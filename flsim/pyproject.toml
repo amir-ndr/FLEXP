@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flsim"
+version = "0.1.0"
+description = "A modular federated learning simulator with wireless channel and energy modeling"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flsim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["flsim/tests"]

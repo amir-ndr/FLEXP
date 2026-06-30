@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: flsim
+Version: 0.1.0
+Summary: A modular federated learning simulator with wireless channel and energy modeling
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.0
+Requires-Dist: torchvision>=0.15
+Requires-Dist: numpy>=1.24
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: scipy>=1.10
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"

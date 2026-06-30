@@ -1,0 +1,49 @@
+# mnist_fedavg.yaml — overrides base.yaml for the canonical FedAvg MNIST experiment
+# McMahan et al. (2017) non-IID setup: 100 clients, shard partition, 10 per round
+
+experiment:
+  name: "mnist_fedavg_shard"
+  seed: 42
+  output_dir: "outputs/"
+
+data:
+  dataset: "mnist"
+  num_clients: 100
+  partition: "shard"
+  num_shards: 200          # 200 shards for 100 clients × 2 shards/client
+  shards_per_client: 2
+
+learning:
+  algorithm: "fedavg"
+  global_rounds: 100
+  clients_per_round: 10
+  local_epochs: 1
+  batch_size: 32
+  learning_rate: 0.01
+
+system:
+  # Paper: f_k drawn from {0.1, 0.2, ..., 0.8} GHz — discrete_ghz mode
+  cpu_freq_mode: "discrete_ghz"
+  cpu_freq_min_ghz: 0.1
+  cpu_freq_max_ghz: 0.8
+  cpu_freq_step_ghz: 0.1
+  # C_k fixed — heterogeneity comes from f_k, not C_k (per paper)
+  cycles_per_sample_min: 1.0e+7
+  cycles_per_sample_max: 1.0e+7
+  switched_capacitance: 1.0e-28
+
+wireless:
+  # Paper: h = h0·ρ·d^{-2}, ρ~Exp(1) per round, circular area radius 500m
+  channel_model: "exp_fading"
+  h0_path_loss_constant: 1.0e-6
+  deployment_shape: "circle"
+  area_radius_m: 500.0
+  total_bandwidth_hz: 2.0e+7
+  tx_power_dbm: 10.0
+  noise_psd_dbm_per_hz: -174.0
+  min_distance_m: 1.0
+  upload_size_bits: 28100
+  upload_size_mode: "model"
+
+evaluation:
+  evaluate_every: 1

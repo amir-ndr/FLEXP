@@ -1,0 +1,85 @@
+experiment:
+  name: "fl_experiment"
+  seed: 42
+  output_dir: "outputs/"
+
+data:
+  dataset: "mnist"          # mnist | cifar10
+  num_clients: 50
+  partition: "iid"          # iid | shard | dirichlet
+  dirichlet_alpha: 0.5
+  num_shards: 200           # for shard partition
+  shards_per_client: 2      # for shard partition
+
+learning:
+  algorithm: "fedavg"
+  global_rounds: 100
+  clients_per_round: 10
+  local_epochs: 1
+  batch_size: 32
+  learning_rate: 0.01
+
+system:
+  # CPU frequency heterogeneity mode:
+  #   "fixed"        — all clients share cpu_frequency_hz
+  #   "discrete_ghz" — each client draws from {f_min, f_min+step, ..., f_max} GHz
+  cpu_freq_mode: "fixed"
+  cpu_frequency_hz: 2.0e+9       # used when cpu_freq_mode="fixed"
+  cpu_freq_min_ghz: 0.1          # used when cpu_freq_mode="discrete_ghz"
+  cpu_freq_max_ghz: 0.8          # used when cpu_freq_mode="discrete_ghz"
+  cpu_freq_step_ghz: 0.1         # used when cpu_freq_mode="discrete_ghz"
+  cycles_per_sample_min: 1.0e+6  # C_k lower bound (cycles per training sample)
+  cycles_per_sample_max: 1.0e+7  # C_k upper bound
+  switched_capacitance: 1.0e-28  # kappa for energy model
+
+wireless:
+  # Channel model:
+  #   "path_loss"  — 3GPP UMa (PL=128.1+37.6·log10(d_km)) + frozen log-normal shadowing
+  #   "exp_fading" — h = h0·ρ·d^{-2}, ρ~Exp(1) re-drawn each round (many FL papers)
+  channel_model: "path_loss"
+  h0_path_loss_constant: 1.0e-6  # used when channel_model="exp_fading"
+  # Deployment geometry:
+  #   "square" — uniform in [-L/2, L/2]^2,  area_side_m defines L
+  #   "circle" — uniform in disk of radius R, area_radius_m defines R
+  deployment_shape: "square"
+  area_side_m: 500.0             # used when deployment_shape="square"
+  area_radius_m: 500.0           # used when deployment_shape="circle"
+  total_bandwidth_hz: 2.0e+7     # B = 20 MHz
+  tx_power_dbm: 10.0             # p_max = 10 dBm
+  noise_psd_dbm_per_hz: -174.0   # N0 thermal noise floor
+  path_loss_intercept_db: 128.1  # used by path_loss model
+  path_loss_exponent: 37.6       # used by path_loss model
+  shadowing_std_db: 8.0          # used by path_loss model (0 = disable)
+  min_distance_m: 1.0            # clamp for all channel models (avoids g→∞)
+  upload_size_bits: 28100        # used when upload_size_mode="fixed"
+  upload_size_mode: "fixed"      # fixed | model
+
+evaluation:
+  evaluate_every: 1
+
+# Plots generated after each run (and in comparison experiments).
+# Each entry produces one PNG. Remove entries you don't want.
+# Available metrics (CSV columns):
+#   test_accuracy, test_loss, mean_compute_time_s, max_compute_time_s,
+#   mean_upload_time_s, max_upload_time_s, mean_compute_energy_j,
+#   total_energy_j, mean_channel_gain, mean_rate_bps, round_duration_s
+# x: round | simulated_time_s
+plots:
+  - metric: test_accuracy
+    x: round
+    ylabel: "Test Accuracy"
+  - metric: test_accuracy
+    x: simulated_time_s
+    ylabel: "Test Accuracy"
+  - metric: test_loss
+    x: round
+    ylabel: "Test Loss"
+  - metric: total_energy_j
+    x: round
+    ylabel: "Energy per client per round (J)"
+  - metric: mean_rate_bps
+    x: round
+    ylabel: "Mean Rate (bps)"
+  - metric: round_duration_s
+    x: round
+    ylabel: "Round Duration (s)"
