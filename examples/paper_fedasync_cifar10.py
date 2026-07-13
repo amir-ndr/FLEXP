@@ -257,7 +257,7 @@ class PaperFedAsyncExperiment(AsyncExperiment):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-print('hi')
+print('hii')
 
 def _add_gradient_column(df: pd.DataFrame, grads_per_step: int) -> pd.DataFrame:
     df = df.copy()
