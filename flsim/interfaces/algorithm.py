@@ -57,7 +57,9 @@ class FederatedAlgorithm(ABC):
     # baselines — override for channel-aware or importance-based selection)
     # ------------------------------------------------------------------
 
-    def select_clients(self, all_clients: list, num_to_select: int, rng) -> list:
+    def select_clients(
+        self, all_clients: list, num_to_select: int, rng, **kwargs
+    ) -> list:
         """
         Uniform random sampling without replacement.
 
@@ -66,6 +68,16 @@ class FederatedAlgorithm(ABC):
           - Importance sampling (pick clients with most informative data)
           - Clustered selection
           - Any other custom policy
+
+        The **kwargs carry system context the Simulator passes each round, so a
+        channel-aware selector can estimate client speed BEFORE selection. The
+        keys match the async AsyncFederatedAlgorithm.select_clients contract, so
+        the same custom selector works in both sync and async:
+            channel_model      — ChannelModel (call .channel_gain / .achievable_rate_bps)
+            noise_psd_w_per_hz  — noise PSD in W/Hz
+            bw_per_client_hz    — bandwidth each client would get (B / clients_per_round)
+            round_idx           — current round index (sync only)
+        Use what you need; ignore the rest.
 
         Args:
             all_clients (list[Client]): all K available clients.

@@ -86,6 +86,11 @@ class Simulator:
         # Cache pre-converted scalar constants so _run_round stays cross-layer-free.
         self._p_max_w  = config._p_max_w
         self._f_max_hz = config._f_max_hz
+        # If downlink_negligible is set, the model-broadcast (download) time is
+        # treated as 0 (base station has effectively unlimited power/bandwidth).
+        self._downlink_negligible = bool(
+            getattr(config.wireless, "downlink_negligible", False)
+        )
 
     def run(self) -> None:
         """
@@ -155,8 +160,17 @@ class Simulator:
         cfg_w = self.config.wireless
 
         # --- 1. Select clients ---
+        # Pass system context so channel-aware selectors can rank clients
+        # before selection (same contract as the async simulator).
+        selection_ctx = {
+            "channel_model":      self.channel_model,
+            "noise_psd_w_per_hz": self.config._noise_psd_w_per_hz,
+            "bw_per_client_hz":   cfg_w.total_bandwidth_hz / max(1, cfg.clients_per_round),
+            "upload_size_bits":   self._upload_bits,
+            "round_idx":          round_idx,
+        }
         selected = self.server.select_clients(
-            self.clients, cfg.clients_per_round, self.rng
+            self.clients, cfg.clients_per_round, self.rng, **selection_ctx
         )
         selected_profiles = [c.profile for c in selected]
         selected_ids = [c.client_id for c in selected]
@@ -223,12 +237,13 @@ class Simulator:
                 bandwidth_hz=bw_hz,
                 channel_gain=g_k,
             )
-            t_dn = self.time_model.compute_download_time(
-                client.profile,
-                size_bits=upload_bits,
-                bandwidth_hz=bw_hz,
-                channel_gain=g_k,
-            )
+            t_dn = 0.0 if self._downlink_negligible else \
+                self.time_model.compute_download_time(
+                    client.profile,
+                    size_bits=upload_bits,
+                    bandwidth_hz=bw_hz,
+                    channel_gain=g_k,
+                )
 
             # Energy — use allocator-assigned f_hz and p_w.
             e_comp = self.energy_model.compute_energy_j(

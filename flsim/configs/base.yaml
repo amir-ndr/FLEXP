@@ -53,9 +53,37 @@ wireless:
   min_distance_m: 1.0            # clamp for all channel models (avoids g→∞)
   upload_size_bits: 28100        # used when upload_size_mode="fixed"
   upload_size_mode: "fixed"      # fixed | model
+  # Downlink (model broadcast) time:
+  #   false — download time is computed like upload (symmetric channel).
+  #   true  — download time = 0 (base station has unlimited power/bandwidth,
+  #           so the broadcast is instantaneous). Common assumption in FL papers.
+  # Applies to BOTH sync and async simulators. Round/arrival time then counts
+  # only compute + upload.
+  downlink_negligible: false
 
 evaluation:
   evaluate_every: 1
+
+# Async FL settings (used only by AsyncSimulator / AsyncExperiment).
+# Ignored when running the synchronous Simulator.
+#
+# alpha:       base mixing hyperparameter α ∈ (0, 1).
+#              x_t = (1 - α_t)*x_{t-1} + α_t*x_new,  α_t = α * s(staleness).
+#              Smaller α → slower but more stable convergence.
+#
+# window_size: number of clients in flight at any time (concurrency level).
+#              Defaults to learning.clients_per_round if not set.
+#              Larger window → more staleness, faster simulated wall-clock time.
+#
+# The staleness function s(·) and client selection policy are set on the
+# algorithm object, not in the config:
+#   FedAsync(alpha=0.1)                              # constant s=1
+#   FedAsync(alpha=0.1, staleness_func="polynomial", a=0.5)
+#   FedAsync(alpha=0.1, staleness_func="hinge", a=10, b=4)
+#   FedAsyncTopKFast(alpha=0.1)                      # always pick K fastest
+async_fl:
+  alpha: 0.1
+  window_size: 10
 
 # Plots generated after each run (and in comparison experiments).
 # Each entry produces one PNG. Remove entries you don't want.

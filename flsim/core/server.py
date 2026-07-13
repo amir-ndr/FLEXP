@@ -34,7 +34,9 @@ class Server:
         self.algorithm = algorithm
         self.round_idx = 0
 
-    def select_clients(self, all_clients: list, num_to_select: int, rng) -> list:
+    def select_clients(
+        self, all_clients: list, num_to_select: int, rng, **kwargs
+    ) -> list:
         """
         Delegate client selection to the algorithm.
 
@@ -42,11 +44,16 @@ class Server:
             all_clients (list[Client]): all available clients.
             num_to_select (int): number to select for this round.
             rng: numpy RandomState.
+            **kwargs: system context (channel_model, noise_psd_w_per_hz,
+                bw_per_client_hz, round_idx) forwarded to the algorithm so
+                channel-aware selectors can rank clients before selection.
 
         Returns:
             list[Client]: selected clients.
         """
-        return self.algorithm.select_clients(all_clients, num_to_select, rng)
+        return self.algorithm.select_clients(
+            all_clients, num_to_select, rng, **kwargs
+        )
 
     def aggregate(self, client_updates: list) -> None:
         """

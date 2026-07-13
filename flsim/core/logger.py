@@ -31,6 +31,7 @@ _CSV_COLUMNS = [
     "max_download_time_s",
     "mean_compute_energy_j",
     "total_energy_j",
+    "cumulative_energy_j",
     "mean_channel_gain",
     "mean_rate_bps",
     "num_selected_clients",
@@ -113,6 +114,7 @@ class Logger:
         self.experiment_name = experiment_name
         self.csv_path = os.path.join(output_dir, f"{experiment_name}.csv")
         self._rows = []   # in-memory cache for plotting
+        self._cum_energy_j = 0.0   # running total energy across all rounds
 
         # Open CSV and write header
         with open(self.csv_path, "w", newline="") as f:
@@ -137,6 +139,8 @@ class Logger:
             round_result (RoundResult): system metrics for this round.
             eval_result: EvalResult if evaluation was run this round, else None.
         """
+        self._cum_energy_j += round_result.total_energy_j
+
         row = {
             "round":                  round_idx,
             "simulated_time_s":       f"{simulated_time_s:.4f}",
@@ -151,6 +155,7 @@ class Logger:
             "max_download_time_s":    f"{round_result.max_download_time_s:.4f}",
             "mean_compute_energy_j":  f"{round_result.mean_compute_energy_j:.6e}",
             "total_energy_j":         f"{round_result.total_energy_j:.6e}",
+            "cumulative_energy_j":    f"{self._cum_energy_j:.6e}",
             "mean_channel_gain":      f"{round_result.mean_channel_gain:.6e}",
             "mean_rate_bps":          f"{round_result.mean_rate_bps:.2f}",
             "num_selected_clients":   round_result.num_selected_clients,
@@ -173,6 +178,7 @@ class Logger:
             "max_upload_time_s":     round_result.max_upload_time_s,
             "mean_compute_energy_j": round_result.mean_compute_energy_j,
             "total_energy_j":        round_result.total_energy_j,
+            "cumulative_energy_j":   self._cum_energy_j,
             "mean_channel_gain":     round_result.mean_channel_gain,
             "mean_rate_bps":         round_result.mean_rate_bps,
             "mean_train_loss":       _mean(round_result.train_losses),
