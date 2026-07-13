@@ -85,7 +85,7 @@ class FedAsyncExperiment(AsyncExperiment):
     """
 
     SHARED_OVERRIDES = {
-        "learning.global_rounds": 100,
+        "learning.global_rounds": 500,
         "async_fl.window_size":   10,
         "evaluation.evaluate_every": 10,
     }

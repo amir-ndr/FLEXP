@@ -159,7 +159,7 @@ class AsyncExperiment(Experiment):
         partitioner    = _make_partitioner(config.data)
         client_indices = partitioner.partition(train_ds, config.data.num_clients, rng)
 
-        global_model = create_model(_model_name_for_dataset(config.data.dataset))
+        global_model = create_model(_model_name_for_dataset(config.data.dataset)).to(device)
 
         # ---- pre-converted scalars ----
         noise_psd             = dbm_to_watts(config.wireless.noise_psd_dbm_per_hz)
