@@ -1,5 +1,5 @@
 # mnist_fedavg.yaml — overrides base.yaml for the canonical FedAvg MNIST experiment
-# McMahan et al. (2017) non-IID setup: 100 clients, shard partition, 10 per round
+# McMahan et al. (2017) non-IID setup: 30 clients, shard partition, 2 shards/client
 
 experiment:
   name: "mnist_fedavg_shard"
@@ -8,9 +8,9 @@ experiment:
 
 data:
   dataset: "mnist"
-  num_clients: 100
+  num_clients: 30
   partition: "shard"
-  num_shards: 200          # 200 shards for 100 clients × 2 shards/client
+  num_shards: 60           # 60 shards for 30 clients × 2 shards/client (full coverage)
   shards_per_client: 2
 
 learning:

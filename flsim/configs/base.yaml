@@ -18,6 +18,14 @@ learning:
   local_epochs: 1
   batch_size: 32
   learning_rate: 0.01
+  # Optional alternate stopping condition, applies to BOTH the sync Simulator
+  # and the AsyncSimulator. Leave null (default) to stop after global_rounds
+  # rounds/epochs, as before.
+  # Set to a positive number of simulated seconds (e.g. 5000) to instead run
+  # until cumulative simulated_time_s reaches that budget — the run stops
+  # by elapsed simulated time regardless of how many rounds/epochs that took.
+  # global_rounds is ignored while this is active.
+  stop_by_time_s: null
 
 system:
   # CPU frequency heterogeneity mode:
