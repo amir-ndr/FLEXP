@@ -17,6 +17,17 @@ Design — three override points, only one is required:
       alpha_t is pre-computed by the simulator via mixing_weight() so it
       can be logged; the algorithm receives the final value directly.
 
+Semi-asynchronous (buffered) algorithms
+----------------------------------------
+Set `buffer_size = k > 1` (default 1) to switch the simulator from fully
+async (one arrival at a time) to semi-async: the server buffers the k
+clients that finish first among the `window_size` currently in flight,
+aggregates them together with ONE mixing step via aggregate_buffered(),
+and immediately re-dispatches k replacements — the remaining
+(window_size - k) clients keep training uninterrupted in the background.
+k=1 (default) is standard FedAsync. k=window_size degenerates to
+synchronous FedAvg-style batching. See FedAsyncTopKFastTotal.
+
 Typical patterns
 ----------------
   # Only change the mixing rule:
@@ -38,10 +49,9 @@ Typical patterns
       def aggregate_async(self, global_model, update, epoch, staleness, alpha_t):
           ...
 
-Client selection modes (use or subclass these ready-made variants):
-  FedAsync              — random selection, tunable staleness function
-  FedAsyncTopKFastTotal — always pick the K fastest clients (compute + upload)
-  FedAsyncFixedFast     — random from the top-M fastest clients
+Client selection / concurrency modes (use or subclass these ready-made variants):
+  FedAsync              — random selection, tunable staleness function, fully async (k=1)
+  FedAsyncTopKFastTotal — semi-async: buffers the k fastest-to-arrive clients per epoch
 """
 
 from abc import ABC, abstractmethod
@@ -53,11 +63,24 @@ class AsyncFederatedAlgorithm(ABC):
     Base class for asynchronous FL algorithms.
 
     The simulator calls these methods in order every global epoch:
-      1. select_clients()    — Scheduler: which client to dispatch next
+      1. select_clients()    — Scheduler: which client(s) to dispatch next
       2. configure_client()  — per-dispatch client setup (optional)
       3. mixing_weight()     — compute alpha_t (logged by simulator)
-      4. aggregate_async()   — Updater: apply the arriving update
+      4. aggregate_async()   — Updater: apply one arriving update
+                                (buffer_size == 1, the default)
+         or aggregate_buffered() — apply k arriving updates together
+                                (buffer_size == k > 1, semi-async)
+
+    Class attribute:
+      buffer_size (int): number of client updates the simulator buffers
+          before triggering one global model update. Default 1 (fully
+          async — every arrival triggers aggregate_async() immediately).
+          Set > 1 (e.g. via a subclass's __init__) to switch to semi-async
+          buffered aggregation via aggregate_buffered(). Must be
+          <= async_fl.window_size (validated by AsyncSimulator).
     """
+
+    buffer_size: int = 1
 
     # ------------------------------------------------------------------
     # Scheduler: client selection
@@ -76,11 +99,15 @@ class AsyncFederatedAlgorithm(ABC):
         Default: uniform random sampling without replacement.
 
         Override for:
-          - Top-K fastest (sort by compute time estimate)
-          - Fixed fast pool (always the same N fast clients)
           - Ratio-based (return int(ratio * len(all_clients)) clients,
             ignoring num_to_trigger)
           - Any custom policy
+
+        Note: for semi-async (buffer_size > 1) algorithms, "fastest k
+        clients" does not need to be implemented here — it emerges
+        naturally from the simulator buffering the k earliest arrivals
+        among whichever clients are currently in flight. See
+        FedAsyncTopKFastTotal.
 
         The **kwargs may carry extra context passed by the simulator
         (e.g., current_virtual_time, time_model) — use what you need,
@@ -176,3 +203,42 @@ class AsyncFederatedAlgorithm(ABC):
         Returns:
             OrderedDict: new global model state_dict (detached float32 tensors).
         """
+
+    # ------------------------------------------------------------------
+    # Updater: semi-async buffered update (only used when buffer_size > 1)
+    # ------------------------------------------------------------------
+
+    def aggregate_buffered(
+        self,
+        global_model,
+        updates: list,
+        global_epoch: int,
+        stalenesses: list,
+        alpha_t: float,
+    ) -> OrderedDict:
+        """
+        Compute the new global model state dict from k buffered updates
+        (called instead of aggregate_async() when buffer_size == k > 1).
+
+        Only needs to be overridden by semi-async algorithms; the default
+        raises NotImplementedError since aggregating multiple updates is
+        not well-defined for the standard one-at-a-time FedAsync rule.
+
+        Args:
+            global_model:  current global nn.Module (read state_dict from this).
+            updates:       list[ClientUpdate] — the k updates buffered this epoch,
+                           in arrival order (earliest first).
+            global_epoch:  t — number of model updates processed so far.
+            stalenesses:   list[int] — t - tau_i for each update, same order as `updates`.
+            alpha_t:       effective mixing weight, already computed by
+                           mixing_weight(base_alpha, representative_staleness)
+                           — the simulator uses max(stalenesses) as the
+                           representative staleness for the whole batch.
+
+        Returns:
+            OrderedDict: new global model state_dict (detached float32 tensors).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has buffer_size > 1 but does not "
+            f"override aggregate_buffered()."
+        )

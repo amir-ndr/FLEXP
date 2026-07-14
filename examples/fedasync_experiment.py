@@ -5,9 +5,9 @@ Demonstrates:
   1. FedAsync+Const     — constant alpha, random client selection
   2. FedAsync+Poly      — polynomial staleness decay
   3. FedAsync+Hinge     — hinge staleness decay
-  4. FedAsync+TopKFast  — always pick the fastest clients (compute + upload)
-  5. FedAsync+FixedFast — random from a fixed fast pool
-  6. FedAvg (sync)      — synchronous baseline for comparison
+  4. FedAsync+TopK      — semi-async: buffers the k fastest-to-arrive clients
+                          per global update (see FedAsyncTopKFastTotal)
+  5. FedAvg (sync)      — synchronous baseline for comparison
 
 All runs share the same dataset, model, channel, and system config
 (flsim/configs/mnist_fedavg.yaml).  Only the async algorithm changes.
@@ -62,9 +62,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from flsim.algorithms.fedavg import FedAvg
-from flsim.algorithms.fedasync import (
-    FedAsync, FedAsyncTopKFastTotal, FedAsyncFixedFast,
-)
+from flsim.algorithms.fedasync import FedAsync, FedAsyncTopKFastTotal
 from flsim.experiments.async_base import AsyncExperiment
 
 
@@ -148,43 +146,28 @@ class FedAsyncExperiment(AsyncExperiment):
         )
 
         # ------------------------------------------------------------------
-        # 4. FedAsync + Top-K fastest clients by TOTAL time (compute + upload)
-        #    Always dispatches the fastest clients end-to-end. The simulator
-        #    supplies channel + upload-size context automatically, so a client
-        #    that computes fast but has a weak channel is correctly deprioritised.
+        # 4. FedAsync + Semi-async top-K buffering
+        #    Buffers the k=5 fastest-to-arrive clients (out of window_size=10
+        #    in flight) per global update, aggregates them together with one
+        #    mixing step, and immediately re-dispatches 5 replacements. The
+        #    other 5 clients keep training uninterrupted. k=1 would be plain
+        #    FedAsync; k=10 (=window_size) would degenerate to sync batching.
         # ------------------------------------------------------------------
-        results["FedAsync+TopKFast"] = self.run_single_async(
-            run_name="fedasync_topkfast",
-            label="FedAsync+TopKFast",
+        results["FedAsync+TopK"] = self.run_single_async(
+            run_name="fedasync_topk",
+            label="FedAsync+TopK (k=5)",
             config_overrides={
                 **self.SHARED_OVERRIDES,
                 "async_fl.alpha":       0.1,
                 "async_fl.window_size": 10,
             },
             components={
-                "algorithm": FedAsyncTopKFastTotal(alpha=0.1, staleness_func="constant"),
+                "algorithm": FedAsyncTopKFastTotal(alpha=0.1, k=5, staleness_func="constant"),
             },
         )
 
         # ------------------------------------------------------------------
-        # 6. FedAsync + Fixed fast pool (random from top-20 fastest)
-        # ------------------------------------------------------------------
-        results["FedAsync+FixedPool"] = self.run_single_async(
-            run_name="fedasync_fixedpool",
-            label="FedAsync+FixedFast (pool=20)",
-            config_overrides={
-                **self.SHARED_OVERRIDES,
-                "async_fl.alpha": 0.1,
-            },
-            components={
-                "algorithm": FedAsyncFixedFast(
-                    pool_size=20, alpha=0.1, staleness_func="constant"
-                ),
-            },
-        )
-
-        # ------------------------------------------------------------------
-        # 7. Synchronous FedAvg baseline
+        # 5. Synchronous FedAvg baseline
         #    Same number of rounds, same clients_per_round as window_size
         # ------------------------------------------------------------------
         results["FedAvg (sync)"] = self.run_single(
@@ -218,17 +201,31 @@ class FedAsyncExperiment(AsyncExperiment):
                 {"metric": "total_energy_j", "x": "round",
                  "ylabel": "Energy per epoch (J)",
                  "title": "Energy comparison"},
+                # Staleness has no meaning for the sync FedAvg baseline (no
+                # `staleness` column in its CSV) — plot_comparison silently
+                # skips any run missing the requested column, so only the
+                # async variants show up here.
+                {"metric": "staleness",      "x": "round",
+                 "ylabel": "Staleness (t − τ)",
+                 "title": "FedAsync variants — staleness vs epoch"},
             ],
             out_prefix="fedasync_comparison",
         )
 
-        # Summary bar chart
+        # Summary bar charts
         self.plot_bar(
             results,
             metric="best_accuracy",
             ylabel="Best test accuracy",
             out_name="fedasync_best_acc_bar",
             title="FedAsync variants — best accuracy",
+        )
+        self.plot_bar(
+            results,
+            metric="avg_staleness",
+            ylabel="Average staleness (t − τ)",
+            out_name="fedasync_avg_staleness_bar",
+            title="FedAsync variants — average staleness (0 for sync FedAvg)",
         )
 
         # Print final summary
@@ -240,6 +237,7 @@ class FedAsyncExperiment(AsyncExperiment):
                 f"  {label:<30s}  "
                 f"best={r.best_accuracy:.4f}  "
                 f"final={r.final_accuracy:.4f}  "
+                f"avg_staleness={r.avg_staleness:.2f}  "
                 f"time={r.total_simulated_time_s:.0f}s"
             )
         print("=" * 60)

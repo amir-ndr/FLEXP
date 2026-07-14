@@ -5,18 +5,31 @@ Global update rule:
     x_t = (1 - alpha_t) * x_{t-1} + alpha_t * x_new
     alpha_t = base_alpha * s(t - tau)
 
+Local worker objective (paper §3, Algorithm 1 "Process Worker"):
+    g_xt(x; z) = f(x; z) + (rho / 2) * ||x - xt||^2
+Set FedAsync(rho=...) (or async_fl.rho in YAML) to enable the proximal term;
+rho=0 (default) reduces local training to plain SGD. The paper requires
+rho > mu (the weak-convexity constant of f) for the Theorem 5 convergence
+guarantee.
+
 Three built-in staleness strategies (paper §5.2):
   "constant"   : s(k) = 1                              → FedAsync+Const
   "polynomial" : s(k) = (k + 1)^{-a}                  → FedAsync+Poly
   "hinge"      : s(k) = 1           if k <= b          → FedAsync+Hinge
                          1 / (a*(k-b)+1)  otherwise
 
-Three built-in client selection policies:
-  FedAsync              — uniform random (default)
-  FedAsyncTopKFastTotal — always pick the K fastest clients by total
-                          (compute + upload) time; falls back to compute-only
-                          when no channel/upload context is available
-  FedAsyncFixedFast     — pick randomly from a fixed pool of the M fastest clients
+Two built-in concurrency modes:
+  FedAsync              — fully async (buffer_size=1): every arrival triggers
+                          an immediate global model update, uniform random
+                          client selection.
+  FedAsyncTopKFastTotal — semi-async (buffer_size=k>1): buffers the k clients
+                          that finish first among the window_size clients
+                          currently in flight, aggregates them together with
+                          ONE mixing step, and immediately re-dispatches k
+                          replacements. The other (window_size - k) clients
+                          keep training uninterrupted. k=1 reduces to plain
+                          FedAsync; k=window_size degenerates to synchronous
+                          batching.
 
 Writing a custom async algorithm
 ---------------------------------
@@ -70,11 +83,19 @@ class FedAsync(AsyncFederatedAlgorithm):
         staleness_func (str):   "constant" | "polynomial" | "hinge". Default "constant".
         a (float):              exponent for polynomial; slope coefficient for hinge.
         b (float):              staleness threshold for hinge (ignored otherwise).
+        rho (float):            proximal regularization weight ρ ≥ 0 for the local
+                                 worker objective g_xt(x; z) = f(x; z) + (ρ/2)‖x−xt‖²
+                                 (paper §3, Algorithm 1). Default 0.0 = no proximal
+                                 term (plain local SGD). The paper requires ρ > μ,
+                                 the weak-convexity constant of f, for the Theorem 5
+                                 convergence guarantee to hold. If omitted here, the
+                                 simulator falls back to config.async_fl.rho (YAML).
 
     Examples:
         FedAsync(alpha=0.1)
         FedAsync(alpha=0.5, staleness_func="polynomial", a=0.5)
         FedAsync(alpha=0.5, staleness_func="hinge", a=10.0, b=4.0)
+        FedAsync(alpha=0.1, rho=0.01)   # with proximal regularization
     """
 
     def __init__(
@@ -83,6 +104,7 @@ class FedAsync(AsyncFederatedAlgorithm):
         staleness_func: str = "constant",
         a: float = 1.0,
         b: float = 4.0,
+        rho: float = None,
     ):
         if not 0.0 < alpha < 1.0:
             raise ValueError(f"alpha must be in (0, 1), got {alpha}")
@@ -91,10 +113,13 @@ class FedAsync(AsyncFederatedAlgorithm):
                 f"staleness_func must be 'constant', 'polynomial', or 'hinge', "
                 f"got '{staleness_func}'"
             )
+        if rho is not None and rho < 0.0:
+            raise ValueError(f"rho must be >= 0, got {rho}")
         self.alpha         = alpha
         self.staleness_func = staleness_func
         self.a             = a
         self.b             = b
+        self.rho           = rho
 
     # ------------------------------------------------------------------
     # Staleness-adaptive mixing weight
@@ -145,110 +170,96 @@ class FedAsync(AsyncFederatedAlgorithm):
 
 
 # ---------------------------------------------------------------------------
-# Client selection variants
+# Semi-asynchronous (buffered top-K) variant
 # ---------------------------------------------------------------------------
 
 class FedAsyncTopKFastTotal(FedAsync):
     """
-    FedAsync that always dispatches the K clients with the smallest TOTAL time.
+    Semi-asynchronous FedAsync: buffers the k fastest-to-arrive clients per
+    global model update, instead of updating on every single arrival.
 
-    Total time estimate:
-        t_total = t_comp + t_upload
-        t_comp  = cycles_per_sample × num_samples / cpu_frequency_hz
-        t_up    = upload_bits / (B × log2(1 + SNR))   (Shannon rate at full power)
+    The simulator keeps `window_size` clients training concurrently at all
+    times. With plain FedAsync (buffer_size=1) every single arrival
+    immediately triggers a global model update. Here, buffer_size=k: the
+    server waits for k arrivals — necessarily the k clients that happen to
+    finish first among the window_size in flight, since arrivals are
+    processed earliest-first — aggregates their k updates together with
+    ONE mixing step (aggregate_buffered), and immediately re-dispatches k
+    replacements. The remaining (window_size - k) clients are left
+    completely undisturbed, continuing the local training they already
+    started.
 
-    Ranking by total time (rather than compute alone) correctly deprioritises a
-    client that computes fast but has a weak channel — its slow upload makes it
-    slow end-to-end.  Download time is not included (server broadcast is assumed
-    cheap; see wireless.downlink_negligible).
+    "Fastest k" therefore isn't a static ranking heuristic — it falls out
+    directly from the discrete-event simulation's real completion order,
+    which is both simpler and more faithful than estimating client speed
+    from profile data ahead of time. This also avoids a selection-bias trap:
+    a fixed profile-based ranking would keep re-dispatching the same one or
+    two objectively-fastest clients forever, starving the rest of the
+    federation of representation. Random dispatch (inherited from FedAsync)
+    keeps who's in the window varied, while buffering picks up whichever of
+    them happen to finish first each cycle.
 
-    Channel/upload context is supplied automatically by the simulator via kwargs
-    (channel_model, noise_psd_w_per_hz, bw_per_client_hz, upload_size_bits), so
-    no manual wiring is needed:
+    k=1 is exactly plain FedAsync (fully async). k=window_size means the
+    server always waits for the entire window before updating — equivalent
+    to synchronous round-based FedAvg batching. Intermediate k values trade
+    off staleness/variance (favors smaller k) against per-update robustness
+    from averaging multiple clients (favors larger k) — this is the
+    synchronous/asynchronous trade-off the paper's mixing hyperparameter α
+    targets from a different angle.
 
-        FedAsyncTopKFastTotal(alpha=0.1)          # uses simulator's upload size
-        FedAsyncTopKFastTotal(alpha=0.1, upload_size_bits=1e6)   # override
-
-    If the channel context is missing (e.g. used outside the simulator), it
-    falls back to ranking by compute time only.
-
-    With num_to_trigger=1 this selects the single fastest client each dispatch;
-    set async_fl.window_size in config to control the concurrency level.
-
-    Args:
-        upload_size_bits (float): override the model size in bits used for the
-            upload estimate. If 0 (default), the simulator-provided value is used.
-        Remaining args are the same as FedAsync.
-    """
-
-    def __init__(self, upload_size_bits: float = 0.0, **kwargs):
-        super().__init__(**kwargs)
-        self._upload_bits = upload_size_bits
-
-    def select_clients(self, all_clients, num_to_trigger, rng, **kwargs):
-        """Sort by estimated total time (compute + upload), return K fastest."""
-        channel_model = kwargs.get("channel_model", None)
-        noise_psd     = kwargs.get("noise_psd_w_per_hz", None)
-        bw_per_client = kwargs.get("bw_per_client_hz", None)
-        # Prefer an explicit constructor override; otherwise use the simulator's.
-        upload_bits   = self._upload_bits or kwargs.get("upload_size_bits", 0.0)
-
-        def _t_total_estimate(client):
-            p = client.profile
-            t_comp = p.cycles_per_sample * client.num_samples / p.cpu_frequency_hz
-            if (channel_model is None or noise_psd is None
-                    or bw_per_client is None or not upload_bits):
-                return t_comp  # fallback: compute only
-            # Estimate upload rate. Pass the selection rng so channel models that
-            # need it (exp_fading draws ρ~Exp(1)) work; path_loss ignores it.
-            gain = channel_model.channel_gain(p, rng)
-            rate = channel_model.achievable_rate_bps(
-                bandwidth_hz=bw_per_client,
-                tx_power_w=p.tx_power_w,
-                channel_gain=gain,
-                noise_psd_w_per_hz=noise_psd,
-            )
-            t_up = upload_bits / max(rate, 1.0)
-            return t_comp + t_up
-
-        k = min(num_to_trigger, len(all_clients))
-        return sorted(all_clients, key=_t_total_estimate)[:k]
-
-
-class FedAsyncFixedFast(FedAsync):
-    """
-    FedAsync that samples uniformly from a fixed pool of the M fastest clients.
-
-    The fast pool is computed once on the first call and cached. This gives
-    variety within a fast subset while still excluding slow clients entirely.
+    Aggregation rule (once k arrivals are buffered):
+        x_avg   = sum_i (n_i / sum_j n_j) * x_new_i     — sample-weighted
+                  average of the k arriving models
+        alpha_t = base_alpha * s(max_i staleness_i)     — driven by the
+                  WORST staleness in the batch (conservative: one very
+                  stale update in the batch shouldn't be hidden by k-1
+                  fresh ones)
+        x_t     = (1 - alpha_t) * x_{t-1} + alpha_t * x_avg
 
     Args:
-        pool_size (int): size of the fast client pool. Default 10.
-        Same as FedAsync for remaining args.
+        k (int): buffer size — number of client updates aggregated together
+            per global model update. Must satisfy 1 <= k <= window_size
+            (async_fl.window_size in config); validated by AsyncSimulator
+            at construction time. Default 5.
+        Remaining args (alpha, staleness_func, a, b, rho) are the same as FedAsync.
 
     Example:
-        # Keep a pool of 20 fastest clients; each dispatch picks 5 of them.
-        FedAsyncFixedFast(pool_size=20, alpha=0.1)
-        # Then set async_fl.window_size: 5 in the config.
+        # Buffer the fastest 5 of 10 concurrently-training clients per update.
+        FedAsyncTopKFastTotal(alpha=0.1, k=5)   # needs async_fl.window_size >= 5
     """
 
-    def __init__(self, pool_size: int = 10, **kwargs):
+    def __init__(self, k: int = 5, **kwargs):
         super().__init__(**kwargs)
-        self.pool_size   = pool_size
-        self._fast_pool  = None   # lazily built on first call
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        self.k = k
+        self.buffer_size = k
 
-    def select_clients(self, all_clients, num_to_trigger, rng, **kwargs):
-        """Sample without replacement from the top-pool_size fastest clients."""
-        if self._fast_pool is None:
-            def _t_estimate(client):
-                p = client.profile
-                return p.cycles_per_sample * client.num_samples / p.cpu_frequency_hz
-            sorted_all = sorted(all_clients, key=_t_estimate)
-            self._fast_pool = sorted_all[:self.pool_size]
+    def aggregate_buffered(
+        self,
+        global_model,
+        updates: list,
+        global_epoch: int,
+        stalenesses: list,
+        alpha_t: float,
+    ) -> OrderedDict:
+        """
+        x_avg = sample-weighted average of the k arriving models
+        x_t   = (1 - alpha_t) * x_{t-1} + alpha_t * x_avg
 
-        k = min(num_to_trigger, len(self._fast_pool))
-        indices = rng.choice(len(self._fast_pool), size=k, replace=False)
-        return [self._fast_pool[i] for i in indices]
+        alpha_t is passed in pre-computed by the simulator, from
+        mixing_weight(base_alpha, max(stalenesses)).
+        """
+        current       = global_model.state_dict()
+        total_samples = sum(u.num_samples for u in updates)
+        new_state     = OrderedDict()
+        for key in current:
+            x_avg = sum(
+                (u.num_samples / total_samples) * u.state_dict[key].float()
+                for u in updates
+            )
+            new_state[key] = (1.0 - alpha_t) * current[key].float() + alpha_t * x_avg
+        return new_state
 
 
 # ---------------------------------------------------------------------------

@@ -15,25 +15,35 @@ This simulator models both threads with a **discrete-event priority queue**:
   1. DISPATCH  (at virtual time t_dispatch, current epoch τ)
        - Select a client via algorithm.select_clients()
        - Take a snapshot of the current global model (at epoch τ)
-       - Run local PyTorch training on that snapshot (wall-clock ignored)
+       - Run local PyTorch training on that snapshot (wall-clock ignored),
+         solving g_xt(x;z) = f(x;z) + (rho/2)||x-xt||^2 when rho > 0
        - Compute simulated finish time:
              arrival_time = t_dispatch + t_compute + t_upload
        - Push an ArrivalEvent(arrival_time, τ, trained_weights) onto the queue
 
   2. UPDATER LOOP  (process epochs 0 … T-1)
-       - Pop the earliest ArrivalEvent from the queue
-       - Compute staleness k = (current epoch) − τ
-       - Compute alpha_t = algorithm.mixing_weight(base_alpha, k)
-       - Call algorithm.aggregate_async(global_model, update, epoch, k, alpha_t)
+       - Pop the B earliest ArrivalEvents from the queue (B = algorithm.buffer_size,
+         default 1 -> fully async, exactly the paper's Algorithm 1). Because the
+         queue is a min-heap on arrival_time, these are — by construction — the B
+         clients that finished first among the window_size currently in flight.
+       - Compute staleness k_i = (current epoch) − τ_i for each of the B updates;
+         representative staleness = max(k_i) (conservative: the worst update in
+         the batch drives the mixing weight, see Remark 2 in the paper).
+       - Compute alpha_t = algorithm.mixing_weight(base_alpha, max(k_i))
+       - B == 1: call algorithm.aggregate_async(global_model, update, epoch, k, alpha_t)
+         B  > 1: call algorithm.aggregate_buffered(global_model, updates, epoch, k_list, alpha_t)
+           — semi-async: the B updates are combined into ONE global model update;
+             the remaining (window_size - B) clients keep training uninterrupted.
        - Load result into global_model
-       - Dispatch ONE replacement client (sliding-window: always keep
+       - Dispatch B replacement clients (sliding-window: always keep
          window_size clients in flight)
 
 Sliding-window concurrency
 --------------------------
 The simulator keeps exactly `window_size` clients in flight at all times:
   - On startup: dispatch window_size clients simultaneously (all see model at epoch 0)
-  - After each Updater step: dispatch 1 replacement client (sees current model)
+  - After each Updater step: dispatch B replacement clients (sees current model),
+    where B is the number of updates just consumed (default 1)
 
 This naturally produces staleness: clients dispatched earlier but slow to arrive
 will be processed while the model has already been updated by faster peers.
@@ -47,6 +57,10 @@ Extending
   - Change selection policy  → override AsyncFederatedAlgorithm.select_clients()
   - Change staleness decay   → override AsyncFederatedAlgorithm.mixing_weight()
   - Change update rule       → override AsyncFederatedAlgorithm.aggregate_async()
+  - Go semi-async (buffer B updates per model update)
+                             → set algorithm.buffer_size = B > 1 and override
+                               AsyncFederatedAlgorithm.aggregate_buffered()
+                               (see FedAsyncTopKFastTotal)
   - Change concurrency level → async_fl.window_size in config
 """
 
@@ -106,6 +120,16 @@ class AsyncSimulator:
     Key config fields (under async_fl in YAML or config_overrides):
         alpha       (float): base mixing hyperparameter. Default 0.1.
         window_size (int):   number of clients in flight. Default = clients_per_round.
+        rho         (float): proximal regularization weight for the local worker
+                             objective g_xt(x;z) = f(x;z) + (rho/2)||x-xt||^2
+                             (paper §3). Default 0.0 (plain local SGD). An
+                             algorithm's own `rho` attribute (e.g. FedAsync(rho=..))
+                             takes priority over this YAML value.
+
+    Buffering (semi-async): the algorithm's own `buffer_size` attribute (default
+    1) controls how many arrivals are aggregated per global model update — this
+    is set by the algorithm (e.g. FedAsyncTopKFastTotal(k=5)), not via YAML.
+    Must satisfy buffer_size <= window_size (validated below).
 
     The existing learning.global_rounds field controls how many server
     updates (= global epochs) to run.
@@ -164,6 +188,32 @@ class AsyncSimulator:
                                            config.learning.clients_per_round)
                                    if async_cfg else config.learning.clients_per_round)
 
+        # Buffer size k (semi-async): algorithm.buffer_size, default 1 (fully async).
+        # k=1 processes one arrival at a time (aggregate_async); k>1 buffers the
+        # k fastest-to-arrive clients per epoch and aggregates them together
+        # (aggregate_buffered). See AsyncFederatedAlgorithm / FedAsyncTopKFastTotal.
+        self._buffer_size = int(getattr(server.algorithm, "buffer_size", 1))
+        if self._buffer_size < 1:
+            raise ValueError(
+                f"{type(server.algorithm).__name__}.buffer_size must be >= 1, "
+                f"got {self._buffer_size}."
+            )
+        if self._buffer_size > self._window_size:
+            raise ValueError(
+                f"{type(server.algorithm).__name__}.buffer_size (k={self._buffer_size}) "
+                f"cannot exceed async_fl.window_size ({self._window_size}) — the "
+                f"server can never buffer more arrivals than are ever in flight. "
+                f"Increase window_size or decrease k."
+            )
+
+        # Rho priority: algorithm.rho > config.async_fl.rho > default 0.0
+        # (proximal regularization weight for the local worker objective, paper §3)
+        _alg_rho = getattr(server.algorithm, "rho", None)
+        if _alg_rho is not None:
+            self._rho = float(_alg_rho)
+        else:
+            self._rho = float(getattr(async_cfg, "rho", 0.0) if async_cfg else 0.0)
+
         # Effective bandwidth per client = total / window_size
         # (models uplink contention when window_size clients transmit concurrently)
         self._effective_bw = config.wireless.total_bandwidth_hz / max(1, self._window_size)
@@ -194,8 +244,8 @@ class AsyncSimulator:
 
         print(
             f"\n[AsyncSimulator] Starting FedAsync: "
-            f"T={T} epochs, window={self._window_size}, "
-            f"alpha={self._base_alpha}, "
+            f"T={T} epochs, window={self._window_size}, buffer_size={self._buffer_size}, "
+            f"alpha={self._base_alpha}, rho={self._rho}, "
             f"staleness_func={getattr(self.server.algorithm, 'staleness_func', 'custom')}, "
             f"device={self.device}"
         )
@@ -206,8 +256,9 @@ class AsyncSimulator:
         )
 
         # ---- initial dispatch: fill the window ----
-        # Extra kwargs passed to select_clients so selection policies that need
-        # channel or bandwidth info (e.g. FedAsyncTopKFastTotal) can use them.
+        # Extra kwargs passed to select_clients so custom selection policies that
+        # need channel or bandwidth info can use them (unused by the default
+        # uniform-random selection).
         selection_ctx = {
             "channel_model":     self.channel_model,
             "noise_psd_w_per_hz": self.config._noise_psd_w_per_hz,
@@ -225,6 +276,7 @@ class AsyncSimulator:
 
         global_epoch    = 0
         simulated_time  = 0.0
+        B               = self._buffer_size
 
         # ---- main updater loop ----
         while global_epoch < T:
@@ -235,42 +287,84 @@ class AsyncSimulator:
                 )
                 break
 
-            # Pop earliest arriving update
-            event = heapq.heappop(pending)
-            simulated_time = event.arrival_time
+            # Pop the B earliest-arriving updates (B=1: fully async, exactly the
+            # old behavior. B>1: semi-async — these are, by construction of the
+            # priority queue, the B clients that finished first among the
+            # window_size currently in flight).
+            batch_size   = min(B, len(pending))
+            batch_events = [heapq.heappop(pending) for _ in range(batch_size)]
+            simulated_time = max(ev.arrival_time for ev in batch_events)
 
-            staleness = global_epoch - event.tau
-            alpha_t   = self.server.algorithm.mixing_weight(self._base_alpha, staleness)
+            stalenesses = [global_epoch - ev.tau for ev in batch_events]
+            # Representative staleness for the batch's mixing weight: the WORST
+            # (max) staleness, so one stale update in the batch isn't hidden by
+            # fresher ones — conservative per paper Remark 2 (larger staleness
+            # -> more error -> lower alpha).
+            rep_staleness = max(stalenesses)
+            alpha_t = self.server.algorithm.mixing_weight(self._base_alpha, rep_staleness)
 
-            # Apply update to global model
-            new_state = self.server.algorithm.aggregate_async(
-                self.server.global_model,
-                event.update,
-                global_epoch,
-                staleness,
-                alpha_t,
-            )
+            updates = [ev.update for ev in batch_events]
+            if batch_size == 1:
+                new_state = self.server.algorithm.aggregate_async(
+                    self.server.global_model,
+                    updates[0],
+                    global_epoch,
+                    stalenesses[0],
+                    alpha_t,
+                )
+            else:
+                new_state = self.server.algorithm.aggregate_buffered(
+                    self.server.global_model,
+                    updates,
+                    global_epoch,
+                    stalenesses,
+                    alpha_t,
+                )
             self.server.global_model.load_state_dict(new_state)
             self.server.round_idx = global_epoch + 1
 
-            # Build result record
-            upd = event.update
-            result = AsyncRoundResult(
-                global_epoch=global_epoch,
-                arrival_time_s=simulated_time,
-                staleness=staleness,
-                alpha_used=alpha_t,
-                client_id=upd.client_id,
-                compute_time_s=upd.compute_time_s,
-                upload_time_s=upd.upload_time_s,
-                total_time_s=upd.total_time_s,
-                compute_energy_j=upd.compute_energy_j,
-                tx_energy_j=upd.tx_energy_j,
-                total_energy_j=upd.total_energy_j,
-                channel_gain=upd.channel_gain,
-                achievable_rate_bps=upd.achievable_rate_bps,
-                train_loss=upd.train_loss,
-            )
+            # Build result record. Single-arrival epochs (B=1) log that one
+            # update's own fields, exactly as before. Buffered epochs (B>1) log
+            # the batch as a whole: time fields use the batch's bottleneck (the
+            # slowest of the B, which determined when the epoch could fire —
+            # same convention as the sync Simulator's per-round max); energy
+            # fields are summed across the batch (total energy spent this
+            # epoch, same convention as the sync Simulator's per-round sum).
+            if batch_size == 1:
+                upd = updates[0]
+                result = AsyncRoundResult(
+                    global_epoch=global_epoch,
+                    arrival_time_s=simulated_time,
+                    staleness=stalenesses[0],
+                    alpha_used=alpha_t,
+                    client_id=upd.client_id,
+                    compute_time_s=upd.compute_time_s,
+                    upload_time_s=upd.upload_time_s,
+                    total_time_s=upd.total_time_s,
+                    compute_energy_j=upd.compute_energy_j,
+                    tx_energy_j=upd.tx_energy_j,
+                    total_energy_j=upd.total_energy_j,
+                    channel_gain=upd.channel_gain,
+                    achievable_rate_bps=upd.achievable_rate_bps,
+                    train_loss=upd.train_loss,
+                )
+            else:
+                result = AsyncRoundResult(
+                    global_epoch=global_epoch,
+                    arrival_time_s=simulated_time,
+                    staleness=rep_staleness,
+                    alpha_used=alpha_t,
+                    client_id=[u.client_id for u in updates],
+                    compute_time_s=max(u.compute_time_s for u in updates),
+                    upload_time_s=max(u.upload_time_s for u in updates),
+                    total_time_s=max(u.total_time_s for u in updates),
+                    compute_energy_j=sum(u.compute_energy_j for u in updates),
+                    tx_energy_j=sum(u.tx_energy_j for u in updates),
+                    total_energy_j=sum(u.total_energy_j for u in updates),
+                    channel_gain=sum(u.channel_gain for u in updates) / len(updates),
+                    achievable_rate_bps=sum(u.achievable_rate_bps for u in updates) / len(updates),
+                    train_loss=sum(u.train_loss for u in updates) / len(updates),
+                )
 
             # Evaluate
             eval_result = None
@@ -285,7 +379,7 @@ class AsyncSimulator:
                 print(
                     f"  Epoch {global_epoch:5d} | "
                     f"sim_time={simulated_time:10.2f}s | "
-                    f"staleness={staleness:3d} | "
+                    f"staleness={rep_staleness:3d} | "
                     f"α_t={alpha_t:.4f} | "
                     f"acc={eval_result.test_accuracy:.4f} | "
                     f"loss={eval_result.test_loss:.4f}"
@@ -293,17 +387,18 @@ class AsyncSimulator:
 
             global_epoch += 1
 
-            # Dispatch one replacement to keep the window full
+            # Dispatch batch_size replacements to keep the window full
             if global_epoch < T:
                 replacement_batch = self.server.algorithm.select_clients(
-                    self.clients, 1, self.rng, **selection_ctx
+                    self.clients, batch_size, self.rng, **selection_ctx
                 )
-                new_ev = self._dispatch_client(
-                    replacement_batch[0],
-                    current_time=simulated_time,
-                    current_epoch=global_epoch,
-                )
-                heapq.heappush(pending, new_ev)
+                for client in replacement_batch:
+                    new_ev = self._dispatch_client(
+                        client,
+                        current_time=simulated_time,
+                        current_epoch=global_epoch,
+                    )
+                    heapq.heappush(pending, new_ev)
 
         print("[AsyncSimulator] Done. Saving plots …")
         self.logger.plot_results()
@@ -395,6 +490,10 @@ class AsyncSimulator:
         )
 
         # ---- local training (on snapshot of current global model) ----
+        # Local objective solved here is g_xt(x; z) = f(x; z) + (rho/2)||x - xt||^2
+        # (paper §3, Algorithm 1 "Process Worker"). rho comes from the algorithm's
+        # `rho` attribute if set, else config.async_fl.rho, else 0.0 (plain SGD).
+        # configure_client() may still override per-client via client.proximal_mu.
         self.server.algorithm.configure_client(
             client, self.server.global_model, current_epoch
         )
@@ -404,7 +503,7 @@ class AsyncSimulator:
             batch_size=cfg.batch_size,
             learning_rate=cfg.learning_rate,
             device=self.device,
-            proximal_mu=getattr(client, "proximal_mu", 0.0),
+            proximal_mu=getattr(client, "proximal_mu", self._rho),
         )
 
         update = ClientUpdate(

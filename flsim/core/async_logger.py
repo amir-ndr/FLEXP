@@ -1,9 +1,12 @@
 """
 core/async_logger.py: Logger for asynchronous federated learning experiments.
 
-One CSV row per global epoch (= one server model update from one client).
-Extends the sync Logger columns with async-specific fields:
-  staleness  — t - tau (how stale the arriving update is)
+One CSV row per global epoch (= one server model update, from one client in
+fully-async mode, or from a buffered batch of `k` clients in semi-async mode —
+see AsyncFederatedAlgorithm.buffer_size). Extends the sync Logger columns with
+async-specific fields:
+  staleness  — t - tau (how stale the arriving update is; max over the batch
+               when buffer_size > 1)
   alpha_used — effective mixing weight alpha_t for this epoch
 
 Also produces async-specific plots:
@@ -51,17 +54,33 @@ class AsyncRoundResult:
     """
     All metrics produced by one global epoch in async FL.
 
-    One arriving ClientUpdate triggers one server update = one global epoch.
-    This struct bundles the timing, energy, channel, and staleness info for
-    that single event so the logger can record it.
+    One arriving ClientUpdate triggers one server update = one global epoch
+    (fully async, buffer_size=1 — the default). This struct bundles the
+    timing, energy, channel, and staleness info for that single event so the
+    logger can record it.
+
+    Semi-async (buffer_size=k>1): one epoch instead aggregates k arriving
+    ClientUpdates together (see AsyncSimulator / aggregate_buffered). In that
+    case:
+      client_id            — list[int] of the k client ids in the batch
+                              (instead of a single int)
+      compute/upload/total_time_s — max over the batch (the bottleneck that
+                              gated this epoch, same convention as the sync
+                              Simulator's per-round max)
+      *_energy_j fields     — sum over the batch (total energy spent this
+                              epoch, same convention as the sync Simulator's
+                              per-round sum)
+      channel_gain, achievable_rate_bps, train_loss — mean over the batch
+      staleness             — max over the batch (see AsyncSimulator)
     """
     global_epoch:        int
     arrival_time_s:      float   # simulated time the update reached the server
-    staleness:           int     # t - tau  (0 = fresh, >0 = stale)
+    staleness:           int     # t - tau  (0 = fresh, >0 = stale); max over batch if buffered
     alpha_used:          float   # effective alpha_t = base_alpha * s(staleness)
 
-    # From the arriving ClientUpdate
-    client_id:           int
+    # From the arriving ClientUpdate(s) — see class docstring for the
+    # single-vs-buffered convention of each field.
+    client_id:           object  # int, or list[int] when buffer_size > 1
     compute_time_s:      float
     upload_time_s:       float
     total_time_s:        float

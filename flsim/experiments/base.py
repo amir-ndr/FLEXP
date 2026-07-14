@@ -110,6 +110,18 @@ class RunResult:
         """Cumulative simulated time at the end of training."""
         return float(self.df["simulated_time_s"].iloc[-1])
 
+    @property
+    def avg_staleness(self) -> float:
+        """
+        Mean staleness (t - tau) across all epochs.
+
+        0.0 for synchronous runs (no `staleness` column — clients always train
+        on the same model, so staleness is zero by construction).
+        """
+        if "staleness" not in self.df.columns:
+            return 0.0
+        return float(self.df["staleness"].mean())
+
     def metric(self, col: str) -> pd.Series:
         """Return a column from the CSV as a pandas Series."""
         return self.df[col]
