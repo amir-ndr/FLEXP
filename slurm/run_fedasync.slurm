@@ -14,11 +14,11 @@
 #   2. Environment setup (module names / conda env / venv path)
 
 #SBATCH --job-name=fedasync_experiment
-#SBATCH --partition=gpu                 # <-- EDIT: your cluster's GPU partition/queue name
-#SBATCH --gres=gpu:1                    # <-- EDIT: e.g. gpu:1, gpu:a100:1, gpu:v100:1 ...
+#SBATCH --partition=gpubase_24hrs   # matches --time=08:00:00 below; use gpubase_6hrs if you shorten it
+#SBATCH --gres=gpu:rtx6000:1            # Quadro RTX 6000 node; other node types offer a100 / a30 / L4 / L40S
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --mem=16G
+#SBATCH --time=08:00:00
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --error=slurm/logs/%x_%j.err
 # Optional extras — uncomment and edit if your cluster requires/supports them:
@@ -32,11 +32,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 1. Environment setup — EDIT for your cluster
 # ---------------------------------------------------------------------------
-# module purge
-# module load cuda/12.1            # match the CUDA build torch was installed with
-# module load anaconda3
-# source activate flexp            # conda env name, or:
-# source /path/to/venv/bin/activate
+source /global/home/hpc6175/venvs/env1/bin/activate
+
+# Workaround: this cluster's ldconfig cache points libcuda.so.1 at
+# /usr/lib64/nvidia/libcuda.so.1, which doesn't exist on these GPU nodes —
+# the real file lives at /usr/lib64/libcuda.so.1. Without this, torch silently
+# falls back to CPU (torch.cuda.is_available() == False) even though the GPU
+# and driver are fine.
+export LD_LIBRARY_PATH="/usr/lib64:${LD_LIBRARY_PATH:-}"
 
 # Run from the repo root regardless of where sbatch was invoked from.
 cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
