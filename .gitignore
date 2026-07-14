@@ -2,6 +2,7 @@
 /.vscode
 # outputs/*.csv
 # outputs/*.png
-# slurm/logs/
 __pycache__/
 *.pyc
+slurm/logs/*
+!slurm/logs/.gitkeep

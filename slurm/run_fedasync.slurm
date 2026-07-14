@@ -14,8 +14,7 @@
 #   2. Environment setup (module names / conda env / venv path)
 
 #SBATCH --job-name=fedasync_experiment
-#SBATCH --partition=gpubase_24hrs   # matches --time=08:00:00 below; use gpubase_6hrs if you shorten it
-#SBATCH --gres=gpu:rtx6000:1            # Quadro RTX 6000 node; other node types offer a100 / a30 / L4 / L40S
+#SBATCH --gres=gpu:1            # Quadro RTX 6000 node; other node types offer a100 / a30 / L4 / L40S
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=08:00:00
@@ -34,16 +33,25 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 source /global/home/hpc6175/venvs/env1/bin/activate
 
+# Run from the repo root regardless of where sbatch was invoked from.
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+mkdir -p slurm/logs
+
 # Workaround: this cluster's ldconfig cache points libcuda.so.1 at
 # /usr/lib64/nvidia/libcuda.so.1, which doesn't exist on these GPU nodes —
 # the real file lives at /usr/lib64/libcuda.so.1. Without this, torch silently
 # falls back to CPU (torch.cuda.is_available() == False) even though the GPU
 # and driver are fine.
-export LD_LIBRARY_PATH="/usr/lib64:${LD_LIBRARY_PATH:-}"
-
-# Run from the repo root regardless of where sbatch was invoked from.
-cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-mkdir -p slurm/logs
+#
+# Only shadow libcuda.so.1, not the whole /usr/lib64 directory: this cluster's
+# system binaries (mkdir, etc.) resolve libc.so.6 from a newer CVMFS software
+# stack, not from /usr/lib64 — prepending /usr/lib64 wholesale shadows that
+# newer libc with the older plain-OS one and breaks every command afterward
+# ("mkdir: ... GLIBC_2.34 not found").
+CUDA_SHIM_DIR="${SLURM_TMPDIR:-/tmp}/cuda_shim_${SLURM_JOB_ID:-manual}"
+mkdir -p "$CUDA_SHIM_DIR"
+ln -sf /usr/lib64/libcuda.so.1 "$CUDA_SHIM_DIR/libcuda.so.1"
+export LD_LIBRARY_PATH="$CUDA_SHIM_DIR:${LD_LIBRARY_PATH:-}"
 
 # ---------------------------------------------------------------------------
 # 2. Record which GPU this job actually landed on.
