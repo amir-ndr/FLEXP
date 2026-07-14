@@ -3,3 +3,5 @@
 # outputs/*.csv
 # outputs/*.png
 # slurm/logs/
+__pycache__/
+*.pyc
