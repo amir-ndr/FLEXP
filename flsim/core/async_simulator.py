@@ -235,20 +235,38 @@ class AsyncSimulator:
         """
         Execute the full async FL experiment.
 
-        Runs learning.global_rounds server updates (global epochs).
+        Stopping condition (mutually exclusive):
+          - Default: run exactly learning.global_rounds server updates (global epochs).
+          - If learning.stop_by_time_s is set (> 0): ignore global_rounds and
+            instead run epochs until cumulative simulated_time_s reaches that
+            budget. See _should_continue().
+
         Evaluates every evaluation.evaluate_every epochs.
         Saves plots at the end.
         """
         T           = self.config.learning.global_rounds
         cfg_eval    = self.config.evaluation
 
-        print(
-            f"\n[AsyncSimulator] Starting FedAsync: "
-            f"T={T} epochs, window={self._window_size}, buffer_size={self._buffer_size}, "
-            f"alpha={self._base_alpha}, rho={self._rho}, "
-            f"staleness_func={getattr(self.server.algorithm, 'staleness_func', 'custom')}, "
-            f"device={self.device}"
-        )
+        stop_by_time_s = getattr(self.config.learning, "stop_by_time_s", None)
+        time_based     = stop_by_time_s is not None and stop_by_time_s > 0
+
+        if time_based:
+            print(
+                f"\n[AsyncSimulator] Starting FedAsync: "
+                f"stop_by_time_s={stop_by_time_s:.0f}s (time-based), "
+                f"window={self._window_size}, buffer_size={self._buffer_size}, "
+                f"alpha={self._base_alpha}, rho={self._rho}, "
+                f"staleness_func={getattr(self.server.algorithm, 'staleness_func', 'custom')}, "
+                f"device={self.device}"
+            )
+        else:
+            print(
+                f"\n[AsyncSimulator] Starting FedAsync: "
+                f"T={T} epochs, window={self._window_size}, buffer_size={self._buffer_size}, "
+                f"alpha={self._base_alpha}, rho={self._rho}, "
+                f"staleness_func={getattr(self.server.algorithm, 'staleness_func', 'custom')}, "
+                f"device={self.device}"
+            )
         print(
             f"[AsyncSimulator] Upload size: {self._upload_bits / 1e3:.1f} kbits "
             f"(mode={self.config.wireless.upload_size_mode}), "
@@ -279,7 +297,7 @@ class AsyncSimulator:
         B               = self._buffer_size
 
         # ---- main updater loop ----
-        while global_epoch < T:
+        while self._should_continue(global_epoch, simulated_time, T, time_based, stop_by_time_s):
             if not pending:
                 print(
                     f"[AsyncSimulator] Warning: pending queue empty at epoch "
@@ -388,7 +406,7 @@ class AsyncSimulator:
             global_epoch += 1
 
             # Dispatch batch_size replacements to keep the window full
-            if global_epoch < T:
+            if self._should_continue(global_epoch, simulated_time, T, time_based, stop_by_time_s):
                 replacement_batch = self.server.algorithm.select_clients(
                     self.clients, batch_size, self.rng, **selection_ctx
                 )
@@ -402,6 +420,14 @@ class AsyncSimulator:
 
         print("[AsyncSimulator] Done. Saving plots …")
         self.logger.plot_results()
+
+    @staticmethod
+    def _should_continue(global_epoch: int, simulated_time: float, T: int,
+                          time_based: bool, stop_by_time_s: float) -> bool:
+        """Round-based: global_epoch < T. Time-based: simulated_time < stop_by_time_s."""
+        if time_based:
+            return simulated_time < stop_by_time_s
+        return global_epoch < T
 
     # ------------------------------------------------------------------
     # Internal: dispatch one client

@@ -96,22 +96,37 @@ class Simulator:
         """
         Execute the full federated learning experiment.
 
-        Loop over global_rounds communication rounds. After every
-        evaluate_every rounds, evaluate the global model on the test set.
-        At the end, generate result plots.
+        Stopping condition (mutually exclusive):
+          - Default: run exactly learning.global_rounds communication rounds.
+          - If learning.stop_by_time_s is set (> 0): ignore global_rounds and
+            instead run rounds until cumulative simulated_time_s reaches that
+            budget. See _should_continue().
+
+        After every evaluate_every rounds, evaluate the global model on the
+        test set. At the end, generate result plots.
         """
         simulated_time_s = 0.0
         cfg_learn = self.config.learning
         cfg_eval  = self.config.evaluation
 
+        stop_by_time_s = getattr(cfg_learn, "stop_by_time_s", None)
+        time_based = stop_by_time_s is not None and stop_by_time_s > 0
+
         cfg_w = self.config.wireless
-        print(f"\n[Simulator] Starting: {cfg_learn.global_rounds} rounds, "
-              f"{cfg_learn.clients_per_round}/{len(self.clients)} clients/round, "
-              f"device={self.device}")
+        if time_based:
+            print(f"\n[Simulator] Starting: stop_by_time_s={stop_by_time_s:.0f}s (time-based), "
+                  f"{cfg_learn.clients_per_round}/{len(self.clients)} clients/round, "
+                  f"device={self.device}")
+        else:
+            print(f"\n[Simulator] Starting: {cfg_learn.global_rounds} rounds, "
+                  f"{cfg_learn.clients_per_round}/{len(self.clients)} clients/round, "
+                  f"device={self.device}")
         print(f"[Simulator] Upload size: {self._upload_bits/1e3:.1f} kbits "
               f"(mode={cfg_w.upload_size_mode})")
 
-        for round_idx in range(cfg_learn.global_rounds):
+        round_idx = 0
+        while self._should_continue(round_idx, simulated_time_s, cfg_learn.global_rounds,
+                                     time_based, stop_by_time_s):
             round_result = self._run_round(round_idx)
             simulated_time_s += round_result.round_duration_s
 
@@ -133,8 +148,18 @@ class Simulator:
                     f"round_dur={round_result.round_duration_s:.2f}s"
                 )
 
+            round_idx += 1
+
         print("[Simulator] Done. Saving plots …")
         self.logger.plot_results()
+
+    @staticmethod
+    def _should_continue(round_idx: int, simulated_time_s: float, global_rounds: int,
+                          time_based: bool, stop_by_time_s: float) -> bool:
+        """Round-based: round_idx < global_rounds. Time-based: simulated_time_s < stop_by_time_s."""
+        if time_based:
+            return simulated_time_s < stop_by_time_s
+        return round_idx < global_rounds
 
     def _run_round(self, round_idx: int) -> RoundResult:
         """
