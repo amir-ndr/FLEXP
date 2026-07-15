@@ -319,10 +319,37 @@ class Simulator:
             tx_energies.append(e_tx)
             rates_list.append(rate_bps)
 
+        # --- 6b. Optional uplink-physics override -----------------------------
+        # By default the per-client loop above modelled an FDMA orthogonal
+        # uplink: each client gets a bandwidth slice B/M, uploads independently,
+        # and tx energy = p·t. An algorithm can override this by implementing
+        # recompute_uplink_physics() to rewrite each ClientUpdate's upload_time_s,
+        # tx_energy_j, total_time_s and total_energy_j in place — e.g. FedOTA
+        # replaces it with over-the-air computation (all clients transmit
+        # simultaneously over the full bandwidth, so upload time is constant and
+        # independent of M; tx energy is the squared norm of the transmitted
+        # signal). No-op for FedAvg/FedProx (they don't define the method), so
+        # this is fully backward-compatible.
+        if hasattr(self.server.algorithm, "recompute_uplink_physics"):
+            self.server.algorithm.recompute_uplink_physics(
+                client_updates,
+                total_bandwidth_hz=cfg_w.total_bandwidth_hz,
+                downlink_negligible=self._downlink_negligible,
+            )
+            # Re-derive the per-client metric lists from the (now-overwritten)
+            # ClientUpdate fields so RoundResult / CSV reflect the new physics.
+            # For the default FDMA path this block never runs, so those results
+            # are byte-for-byte unchanged.
+            upload_times = [u.upload_time_s for u in client_updates]
+            download_times = [u.download_time_s for u in client_updates]
+            tx_energies = [u.tx_energy_j for u in client_updates]
+
         # --- 7. Server aggregates ---
         self.server.aggregate(client_updates)
 
-        # Synchronous round: bottlenecked by the slowest client
+        # Synchronous round: bottlenecked by the slowest client. For OTA this is
+        # max(compute) + constant simultaneous upload; for FDMA it is
+        # max(compute + own-slice upload).
         round_duration = max(
             u.total_time_s for u in client_updates
         )

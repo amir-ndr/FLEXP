@@ -93,6 +93,33 @@ async_fl:
   alpha: 0.1
   window_size: 10
 
+# Over-the-air (AirComp) aggregation settings — used only by FedOTA and other
+# algorithms built on flsim.system.ota.OTAChannel (Yang et al. 2019,
+# arXiv:1812.11750). Ignored by digital algorithms (FedAvg, FedProx, FedAsync).
+#
+# Like FedProx's mu, these are algorithm hyperparameters passed to the
+# constructor — sync algorithms don't read config directly. This section is the
+# canonical place to record/document your chosen values; mirror them into the
+# FedOTA(...) call in your experiment:
+#   FedOTA(p0_w=0.01, noise_power_w=1.03e-20, gamma_db=3.0)
+#
+# p0_w:          per-device peak transmit power P0 in watts (a natural choice
+#                is dbm_to_watts(wireless.tx_power_dbm) to reuse the same budget).
+# noise_power_w: receiver noise power sigma^2 per scalar channel use, in watts.
+#                Calibrate to your channel_gain() scale — see examples/ota_experiment.py.
+# gamma_db:      target aggregation-MSE budget in dB. Looser (higher) selects
+#                more devices but injects more aggregation noise. Paper uses 5 dB.
+#
+# The OTA uplink is simultaneous over the FULL wireless.total_bandwidth_hz (not
+# sliced per device), so upload time = model_size_scalars / total_bandwidth_hz,
+# constant regardless of how many devices participate. Transmission energy is
+# the squared norm of the transmitted signal (paper eq. 5), NOT p*t. FedOTA
+# writes both into the standard RoundResult/CSV via recompute_uplink_physics().
+ota:
+  p0_w:          0.01
+  noise_power_w: 1.03e-20
+  gamma_db:      3.0
+
 # Plots generated after each run (and in comparison experiments).
 # Each entry produces one PNG. Remove entries you don't want.
 # Available metrics (CSV columns):
