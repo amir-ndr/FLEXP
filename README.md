@@ -1,8 +1,19 @@
 # flsim — Federated Learning Simulator
 
-A research-grade FL simulator with clean 4-layer architecture designed for easy extension.  
-Supports both **synchronous** (FedAvg, FedProx) and **asynchronous** (FedAsync) federated learning.  
-Write a new algorithm or experiment by overriding only the methods that change.
+A research-grade FL simulator with a clean, layered architecture designed for easy extension.
+It supports four training paradigms, each with its own orchestrator but a shared
+component/experiment/plotting stack:
+
+| Paradigm | Orchestrator | Built-in algorithms |
+|---|---|---|
+| **Synchronous** FL | `Simulator` | `FedAvg`, `FedProx` |
+| **Asynchronous** FL | `AsyncSimulator` | `FedAsync` (+ Const/Poly/Hinge staleness), `FedAsyncTopKFastTotal` (semi-async buffering), `FedAsyncSimulatedStaleness` |
+| **Over-the-air** aggregation (AirComp) | `Simulator` + uplink-physics hook | `FedOTA` |
+| **Split learning** (SL / SplitFed) | `SplitSimulator` | SL, SFLV1, SFLV2 (via `client_mode` × `server_mode`) |
+
+The recurring design principle across all four: **write a new algorithm or
+experiment by overriding only the methods that change.** Each section below ends
+with copy-pasteable patterns for doing exactly that.
 
 ---
 
@@ -12,11 +23,17 @@ Write a new algorithm or experiment by overriding only the methods that change.
 # Install
 pip install -e flsim/
 
-# Run the canonical FedAvg experiment (synchronous)
+# Synchronous FedAvg
 python examples/fedavg_experiment.py
 
-# Run the async FedAsync experiment (async, all variants)
+# Asynchronous FedAsync — Const/Poly/Hinge + semi-async TopK + FedAvg baseline
 python examples/fedasync_experiment.py
+
+# Over-the-air aggregation — FedOTA (several MSE budgets) vs digital FedAvg
+python examples/ota_experiment.py
+
+# Split learning — Normal / FL / SL / SFLV1 / SFLV2 (Figure-2-style comparison)
+python examples/splitfed_experiment.py
 
 # With CLI overrides
 python examples/fedavg_experiment.py --rounds 50 --clients_per_round 5 --lr 0.005
@@ -24,6 +41,10 @@ python examples/fedavg_experiment.py --rounds 50 --clients_per_round 5 --lr 0.00
 # Re-plot any saved CSV
 python plot_results.py outputs/fedAVG/fedavg/fedavg.csv
 ```
+
+For long runs on a GPU cluster, ready-made SLURM scripts live in `slurm/`
+(`run_fedasync.slurm`, `run_ota.slurm`, `run_splitfed.slurm`, …) — each
+auto-detects CUDA and logs the GPU it landed on.
 
 > **Note:** There is no `run.py`. The entry point is always an experiment file
 > in `examples/` (or your own script). All wiring utilities live in `flsim/experiments/wiring.py`.

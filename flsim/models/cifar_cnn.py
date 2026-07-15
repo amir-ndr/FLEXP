@@ -9,12 +9,19 @@ Architecture:
 
 Input: (B, 3, 32, 32) — 3-channel 32×32 CIFAR-10 images
 Output: (B, 10) — logits for 10 object classes
+
+Splittable (flsim.interfaces.splittable): ordered_layers() exposes the 17
+layers below as a flat list (indices 0-11 = features, 12-16 = classifier) so
+flsim.system.split_model.split_model() can cut the network for split
+learning (SL/SFLV1/SFLV2) at any index in [1, 16].
 """
 
 import torch.nn as nn
 
+from flsim.interfaces.splittable import Splittable
 
-class CifarCNN(nn.Module):
+
+class CifarCNN(nn.Module, Splittable):
     """
     Small 3-layer CNN for CIFAR-10 with Batch Normalisation.
 
@@ -60,3 +67,7 @@ class CifarCNN(nn.Module):
             tensor of shape (B, 10) — unnormalized logits.
         """
         return self.classifier(self.features(x))
+
+    def ordered_layers(self) -> list:
+        """17 layers in forward order: features[0:12] then classifier[0:5]."""
+        return list(self.features) + list(self.classifier)

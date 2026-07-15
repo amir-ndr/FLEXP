@@ -26,6 +26,15 @@ learning:
   # by elapsed simulated time regardless of how many rounds/epochs that took.
   # global_rounds is ignored while this is active.
   stop_by_time_s: null
+  # Split learning only (flsim.core.split_simulator.SplitSimulator via
+  # flsim.experiments.split_base.SplitExperiment) — the paper's "cut layer":
+  # the client keeps ordered_layers()[:cut_layer], the server keeps the rest.
+  # Model-dependent — see each Splittable model's docstring for its layer
+  # count and a sensible default (e.g. mnist_cnn has 10 layers; cut_layer=6
+  # is the natural features/classifier boundary). Must satisfy
+  # 1 <= cut_layer <= num_layers-1. Overridable per-run via
+  # run_single_split(cut_layer=...) without touching this file.
+  cut_layer: 6
 
 system:
   # CPU frequency heterogeneity mode:

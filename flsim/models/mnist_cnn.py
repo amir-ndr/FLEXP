@@ -8,12 +8,20 @@ Architecture matches the standard FL benchmark model from McMahan et al. (2017):
 
 Input: (B, 1, 28, 28) — single-channel 28×28 MNIST images
 Output: (B, 10) — logits for 10 digit classes
+
+Splittable (flsim.interfaces.splittable): ordered_layers() exposes the 10
+layers below as a flat list (indices 0-5 = features, 6-9 = classifier) so
+flsim.system.split_model.split_model() can cut the network for split
+learning (SL/SFLV1/SFLV2) at any index in [1, 9]. See that module for the
+cut_layer validity rule.
 """
 
 import torch.nn as nn
 
+from flsim.interfaces.splittable import Splittable
 
-class MnistCNN(nn.Module):
+
+class MnistCNN(nn.Module, Splittable):
     """
     Lightweight 2-layer CNN for MNIST.
 
@@ -49,3 +57,7 @@ class MnistCNN(nn.Module):
             tensor of shape (B, 10) — unnormalized logits.
         """
         return self.classifier(self.features(x))
+
+    def ordered_layers(self) -> list:
+        """10 layers in forward order: features[0:6] then classifier[0:4]."""
+        return list(self.features) + list(self.classifier)
