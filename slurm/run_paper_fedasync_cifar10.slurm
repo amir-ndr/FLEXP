@@ -105,7 +105,7 @@ print('torch:', torch.__version__,
 python examples/paper_fedasync_cifar10.py \
     --set data.dataset=cifar10 data.num_clients=100 learning.batch_size=50 \
           learning.learning_rate=0.1 async_fl.rho=0.005 \
-    --seeds 10 \
+    --seeds 1 \
     --staleness 4 16 \
     --output-dir outputs/paper_fedasync_cifar10/
 
