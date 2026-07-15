@@ -275,24 +275,32 @@ class FedAsyncSimulatedStaleness(FedAsync):
         "We simulate the asynchrony by randomly sampling the staleness (t−τ)
         from a uniform distribution."
 
-    How it works
-    ------------
-    The simulator always calls mixing_weight(base_alpha, real_staleness) first,
-    then logs alpha_t, then calls aggregate_async(..., alpha_t).
+    How it works (TRUE stale-model contribution)
+    ---------------------------------------------
+    Rather than only scaling alpha by a sampled staleness (which would leave the
+    update itself fresh), this variant makes the sampled staleness REAL: at each
+    dispatch the simulator asks this algorithm for a staleness k via
+    sample_dispatch_staleness(), then trains the client on the genuinely OLD
+    global-model snapshot x_{t-k} it kept in history. The stale update is then
+    mixed into the current model with alpha_t = alpha * s(k). So the sampled
+    staleness affects BOTH the mixing weight AND which model the client trained
+    on — a faithful simulation of asynchrony, not just an alpha discount.
 
-    Here, mixing_weight() IGNORES the real timing-based staleness and samples
-    a new one from Uniform{0, ..., max_staleness}. The sampled value is stored
-    so aggregate_async can use it; the logged alpha_used correctly reflects the
-    sampled staleness (not the real one).
+    This requires the AsyncSimulator's model-history mechanism (keyed on this
+    class exposing sample_dispatch_staleness); it is enabled automatically.
+    It works with any window_size, but the paper's controlled setup uses
+    window_size=1 (so the ONLY source of staleness is the sampling, giving the
+    clean Uniform{0..K} distribution the paper specifies). With window_size>1
+    the sampling still applies per dispatch.
 
-    This means:
-      - The staleness column in the CSV = real timing staleness (always ~0 with
-        window_size=1, or small with larger windows).
-      - alpha_used column = alpha * s(sampled_staleness) — this is what the paper
-        studies and what drives convergence.
+    CSV columns:
+      - staleness  = the sampled k (the real staleness of the update), NOT ~0.
+      - alpha_used = alpha * s(k).
 
     Args:
         max_staleness (int): upper bound K. Paper uses 4 (low) or 16 (high).
+                             Early in training (epoch < K) the effective bound is
+                             clamped to how many past model versions exist yet.
         seed (int):          seed for the staleness sampling RNG — independent
                              from the main simulator RNG so results are
                              reproducible regardless of other randomness.
@@ -310,29 +318,21 @@ class FedAsyncSimulatedStaleness(FedAsync):
             raise ValueError(f"max_staleness must be >= 0, got {max_staleness}")
         self.max_staleness    = max_staleness
         self._staleness_rng   = np.random.RandomState(seed)
-        self._sampled_staleness = 0   # set by mixing_weight, read by aggregate_async
 
-    def mixing_weight(self, base_alpha: float, staleness: int) -> float:
+    def sample_dispatch_staleness(self, current_epoch: int, max_available: int) -> int:
         """
-        Sample k ~ Uniform{0, ..., max_staleness}, return base_alpha * s(k).
+        Sample k ~ Uniform{0, ..., min(max_staleness, max_available)}.
 
-        The real timing-based staleness argument is intentionally ignored.
-        The sampled k is cached so aggregate_async can access it for record-keeping.
+        Called by the AsyncSimulator at dispatch time. The simulator then trains
+        the client on the stale global-model snapshot x_{t-k} and carries k
+        forward as the update's staleness (used for both the mixing weight and
+        the log). max_available = number of past model versions currently in
+        history minus 1, so early rounds can't request a staleness deeper than
+        the history that exists yet.
         """
-        self._sampled_staleness = int(
-            self._staleness_rng.randint(0, self.max_staleness + 1)
-        )
-        return base_alpha * self._s(self._sampled_staleness)
+        upper = min(self.max_staleness, max_available)
+        return int(self._staleness_rng.randint(0, upper + 1))
 
-    def aggregate_async(
-        self, global_model, update, global_epoch, staleness, alpha_t
-    ) -> OrderedDict:
-        """
-        Standard FedAsync mixing.  alpha_t was already computed from the sampled
-        staleness in mixing_weight() — just use it directly.
-        """
-        return super().aggregate_async(
-            global_model, update, global_epoch,
-            self._sampled_staleness,   # pass sampled value (not real timing staleness)
-            alpha_t,
-        )
+    # mixing_weight()   → inherited from FedAsync: base_alpha * s(k), where the
+    #                     simulator now passes the dispatch-sampled k as staleness.
+    # aggregate_async() → inherited from FedAsync: standard (1-alpha_t) mixing.

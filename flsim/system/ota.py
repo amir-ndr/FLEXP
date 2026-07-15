@@ -367,7 +367,7 @@ class OTAChannel:
         for key, tensor in agg_state.items():
             noise = torch.from_numpy(
                 rng.normal(loc=0.0, scale=noise_std, size=tuple(tensor.shape))
-            ).to(dtype=tensor.dtype)
+            ).to(dtype=tensor.dtype, device=tensor.device)
             agg_state[key] = tensor + noise
 
         return agg_state, mse

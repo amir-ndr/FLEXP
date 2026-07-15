@@ -93,11 +93,19 @@ class _ArrivalEvent:
         tau:          global epoch at which the client was dispatched
                       (= the model version the client trained on).
         update:       the ClientUpdate produced by local training.
+        forced_staleness: for controlled-staleness algorithms (those exposing
+                      sample_dispatch_staleness), the k that was sampled at
+                      dispatch and on whose stale model snapshot x_{t-k} the
+                      client was actually trained. When set, the updater uses
+                      this k as THE staleness (for the mixing weight and the
+                      log) instead of the real timing-based staleness. None for
+                      ordinary async, where staleness = arrival_epoch - tau.
     """
     arrival_time: float
     seq:          int
     tau:          int
     update:       Any
+    forced_staleness: Any = None
 
     def __lt__(self, other):
         """Primary sort: arrival_time. Tie-break: seq (FIFO)."""
@@ -227,6 +235,56 @@ class AsyncSimulator:
         # Insertion counter for stable priority-queue tie-breaking
         self._seq = 0
 
+        # Controlled-staleness support (e.g. FedAsyncSimulatedStaleness): if the
+        # algorithm exposes sample_dispatch_staleness(), the simulator keeps a
+        # rolling history of past global-model snapshots so a dispatched client
+        # can be trained on a genuinely OLD model x_{t-k} (k sampled by the
+        # algorithm), rather than the current one. This makes the sampled
+        # staleness affect the actual update (stale model contributes), not just
+        # the mixing weight. Disabled (no history kept, zero overhead) for
+        # ordinary async algorithms, whose staleness already arises naturally
+        # from real dispatch/arrival timing when window_size > 1.
+        self._uses_forced_staleness = hasattr(server.algorithm, "sample_dispatch_staleness")
+        self._model_history: list = []      # newest-last list of state_dict snapshots
+        self._max_history = int(getattr(server.algorithm, "max_staleness", 0)) + 1
+        self._stale_holder = None            # lazy scratch nn.Module for loading snapshots
+
+    # ------------------------------------------------------------------
+    # Controlled-staleness helpers
+    # ------------------------------------------------------------------
+
+    def _snapshot_global_model(self) -> None:
+        """Append a detached CPU-independent clone of the current global model
+        state_dict to the rolling history (bounded to _max_history)."""
+        snap = {k: v.detach().clone() for k, v in self.server.global_model.state_dict().items()}
+        self._model_history.append(snap)
+        if len(self._model_history) > self._max_history:
+            self._model_history.pop(0)
+
+    def _resolve_training_model(self, current_epoch: int):
+        """
+        Return (model_to_train_on, forced_staleness).
+
+        For controlled-staleness algorithms: ask the algorithm for a staleness k
+        (bounded by how many snapshots we actually have), load the snapshot from
+        k versions ago into a scratch model, and return (that_model, k). The
+        client will train on the genuinely stale model x_{t-k}.
+
+        For ordinary async: return (current global model, None).
+        """
+        if not self._uses_forced_staleness or not self._model_history:
+            return self.server.global_model, None
+
+        max_available = len(self._model_history) - 1   # 0 => only current model exists
+        k = int(self.server.algorithm.sample_dispatch_staleness(current_epoch, max_available))
+        k = max(0, min(k, max_available))
+        snapshot = self._model_history[-1 - k]          # k versions back (k=0 => current)
+
+        if self._stale_holder is None:
+            self._stale_holder = copy.deepcopy(self.server.global_model)
+        self._stale_holder.load_state_dict(snapshot)
+        return self._stale_holder, k
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -284,6 +342,11 @@ class AsyncSimulator:
             "upload_size_bits":  self._upload_bits,
         }
 
+        # Seed the model history with the initial (epoch-0) global model so the
+        # first dispatched clients can already be assigned a (small) staleness.
+        if self._uses_forced_staleness:
+            self._snapshot_global_model()
+
         pending: list = []
         initial_batch = self.server.algorithm.select_clients(
             self.clients, self._window_size, self.rng, **selection_ctx
@@ -313,7 +376,15 @@ class AsyncSimulator:
             batch_events = [heapq.heappop(pending) for _ in range(batch_size)]
             simulated_time = max(ev.arrival_time for ev in batch_events)
 
-            stalenesses = [global_epoch - ev.tau for ev in batch_events]
+            # Staleness per update: for controlled-staleness algorithms use the
+            # k that was sampled at dispatch (and on whose stale model snapshot
+            # the client was actually trained); otherwise the real timing-based
+            # staleness = arrival_epoch - tau.
+            stalenesses = [
+                ev.forced_staleness if ev.forced_staleness is not None
+                else global_epoch - ev.tau
+                for ev in batch_events
+            ]
             # Representative staleness for the batch's mixing weight: the WORST
             # (max) staleness, so one stale update in the batch isn't hidden by
             # fresher ones — conservative per paper Remark 2 (larger staleness
@@ -340,6 +411,11 @@ class AsyncSimulator:
                 )
             self.server.global_model.load_state_dict(new_state)
             self.server.round_idx = global_epoch + 1
+
+            # Record the new global-model version so future dispatches can be
+            # trained on it as a stale snapshot (controlled-staleness only).
+            if self._uses_forced_staleness:
+                self._snapshot_global_model()
 
             # Build result record. Single-arrival epochs (B=1) log that one
             # update's own fields, exactly as before. Buffered epochs (B>1) log
@@ -515,16 +591,23 @@ class AsyncSimulator:
             client.profile, upload_time_s=t_up, tx_power_w=p_w,
         )
 
-        # ---- local training (on snapshot of current global model) ----
+        # ---- local training (on snapshot of the global model the client received) ----
+        # Ordinarily this is the CURRENT global model (staleness then arises
+        # naturally from dispatch/arrival timing when window_size > 1). For a
+        # controlled-staleness algorithm it is a genuinely OLD snapshot x_{t-k}
+        # with k sampled by the algorithm, so the sampled staleness affects the
+        # actual update, not just the mixing weight.
+        train_model, forced_staleness = self._resolve_training_model(current_epoch)
+
         # Local objective solved here is g_xt(x; z) = f(x; z) + (rho/2)||x - xt||^2
         # (paper §3, Algorithm 1 "Process Worker"). rho comes from the algorithm's
         # `rho` attribute if set, else config.async_fl.rho, else 0.0 (plain SGD).
         # configure_client() may still override per-client via client.proximal_mu.
         self.server.algorithm.configure_client(
-            client, self.server.global_model, current_epoch
+            client, train_model, current_epoch
         )
         state_dict, n_samples, train_loss = client.train(
-            global_model=self.server.global_model,
+            global_model=train_model,
             local_epochs=cfg.local_epochs,
             batch_size=cfg.batch_size,
             learning_rate=cfg.learning_rate,
@@ -560,4 +643,5 @@ class AsyncSimulator:
             seq=self._seq,
             tau=current_epoch,
             update=update,
+            forced_staleness=forced_staleness,
         )
