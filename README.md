@@ -56,18 +56,20 @@ auto-detects CUDA and logs the GPU it landed on.
 ```
 FLEXP/
 ├── flsim/
-│   ├── interfaces/              # ABCs — the contracts everything must satisfy
-│   │   ├── algorithm.py           FederatedAlgorithm    (sync: select_clients, configure_client, aggregate)
-│   │   ├── async_algorithm.py     AsyncFederatedAlgorithm (async: select_clients, mixing_weight, aggregate_async)
-│   │   ├── allocator.py           ResourceAllocator     (allocate_bandwidth, allocate_power, allocate_cpu_freq)
-│   │   ├── channel_model.py       ChannelModel          (channel_gain, achievable_rate_bps)
-│   │   ├── time_model.py          TimeModel             (compute_training_time, compute_upload_time, …)
-│   │   └── partitioner.py         DataPartitioner       (partition, describe)
+│   ├── interfaces/              # ABCs / mixins — the contracts everything must satisfy
+│   │   ├── algorithm.py           FederatedAlgorithm      (sync: select_clients, configure_client, aggregate)
+│   │   ├── async_algorithm.py     AsyncFederatedAlgorithm (async: select_clients, mixing_weight, aggregate_async, aggregate_buffered)
+│   │   ├── splittable.py          Splittable              (split learning: ordered_layers)
+│   │   ├── allocator.py           ResourceAllocator       (allocate_bandwidth, allocate_power, allocate_cpu_freq)
+│   │   ├── channel_model.py       ChannelModel            (channel_gain, achievable_rate_bps)
+│   │   ├── time_model.py          TimeModel               (compute_training_time, compute_upload_time, …)
+│   │   └── partitioner.py         DataPartitioner         (partition, describe)
 │   │
 │   ├── algorithms/              # FL algorithms
 │   │   ├── fedavg.py              FedAvg   (sync, sample-weighted aggregation)
 │   │   ├── fedprox.py             FedProx  (sync, proximal regularisation)
-│   │   └── fedasync.py            FedAsync (async) + FedAsyncTopKFastTotal + FedAsyncFixedFast
+│   │   ├── fedasync.py            FedAsync + FedAsyncTopKFastTotal (semi-async) + FedAsyncSimulatedStaleness
+│   │   └── fedota.py              FedOTA   (over-the-air / AirComp aggregation)
 │   │
 │   ├── allocators/              # Resource allocation policies
 │   │   └── equal_split.py         EqualSplitAllocator (FDMA equal split, max power, profile freq)
@@ -77,25 +79,30 @@ FLEXP/
 │   │   ├── fdma.py                Alias for PathLossChannelModel
 │   │   └── exp_fading.py          h = h0·ρ·d⁻², ρ~Exp(1) per round
 │   │
-│   ├── system/                  # Computation + energy formulas
-│   │   ├── cellular_time.py       τ = (I·C·D)/f
-│   │   └── energy.py              E_comp = κ·I·C·D·f²,  E_tx = p·t_up
+│   ├── system/                  # Computation, energy, and aggregation-physics formulas
+│   │   ├── cellular_time.py       τ = (I·C·D)/f,  Shannon-rate upload time
+│   │   ├── energy.py              E_comp = κ·I·C·D·f²,  E_tx = p·t_up  (FDMA)
+│   │   ├── ota.py                 OTAChannel — AirComp physics (zero-forcing, MSE, squared-norm energy)
+│   │   └── split_model.py         split_model(model, cut_layer) → (client_side, server_side)
 │   │
 │   ├── data/                    # Dataset loaders + partitioners
-│   ├── models/                  # PyTorch model definitions
+│   ├── models/                  # PyTorch models (Splittable: expose ordered_layers())
 │   ├── profiles/                # Client system profiles (distance, freq, power)
 │   ├── core/
-│   │   ├── simulator.py           Synchronous FL simulator
-│   │   ├── async_simulator.py     Asynchronous FL simulator (discrete-event)
+│   │   ├── simulator.py           Synchronous FL simulator (+ optional uplink-physics hook for OTA)
+│   │   ├── async_simulator.py     Asynchronous FL simulator (discrete-event, model-history for staleness)
+│   │   ├── split_simulator.py     Split-learning orchestrator (SL / SFLV1 / SFLV2)
 │   │   ├── server.py              Server (holds global model + algorithm)
 │   │   ├── client.py              Client (local PyTorch training)
+│   │   ├── split_client.py        SplitClient (forward/backward relay training)
 │   │   ├── evaluator.py           Test-set evaluation
 │   │   ├── logger.py              Sync CSV logger + plots
 │   │   └── async_logger.py        Async CSV logger + plots (staleness, alpha_t columns)
 │   ├── configs/                 # YAML experiment configs
 │   ├── experiments/
-│   │   ├── base.py                Experiment + RunResult  (sync)
-│   │   ├── async_base.py          AsyncExperiment         (async, extends Experiment)
+│   │   ├── base.py                Experiment + RunResult  (sync; shared plotting for all paradigms)
+│   │   ├── async_base.py          AsyncExperiment         (async)
+│   │   ├── split_base.py          SplitExperiment         (split learning)
 │   │   ├── compare_algorithms.py  AlgorithmComparison
 │   │   ├── parameter_sweep.py     ParameterSweep
 │   │   └── wiring.py              Config loading + component factories
@@ -103,8 +110,11 @@ FLEXP/
 │
 ├── examples/
 │   ├── fedavg_experiment.py       Canonical FedAvg run (sync)
-│   └── fedasync_experiment.py     FedAsync variants + FedAvg baseline (async)
+│   ├── fedasync_experiment.py     FedAsync variants + FedAvg baseline (async)
+│   ├── ota_experiment.py          FedOTA (several MSE budgets) vs digital FedAvg
+│   └── splitfed_experiment.py     Normal / FL / SL / SFLV1 / SFLV2 comparison
 │
+├── slurm/                         # GPU-cluster job scripts (auto-detect CUDA, log GPU)
 ├── plot_results.py                Standalone CSV → plots tool
 └── README.md
 ```
@@ -261,42 +271,63 @@ Updater loop (runs T times):
 Bandwidth is divided equally among `window_size` concurrent clients to model uplink contention:
 `effective_bw_per_client = total_bandwidth / window_size`.
 
-### Built-in algorithms and selection modes
+### The three FedAsync building blocks
+
+FedAsync exposes exactly the three knobs the paper (Xie et al. 2019) parameterises,
+plus the concurrency level. Every built-in variant is a combination of these:
+
+**1. Staleness function `s(t−τ)`** — how much a stale update is trusted, via
+`alpha_t = alpha × s(staleness)`:
 
 ```python
-from flsim.algorithms.fedasync import (
-    FedAsync, FedAsyncTopKFastTotal, FedAsyncFixedFast,
-)
+from flsim.algorithms.fedasync import FedAsync
 
-# Constant alpha (FedAsync+Const from the paper)
-FedAsync(alpha=0.1)
-
-# Polynomial staleness decay: alpha_t = alpha * (staleness + 1)^{-a}
-FedAsync(alpha=0.1, staleness_func="polynomial", a=0.5)
-
-# Hinge staleness decay: alpha_t = alpha if staleness <= b, else alpha / (a*(k-b)+1)
-FedAsync(alpha=0.1, staleness_func="hinge", a=10.0, b=4.0)
-
-# Always dispatch the K fastest clients by TOTAL time (compute + upload).
-# The simulator passes channel_model / bw_per_client / upload_size automatically
-# via kwargs, so a fast-compute but weak-channel client is correctly deprioritised.
-# Falls back to compute-only ranking if no channel context is available.
-FedAsyncTopKFastTotal(alpha=0.1)
-
-# Sample randomly from a fixed pool of the M fastest-compute clients
-FedAsyncFixedFast(pool_size=20, alpha=0.1)
-
-# Ratio-based concurrency: set window_size = int(ratio * num_clients) in config
-# e.g., 10% of 100 clients → async_fl.window_size: 10
+FedAsync(alpha=0.1)                                              # Const:  s(k) = 1
+FedAsync(alpha=0.1, staleness_func="polynomial", a=0.5)         # Poly:   s(k) = (k+1)^{-a}
+FedAsync(alpha=0.1, staleness_func="hinge", a=10.0, b=4.0)      # Hinge:  s(k) = 1 if k<=b else 1/(a(k-b)+1)
 ```
 
-**Selection modes compared:**
+**2. Local proximal regularization `ρ`** (paper §3, Algorithm 1's worker objective
+`g_xt(x;z) = f(x;z) + (ρ/2)‖x−xt‖²`) — the client trains against drift from the
+model it received:
 
-| Class | Sorts by | Best when |
+```python
+FedAsync(alpha=0.1, rho=0.01)     # rho defaults to config.async_fl.rho, else 0 (plain SGD)
+```
+
+**3. Buffer size `k` (semi-async)** — how many arrivals are aggregated per model
+update. `k=1` (default) is fully async; `k>1` buffers the `k` fastest-to-arrive
+clients, aggregates them together with one mixing step, and leaves the other
+`window_size − k` clients training uninterrupted:
+
+```python
+from flsim.algorithms.fedasync import FedAsyncTopKFastTotal
+
+FedAsyncTopKFastTotal(alpha=0.1, k=5)   # needs async_fl.window_size >= 5
+```
+
+**Variants at a glance:**
+
+| Class | Buffer | Notes |
 |---|---|---|
-| `FedAsync` | Random | Baseline / IID clients |
-| `FedAsyncTopKFastTotal` | Compute + upload estimate (falls back to compute-only) | Fastest end-to-end clients (heterogeneous CPUs *and* channels) |
-| `FedAsyncFixedFast` | Random within top-M fastest | Variety among fast clients |
+| `FedAsync` | `k=1` (fully async) | Random selection; Const/Poly/Hinge via `staleness_func` |
+| `FedAsyncTopKFastTotal` | `k>1` (semi-async) | Buffers the `k` first-to-arrive of `window_size` in flight. `k=1` ≡ `FedAsync`; `k=window_size` ≡ synchronous batching |
+| `FedAsyncSimulatedStaleness` | `k=1` | Paper-replication (§5.2): samples staleness `k ~ Uniform{0..K}` per dispatch and trains the client on the **genuinely old** model snapshot `x_{t−k}` (see below) |
+
+> **`window_size` is concurrency, not a per-round cohort.** Async has no rounds —
+> `window_size` is how many clients are simultaneously *in flight* (training,
+> not yet aggregated). All `N` clients stay eligible throughout; larger
+> `window_size` → more overlap → more staleness → more throughput. Set it via
+> `async_fl.window_size` (default = `clients_per_round`).
+
+> **Genuine stale-model training.** With `window_size > 1`, staleness is real: a
+> client trains on a deep-copied snapshot at dispatch (epoch τ) and arrives many
+> epochs later, so its update *was* computed on an old model. For the
+> paper-replication `FedAsyncSimulatedStaleness` (which pins `window_size=1` to
+> get a clean `Uniform{0..K}` distribution), the simulator keeps a rolling
+> history of past global models so a sampled staleness `k` also makes the client
+> train on the real `x_{t−k}` snapshot — the sampled staleness affects the
+> **actual update**, not just the mixing weight.
 
 ### Running an async experiment
 
@@ -350,14 +381,21 @@ MyExp(
 Every async algorithm subclasses `AsyncFederatedAlgorithm` from  
 `flsim/interfaces/async_algorithm.py`.
 
-There are **three override hooks** — all optional except `aggregate_async`:
+There are **five override hooks** — all optional except `aggregate_async`:
 
 | Method | Required | Purpose |
 |---|---|---|
-| `aggregate_async(global_model, update, global_epoch, staleness, alpha_t)` | **Yes** | How one arriving update changes the global model |
+| `aggregate_async(global_model, update, global_epoch, staleness, alpha_t)` | **Yes** | How one arriving update changes the global model (`buffer_size=1`) |
+| `aggregate_buffered(global_model, updates, global_epoch, stalenesses, alpha_t)` | Only if `buffer_size>1` | How a batch of `k` buffered updates is aggregated (semi-async) |
 | `mixing_weight(base_alpha, staleness)` | No | Staleness-adaptive `alpha_t = base_alpha * s(staleness)`. Default: constant. |
-| `select_clients(all_clients, num_to_trigger, rng, **kwargs)` | No | Which client to dispatch next. Default: uniform random. |
-| `configure_client(client, global_model, global_epoch)` | No | Per-dispatch client setup. Default: no-op. |
+| `select_clients(all_clients, num_to_trigger, rng, **kwargs)` | No | Which client(s) to dispatch next. Default: uniform random. |
+| `configure_client(client, global_model, global_epoch)` | No | Per-dispatch client setup (e.g. FedProx `mu`). Default: no-op. |
+
+> Set the class/instance attribute `buffer_size = k` to make the simulator buffer
+> `k` arrivals per model update and call `aggregate_buffered()` instead of
+> `aggregate_async()`. Optionally expose `sample_dispatch_staleness(current_epoch,
+> max_available)` to have the simulator train dispatched clients on a chosen
+> `x_{t−k}` snapshot (see `FedAsyncSimulatedStaleness`).
 
 #### Pattern A — only change the update rule
 
@@ -557,6 +595,253 @@ One row per global epoch (= one server update). Key columns:
 
 ---
 
+## Over-the-air computation (FedOTA)
+
+Over-the-air computation (AirComp) replaces per-client digital upload + server
+averaging with **simultaneous analog transmission**: every selected client
+transmits at once over the same channel, and the wireless channel's own signal
+superposition physically computes the weighted sum. Communication cost stops
+scaling with the number of clients, at the price of channel-induced aggregation
+noise. Based on Yang, Jiang, Shi & Ding, *"Federated Learning via Over-the-Air
+Computation"* (arXiv:1812.11750).
+
+### What FedOTA changes vs digital FedAvg
+
+| | Digital FedAvg (FDMA) | FedOTA (AirComp) |
+|---|---|---|
+| **Uplink** | Each client gets a bandwidth slice `B/M`, uploads independently | All clients transmit **simultaneously** over the full band |
+| **Aggregation** | Exact sample-weighted average | Sample-weighted average **+ Gaussian noise** matching the achieved MSE |
+| **Upload time** | `size_bits / rate_k` — grows with #clients | `num_symbols / total_bandwidth_hz` — **constant**, independent of #clients |
+| **TX energy** | `p · t_up` (power × time) | `num_symbols · ‖b_i‖²` — **squared norm** of the transmitted signal (paper eq. 5) |
+| **Device selection** | any policy | keep every device whose MSE ≤ `gamma` (maximise participation under an error budget) |
+
+### The physics (single-antenna, N=1)
+
+The reusable primitive is `flsim.system.ota.OTAChannel`, which owns the two
+OTA-specific parameters and implements the paper's equations (specialised to a
+single-antenna base station — see the module docstring for why the multi-antenna
+DC/beamforming case is out of scope):
+
+```
+eta   = min_i [ P0 · g_i / phi_i² ]          # power-normalizing factor (eq. 9)
+b_i   = sqrt(eta) · phi_i / sqrt(g_i)         # zero-forcing transmit scalar (eq. 8)
+MSE   = sigma² / eta                          # achieved aggregation MSE (eq. 10)
+zhat  = weighted_average + N(0, MSE / (Σ phi_i)²)   # noisy aggregate (eq. 2, 6)
+```
+
+where `phi_i = num_samples` (pre-processing weight), `g_i = channel_gain`,
+`P0 = p0_w` (peak transmit power), `sigma² = noise_power_w` (receiver noise per
+channel use). The aggregation is **provably** FedAvg's weighted average plus
+zero-mean noise whose variance equals the achieved `MSE(S)` — verified
+numerically (reduces to exact averaging as noise→0; unbiased under Monte Carlo).
+
+### Using `FedOTA`
+
+```python
+from flsim.algorithms.fedota import FedOTA
+from flsim.channel.conversions import dbm_to_watts
+
+# gamma is the target aggregation-MSE budget: looser (higher) selects MORE
+# devices but injects MORE noise. Give it in dB or linear (exactly one).
+FedOTA(p0_w=dbm_to_watts(10.0), noise_power_w=1.03e-20, gamma_db=5.0, seed=0)
+FedOTA(p0_w=0.01, noise_power_w=1e-20, gamma_linear=3.0)
+```
+
+`FedOTA` is a normal `FederatedAlgorithm` run by the **sync** `Simulator`. It
+only overrides three things — the pattern for any custom OTA algorithm:
+
+| Hook | What FedOTA does |
+|---|---|
+| `select_clients()` | keep every device with `phi_i²/g_i ≤ gamma·P0/sigma²` (closed-form MSE threshold); ignores `num_to_select` to maximise participation |
+| `recompute_uplink_physics()` | rewrites each `ClientUpdate`'s `upload_time_s` / `tx_energy_j` to OTA physics (constant time, squared-norm energy) — so the standard CSV energy/time columns are **correct for OTA**, not FDMA |
+| `aggregate()` | `OTAChannel.aggregate_state_dicts()` → weighted average + MSE-matched noise |
+
+> **Uplink-physics hook.** `Simulator._run_round()` calls
+> `algorithm.recompute_uplink_physics(client_updates, total_bandwidth_hz=...)`
+> **if the algorithm defines it** (a no-op `hasattr` check for FedAvg/FedProx).
+> This is the general mechanism for swapping the physical layer per-algorithm
+> without touching the shared round loop.
+
+### Config (`flsim/configs/base.yaml`)
+
+```yaml
+ota:
+  p0_w:          0.01        # per-device peak transmit power P0 (watts)
+  noise_power_w: 1.03e-20    # receiver noise sigma² per channel use (watts)
+  gamma_db:      3.0         # target aggregation-MSE budget (dB)
+```
+
+Like FedProx's `mu`, these are algorithm hyperparameters passed to the
+constructor — this section documents/records the chosen values. Calibrate
+`noise_power_w` to your `channel_gain()` scale (see `examples/ota_experiment.py`'s
+header for the method).
+
+### FedOTA-specific metrics
+
+Some OTA quantities have no standard CSV column and are accumulated on the
+algorithm object for inspection after `simulator.run()`:
+
+```python
+alg = FedOTA(...); exp.run_single("ota", components={"algorithm": alg})
+alg.mse_history        # list[float]            — achieved MSE(S) each round
+alg.energy_history     # list[dict[int,float]]  — {client_id: joules} each round (squared-norm)
+alg.excluded_history   # list[list[int]]        — client ids that failed the MSE budget
+```
+
+### Writing a custom OTA algorithm
+
+Reuse `OTAChannel` directly — you are not limited to FedOTA's threshold selection:
+
+```python
+from flsim.system.ota import OTAChannel
+from flsim.interfaces.algorithm import FederatedAlgorithm
+
+class MyOTAAlgorithm(FederatedAlgorithm):
+    def __init__(self, p0_w, noise_power_w, mu):
+        self.ota = OTAChannel(p0_w=p0_w, noise_power_w=noise_power_w)
+        self.mu  = mu   # e.g. combine OTA aggregation with a FedProx proximal term
+
+    def configure_client(self, client, global_model, round_idx):
+        client.proximal_mu = self.mu
+
+    def select_clients(self, all_clients, num_to_select, rng, **kwargs):
+        ...   # any policy — need not be MSE-threshold based
+
+    def aggregate(self, global_model, client_updates):
+        state_dicts = [u.state_dict   for u in client_updates]
+        phis        = [u.num_samples  for u in client_updates]
+        gains       = [u.channel_gain for u in client_updates]
+        agg, mse = self.ota.aggregate_state_dicts(state_dicts, phis, gains)
+        return agg
+```
+
+---
+
+## Split learning (SL / SplitFed V1 / V2)
+
+Split learning cuts the model into a **client-side** sub-network and a
+**server-side** sub-network at a configurable *cut layer*. The client computes
+the forward pass up to the cut, sends the activations ("smashed data") across a
+simulated wire, the server finishes the forward pass and computes the loss, and
+gradients flow back across the wire — so raw data never leaves the client *and*
+the client only ever holds part of the model. Based on Thapa, Chamikara Mahawaga
+Arachchige, Camtepe & Sun, *"SplitFed: When Federated Learning Meets Split
+Learning"* (AAAI-22, arXiv:2004.12088).
+
+Run by a dedicated orchestrator, `flsim.core.split_simulator.SplitSimulator`
+(split learning trains **two** cooperating sub-models via a relay — it doesn't
+fit the single-`aggregate()` contract of the other paradigms).
+
+### The cut layer
+
+Any model implementing the `Splittable` mixin exposes `ordered_layers()` — a
+flat list of its layers in forward order. `learning.cut_layer` is the index at
+which the network is split; the client keeps `layers[:cut_layer]`, the server
+keeps the rest. `MnistCNN` has 10 layers (cut at 6 = the features/classifier
+boundary); `CifarCNN` has 17.
+
+```yaml
+learning:
+  cut_layer: 6     # client = ordered_layers()[:6], server = the rest
+```
+
+Make any `nn.Module` splittable with one additive method (it does not affect the
+model's use in the other paradigms):
+
+```python
+from flsim.interfaces.splittable import Splittable
+
+class MyCNN(nn.Module, Splittable):
+    def __init__(self):
+        super().__init__()
+        self.features   = nn.Sequential(...)
+        self.classifier = nn.Sequential(...)
+    def forward(self, x):
+        return self.classifier(self.features(x))
+    def ordered_layers(self):
+        return list(self.features) + list(self.classifier)
+```
+
+### The three variants = two orthogonal axes
+
+The paper's three variants reduce to two independent choices — how the
+**client** side is combined across clients, and how the **server** side is:
+
+- **`sequential`** — one persistent model instance; clients are processed one at
+  a time (random order each epoch), each continuing from where the previous left
+  off. No aggregation.
+- **`parallel_fedavg`** — every client gets an independent copy, trains it, and
+  all copies are FedAvg-averaged (`W = Σ (n_k/n) W_k`) at the epoch's end.
+
+| Variant | `client_mode` | `server_mode` | Paper |
+|---|---|---|---|
+| **SL** | `sequential` | `sequential` | Table 1: "Client-side training: Sequential", "Model aggregation: No" |
+| **SFLV1** | `parallel_fedavg` | `parallel_fedavg` | both sides "executed separately in parallel and then aggregated" |
+| **SFLV2** | `parallel_fedavg` | `sequential` | client-side "same as SFLV1"; server-side sequential, "no FedAvg" |
+
+This orthogonal framing is *why a new variant is trivial* — a hypothetical
+"SplitFedAvg" or any custom split scheme is just a different point on these two
+axes (or a custom aggregation-weight function), with **no new orchestration
+code**.
+
+### Using `SplitExperiment`
+
+```python
+from flsim.experiments.split_base import SplitExperiment
+
+class MyExp(SplitExperiment):
+    def run(self):
+        r_sl    = self.run_single_split("sl",    label="SL",    client_mode="sequential",      server_mode="sequential")
+        r_sflv1 = self.run_single_split("sflv1", label="SFLV1", client_mode="parallel_fedavg", server_mode="parallel_fedavg")
+        r_sflv2 = self.run_single_split("sflv2", label="SFLV2", client_mode="parallel_fedavg", server_mode="sequential")
+        # cut_layer overridable per-run: run_single_split(..., cut_layer=4)
+        self.plot_comparison({"SL": r_sl, "SFLV1": r_sflv1, "SFLV2": r_sflv2})
+
+MyExp(base_config="flsim/configs/mnist_fedavg.yaml",
+      output_dir="outputs/my_split/").run()
+```
+
+`run_single_split()` returns the same `RunResult` as every other paradigm, so it
+plugs straight into `plot_comparison()` / `plot_bar()`.
+
+### Correctness
+
+The forward/backward relay is **mathematically exact**: training a split model
+via the relay produces **bitwise-identical weights** to training the unsplit
+model directly (verified, max diff `0.0`). The variant mechanics were verified by
+object-identity tracing: SL uses 1 shared client + 1 shared server model per
+epoch; SFLV1 uses independent per-client copies of both; SFLV2 uses independent
+client copies + 1 shared sequential server — exactly matching the paper.
+
+### System-cost metrics (fair cross-paradigm comparison)
+
+Split learning tracks latency, communication traffic (bytes), and energy on the
+**same physical base** as the sync/async/OTA simulators — FDMA Shannon rate for
+links, DVFS (`κ·f²`) for compute energy, `tx_power·time` for uplink energy —
+so all paradigms are directly comparable. What differs is only split learning's
+*workflow* (device FP/BP → smashed-data uplink → server FP/BP → gradient
+downlink → device-model up/down) and that server-side compute runs at a faster
+edge-server frequency (`split.server_cpu_frequency_hz`). The device/server
+compute split at the cut layer is measured automatically
+(`flsim.system.flops`), so nothing model-specific is entered by hand.
+
+The split CSV therefore adds `simulated_time_s`, `round_latency_s`,
+`traffic_bytes`, `cumulative_traffic_bytes`, `total_energy_j`,
+`cumulative_energy_j` (the first two and last two share the sync/async column
+names). Latency combines per variant: SL = sum over devices (sequential),
+SFLV1 = max (parallel), SFLV2 = max(device paths) + sum(server compute); traffic
+and energy always sum over devices (so they are identical across SL/SFLV1/SFLV2,
+matching the paper's Table 2). `examples/splitfed_experiment.py` plots
+accuracy-vs-simulated-time, cumulative energy, per-round traffic, and per-round
+latency across all five paradigms.
+
+> Reuse `flsim.system.split_cost.SplitCostModel` in your own experiments — pass
+> it a `ChannelModel` + per-client profiles + `server_cpu_frequency_hz` and call
+> `device_cost(...)` / `combine(mode, ...)` (or `centralized_cost(...)` for a
+> Normal baseline).
+
+---
+
 ## Writing a custom resource allocator
 
 Every allocator subclasses `ResourceAllocator` from `flsim/interfaces/allocator.py`.
@@ -753,6 +1038,70 @@ python plot_results.py outputs/fedAVG/fedavg/fedavg.csv --out figures/fedavg/
 
 ---
 
+## Metrics & outputs
+
+Every run writes a per-run CSV and returns a `RunResult`. The CSV columns differ
+by paradigm (below), but all share `round`/`global_epoch`, `test_accuracy`,
+`test_loss`, and a `train_loss`, so any run plugs into the same
+`plot_comparison()` / `plot_bar()` helpers.
+
+### `RunResult` — convenience properties (all paradigms)
+
+Read these off the object `run_single*()` returns, instead of digging into the CSV:
+
+| Property | Meaning |
+|---|---|
+| `final_accuracy` | `test_accuracy` at the last evaluated round |
+| `best_accuracy` | max `test_accuracy` over the run |
+| `final_loss` | `test_loss` at the last evaluated round |
+| `total_energy_j` | Σ `total_energy_j` over all rounds |
+| `total_simulated_time_s` | cumulative simulated time at the end |
+| `avg_staleness` | mean `staleness` (0 for paradigms with no staleness column) |
+| `.df`, `.metric("col")` | the raw DataFrame / a single column |
+
+### CSV columns by paradigm
+
+**Sync (`Simulator` — FedAvg, FedProx, FedOTA):** `round`, `simulated_time_s`,
+`test_accuracy`, `test_loss`, `round_duration_s`, `mean/max_compute_time_s`,
+`mean/max_upload_time_s`, `mean/max_download_time_s`, `mean_compute_energy_j`,
+`total_energy_j`, `cumulative_energy_j`, `mean_channel_gain`, `mean_rate_bps`,
+`num_selected_clients`, `selected_client_ids`.
+
+**Async (`AsyncSimulator`):** `global_epoch`, `simulated_time_s`, `staleness`,
+`alpha_used`, `client_id`, `compute_time_s`, `upload_time_s`, `total_time_s`,
+`total_energy_j`, `cumulative_energy_j`, `channel_gain`, `achievable_rate_bps`,
+`train_loss`, `test_accuracy`, `test_loss`.
+
+**Split (`SplitSimulator` — SL/SFLV1/SFLV2):** `round`, `train_loss`,
+`test_loss`, `test_accuracy`, `num_clients`, `round_latency_s`,
+`simulated_time_s`, `traffic_bytes`, `cumulative_traffic_bytes`,
+`total_energy_j`, `cumulative_energy_j` (cost columns present when a
+`SplitCostModel` is attached — see the split-learning section).
+
+### Metric glossary
+
+| Metric | Definition |
+|---|---|
+| `test_accuracy` / `test_loss` | Global model on the held-out test set (only at evaluation rounds) |
+| `round_duration_s` (sync) | `max` over selected clients of `compute + upload + download` (straggler-bound) |
+| `simulated_time_s` | Cumulative virtual wall-clock time (sync: Σ round durations; async: arrival time of each update) — **analytic, never PyTorch wall-clock** |
+| `achievable_rate_bps` | Shannon capacity `B·log2(1 + g·p/(N0·B))` — used to turn model size into upload time (FDMA only) |
+| `channel_gain` | Linear power gain `g_k` (dimensionless, ~1e-13…1e-9 here) = path loss × fading |
+| `total_energy_j` | Compute energy `κ·I·C·D·f²` + TX energy. TX = `p·t_up` (FDMA) or `num_symbols·‖b_i‖²` (OTA) |
+| `cumulative_energy_j` | Running Σ `total_energy_j` — **use this** to compare energy across paradigms (per-step energy isn't comparable; see below) |
+| `staleness` (async) | `t − τ`: model versions between dispatch and aggregation |
+| `alpha_used` (async) | Effective mixing weight `α_t = α·s(staleness)` |
+
+> **Comparing energy fairly.** A sync round logs ~`clients_per_round` clients'
+> energy; an async epoch logs one; OTA and FDMA use different physical formulas.
+> Per-step energy is **not** comparable — always use `cumulative_energy_j` (in
+> every CSV) for a fair energy curve.
+
+> **FedOTA extras** (no CSV column): `algorithm.mse_history`,
+> `algorithm.energy_history`, `algorithm.excluded_history` (see the OTA section).
+
+---
+
 ## Config reference
 
 Key parameters in `flsim/configs/base.yaml`:
@@ -773,6 +1122,10 @@ learning:
   local_epochs:      5
   batch_size:        32
   learning_rate:     0.01
+  stop_by_time_s:    null    # sync & async: if set (>0), stop when cumulative
+                             # simulated_time_s reaches this budget instead of
+                             # after global_rounds (global_rounds then ignored)
+  cut_layer:         6       # split learning only — client keeps ordered_layers()[:cut_layer]
 
 system:
   cpu_freq_mode:        fixed | discrete_ghz
@@ -801,7 +1154,20 @@ wireless:
 async_fl:
   alpha:       0.1   # base mixing weight α ∈ (0, 1)
   window_size: 10    # concurrent in-flight clients (default = clients_per_round)
+  rho:         0.0   # proximal weight for the async worker objective (paper §3); 0 = plain SGD
+
+# Over-the-air (FedOTA) only — ignored by every other algorithm
+ota:
+  p0_w:          0.01       # per-device peak transmit power P0 (watts)
+  noise_power_w: 1.03e-20   # receiver noise sigma² per channel use (watts)
+  gamma_db:      3.0        # target aggregation-MSE budget (dB)
 ```
+
+> `async_fl` and `ota` values are algorithm hyperparameters (like FedProx's
+> `mu`): the sync/async algorithm object takes them via its constructor, and
+> these config entries are the canonical place to record/tune them. An
+> algorithm-object attribute (e.g. `FedAsync(alpha=0.6)`, `FedOTA(gamma_db=5)`)
+> overrides the YAML value.
 
 **Downlink time.** By default download (server → client model broadcast) time is
 computed symmetrically to upload. Set `wireless.downlink_negligible: true` (or

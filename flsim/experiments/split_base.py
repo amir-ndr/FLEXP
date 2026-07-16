@@ -34,23 +34,35 @@ import numpy as np
 import pandas as pd
 import torch
 
+from flsim.channel.conversions import dbm_to_watts
 from flsim.core.evaluator import Evaluator
 from flsim.core.split_client import SplitClient
 from flsim.core.split_simulator import SplitSimulator
 from flsim.experiments.base import Experiment, RunResult, _apply_config_overrides, _print_header
 from flsim.experiments.wiring import (
+    _make_channel_model,
     _make_partitioner,
+    _make_profiles,
     _model_name_for_dataset,
     load_config,
     set_seeds,
 )
 from flsim.models.factory import create_model
 from flsim.system.split_model import split_model, num_layers
+from flsim.system.split_cost import SplitCostModel
 from flsim.data.loaders.mnist import load_mnist
 from flsim.data.loaders.cifar10 import load_cifar10
 
 
-_SPLIT_CSV_COLUMNS = ["round", "train_loss", "test_loss", "test_accuracy", "num_clients"]
+_SPLIT_CSV_COLUMNS = [
+    "round", "train_loss", "test_loss", "test_accuracy", "num_clients",
+    # system-cost columns (same physical base as the sync/async/OTA CSVs, so
+    # these are directly comparable): simulated_time_s / cumulative_energy_j
+    # share the exact names those CSVs use.
+    "round_latency_s", "simulated_time_s",
+    "traffic_bytes", "cumulative_traffic_bytes",
+    "total_energy_j", "cumulative_energy_j",
+]
 
 
 class SplitExperiment(Experiment):
@@ -123,11 +135,27 @@ class SplitExperiment(Experiment):
             )
         client_model, server_model = split_model(full_model, cut_layer=resolved_cut)
 
-        # ---- clients (no system/channel profiles — see split_simulator.py scope note) ----
+        # ---- clients ----
         clients = [
             SplitClient(client_id=k, dataset=train_ds, indices=client_indices[k])
             for k in range(config.data.num_clients)
         ]
+
+        # ---- system-cost model (same physical base as sync/async/OTA) ----
+        # Reuses the wireless channel model, DVFS kappa, and per-device profiles;
+        # adds only the edge-server frequency (split.server_cpu_frequency_hz).
+        noise_psd = dbm_to_watts(config.wireless.noise_psd_dbm_per_hz)
+        config._noise_psd_w_per_hz = noise_psd
+        channel_model = _make_channel_model(config, noise_psd)
+        profiles = _make_profiles(config, [len(i) for i in client_indices], rng)
+        server_freq = float(getattr(getattr(config, "split", None), "server_cpu_frequency_hz", 3.0e9))
+        cost_model = SplitCostModel(
+            channel_model=channel_model,
+            noise_psd_w_per_hz=noise_psd,
+            kappa=config.system.switched_capacitance,
+            server_cpu_frequency_hz=server_freq,
+            downlink_negligible=bool(getattr(config.wireless, "downlink_negligible", False)),
+        )
 
         evaluator = Evaluator(test_dataset=test_ds)
 
@@ -141,6 +169,8 @@ class SplitExperiment(Experiment):
             device=device,
             client_mode=client_mode,
             server_mode=server_mode,
+            cost_model=cost_model,
+            profiles=profiles,
         )
 
         run_dir = os.path.join(self.output_dir, run_name)
@@ -162,10 +192,11 @@ class SplitExperiment(Experiment):
         """
         Build, execute, and return results for one split-learning run.
 
-        The CSV is written to <output_dir>/<run_name>/<run_name>.csv with
-        columns [round, train_loss, test_loss, test_accuracy, num_clients] —
-        the same test_accuracy/test_loss/round names the sync/async CSVs use,
-        so this RunResult works with plot_comparison()/plot_bar() unmodified.
+        The CSV is written to <output_dir>/<run_name>/<run_name>.csv. It reuses
+        the sync/async column names (round, test_accuracy, test_loss,
+        simulated_time_s, cumulative_energy_j) plus split-specific cost columns
+        (round_latency_s, traffic_bytes, cumulative_traffic_bytes), so this
+        RunResult works with plot_comparison()/plot_bar() unmodified.
         """
         label = label or run_name
         header_overrides = {**(config_overrides or {}), "client_mode": client_mode, "server_mode": server_mode}
@@ -191,6 +222,12 @@ class SplitExperiment(Experiment):
                     "test_loss":     f"{r.test_loss:.6f}" if r.test_loss is not None else "",
                     "test_accuracy": f"{r.test_accuracy:.6f}" if r.test_accuracy is not None else "",
                     "num_clients":   r.num_clients,
+                    "round_latency_s":          f"{r.round_latency_s:.6f}",
+                    "simulated_time_s":         f"{r.simulated_time_s:.6f}",
+                    "traffic_bytes":            f"{r.traffic_bytes:.1f}",
+                    "cumulative_traffic_bytes": f"{r.cumulative_traffic_bytes:.1f}",
+                    "total_energy_j":           f"{r.total_energy_j:.6e}",
+                    "cumulative_energy_j":      f"{r.cumulative_energy_j:.6e}",
                 })
 
         df = pd.read_csv(csv_path)

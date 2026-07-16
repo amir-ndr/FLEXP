@@ -129,6 +129,21 @@ ota:
   noise_power_w: 1.03e-20
   gamma_db:      3.0
 
+# Split learning (SL / SFLV1 / SFLV2) cost model — used only by SplitSimulator.
+# Latency/energy/traffic are computed on the SAME physical base as the sync/
+# async/OTA simulators (FDMA Shannon rate from `wireless`, DVFS energy with
+# `system.switched_capacitance` and each device's `cpu_frequency_hz`, uplink
+# TX energy = tx_power · time) — so all paradigms are directly comparable.
+# What differs is only split learning's workflow (device FP/BP + smashed-data
+# uplink + server FP/BP + gradient downlink + device-model up/down) and that
+# server-side compute runs at a separate, faster edge-server frequency below.
+# The device/server compute split at the cut layer is measured automatically
+# (flsim.system.flops), so nothing model-specific needs to be entered here.
+split:
+  server_cpu_frequency_hz: 3.0e+9   # f_S — edge-server frequency (cycles/s).
+                                    # The centralized "Normal" baseline also
+                                    # runs on this (one powerful machine).
+
 # Plots generated after each run (and in comparison experiments).
 # Each entry produces one PNG. Remove entries you don't want.
 # Available metrics (CSV columns):

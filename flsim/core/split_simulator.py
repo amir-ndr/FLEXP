@@ -57,20 +57,25 @@ other custom combination, is just a different choice on these same two axes
 (or a custom aggregation-weight function — see `weight_fn`) — no new
 orchestration code needed.
 
-Scope note (communication time / energy)
---------------------------------------------
-This implementation focuses on getting the ALGORITHM (forward/backward relay,
-the three aggregation patterns, cut_layer) exactly right — verified against
-the paper (see flsim/core/split_client.py's docstring for the relay
-correctness proof: split-relay training is numerically IDENTICAL to training
-the unsplit model directly). It does not simulate communication time or
-energy the way the sync/async/OTA simulators do (TimeModel/EnergyModel/
-ChannelModel) — the paper's own communication-cost analysis (its Table 2:
-comms. per client, total comms., total training time as closed-form
-expressions in |W|, p, q, K, R, T_fedavg) is a separate, analytically-defined
-model that isn't wired in here. This can be added as a follow-up using the
-formulas straight from Table 2 if you want communication/energy plots
-alongside the accuracy curves this module produces.
+System-cost metrics (latency / traffic / energy)
+--------------------------------------------------
+Pass a `cost_model` (flsim.system.split_cost.SplitCostModel) + per-client
+`profiles` to have each round's simulated latency, communication traffic
+(bytes), and energy computed on the SAME physical base as the sync/async/OTA
+simulators — FDMA Shannon rate for links, DVFS (kappa·f²) for compute energy,
+tx_power·time for uplink energy — so all paradigms are directly comparable.
+What differs for split learning is only the WORKFLOW (device FP/BP + smashed
+uplink + server FP/BP + gradient downlink + device-model up/down) and that
+server-side compute runs at a faster edge-server frequency; the device/server
+compute split at the cut layer is measured automatically (flsim.system.flops).
+These land in SplitEpochResult (simulated_time_s, round_latency_s,
+traffic_bytes, cumulative_energy_j, …) and the run's CSV. Omit the cost model
+and those metrics stay 0 (the algorithm still runs).
+
+The ALGORITHM itself (forward/backward relay, the three aggregation patterns,
+cut_layer) is verified exact against the paper — see flsim/core/split_client.py's
+docstring for the proof that split-relay training is numerically IDENTICAL to
+training the unsplit model directly.
 """
 
 import copy
@@ -93,6 +98,14 @@ class SplitEpochResult:
     num_clients: int           # number of clients processed this epoch
     test_loss: Optional[float] = None
     test_accuracy: Optional[float] = None
+    # System-cost metrics (0 when no cost_model is attached) — computed on the
+    # same physical base as the sync/async/OTA simulators; see SplitCostModel.
+    round_latency_s:         float = 0.0   # this round's simulated duration
+    simulated_time_s:        float = 0.0   # cumulative simulated time
+    traffic_bytes:           float = 0.0   # bytes communicated this round
+    cumulative_traffic_bytes: float = 0.0
+    total_energy_j:          float = 0.0   # energy this round
+    cumulative_energy_j:     float = 0.0
 
 
 def _weighted_average_state_dicts(state_dicts: list, weights: list) -> OrderedDict:
@@ -143,9 +156,15 @@ class SplitSimulator:
         device (torch.device): training device.
         client_mode (str): "sequential" | "parallel_fedavg" — see module docstring.
         server_mode (str): "sequential" | "parallel_fedavg" — see module docstring.
+        cost_model (SplitCostModel, optional): if given, per-round latency,
+            traffic, and energy are computed on the same physical base as the
+            sync/async/OTA simulators (see flsim.system.split_cost). Requires
+            `profiles`. If None, those metrics stay 0 (algorithm still runs).
+        profiles (list, optional): one ClientSystemProfile per client (same
+            order as `clients`) — supplies each device's CPU frequency, transmit
+            power, and channel gain for the cost model.
 
     This class does NOT:
-    - Compute simulated time, energy, or channel metrics (see module docstring).
     - Decide which dataset/model to use (both come in pre-built).
     """
 
@@ -160,6 +179,8 @@ class SplitSimulator:
         device: torch.device,
         client_mode: str = "parallel_fedavg",
         server_mode: str = "parallel_fedavg",
+        cost_model=None,
+        profiles: list = None,
     ):
         valid_modes = ("sequential", "parallel_fedavg")
         if client_mode not in valid_modes or server_mode not in valid_modes:
@@ -176,7 +197,57 @@ class SplitSimulator:
         self.device        = device
         self.client_mode   = client_mode
         self.server_mode   = server_mode
+        self.cost_model    = cost_model
+        self.profiles      = profiles
         self.history: list = []   # list[SplitEpochResult], filled by run()
+
+        # Dedicated RNG for the cost model's per-round channel draws, seeded
+        # independently of the training RNG. This is essential for FAIR
+        # comparison: SL/SFLV1/SFLV2 advance the training RNG by different
+        # amounts (different training paths), so without a separate stream they
+        # would see DIFFERENT channel realizations. Seeding this identically
+        # (from experiment.seed) makes every variant see the SAME channels.
+        seed = int(getattr(getattr(config, "experiment", None), "seed", 0))
+        self.cost_rng = np.random.RandomState(seed)
+
+        # Measure the split-specific sizes ONCE (they don't change across rounds):
+        #   activation_numel        — smashed-data elements per sample (client output)
+        #   client_param_count      — device-side model size in elements, counted
+        #       from the state_dict (params + buffers, e.g. BatchNorm running
+        #       stats) — the SAME accounting the sync/async simulators use for
+        #       model transfer, so device-model traffic is consistent across
+        #       paradigms even for models that carry buffers.
+        #   device_compute_fraction — share of FLOPs on the device side of the cut
+        self._activation_numel = 0
+        self._client_param_count = sum(t.numel() for t in self.client_model.state_dict().values())
+        self._device_compute_fraction = 0.5
+        if self.cost_model is not None:
+            self._measure_split_sizes()
+
+    def _cost_mode(self) -> str:
+        """Map (client_mode, server_mode) → cost-model variant key."""
+        if self.client_mode == "sequential" and self.server_mode == "sequential":
+            return "sl"
+        if self.client_mode == "parallel_fedavg" and self.server_mode == "sequential":
+            return "sflv2"
+        return "sflv1"   # parallel_fedavg × parallel_fedavg (and any other combo)
+
+    def _measure_split_sizes(self) -> None:
+        """Run one real batch through the split to measure smashed-data size and
+        the device/server FLOP split (see flsim.system.flops)."""
+        from torch.utils.data import DataLoader, Subset
+        from flsim.system.flops import compute_split_fraction
+        c0 = self.clients[0]
+        loader = DataLoader(Subset(c0.dataset, c0.indices[: min(8, len(c0.indices))]),
+                            batch_size=min(8, len(c0.indices)))
+        x, _ = next(iter(loader))
+        x = x.to(self.device)
+        with torch.no_grad():
+            smashed = self.client_model(x)
+        self._activation_numel = smashed[0].numel()   # per sample
+        self._device_compute_fraction = compute_split_fraction(
+            self.client_model, self.server_model, x
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -194,8 +265,13 @@ class SplitSimulator:
         k = min(k, len(self.clients))
 
         mode_label = f"client={self.client_mode}, server={self.server_mode}"
+        cost_label = f", cost_model={self._cost_mode()}" if self.cost_model else ""
         print(f"\n[SplitSimulator] Starting: T={T} epochs, {k}/{len(self.clients)} "
-              f"clients/epoch, {mode_label}, device={self.device}")
+              f"clients/epoch, {mode_label}{cost_label}, device={self.device}")
+
+        cum_time = 0.0
+        cum_traffic = 0.0
+        cum_energy = 0.0
 
         for epoch in range(T):
             selected = self._select_clients(k)
@@ -204,6 +280,12 @@ class SplitSimulator:
                 mean_loss = self._run_epoch_server_sequential(selected)
             else:
                 mean_loss = self._run_epoch_server_parallel_fedavg(selected)
+
+            # ---- system cost for this round (same physical base as other sims) ----
+            round_cost = self._round_cost(selected)
+            cum_time    += round_cost.latency_s
+            cum_traffic += round_cost.traffic_bytes
+            cum_energy  += round_cost.total_energy_j
 
             eval_result = None
             if epoch % cfg_eval.evaluate_every == 0:
@@ -216,17 +298,55 @@ class SplitSimulator:
                 num_clients=len(selected),
                 test_loss=eval_result.test_loss if eval_result else None,
                 test_accuracy=eval_result.test_accuracy if eval_result else None,
+                round_latency_s=round_cost.latency_s,
+                simulated_time_s=cum_time,
+                traffic_bytes=round_cost.traffic_bytes,
+                cumulative_traffic_bytes=cum_traffic,
+                total_energy_j=round_cost.total_energy_j,
+                cumulative_energy_j=cum_energy,
             )
             self.history.append(result)
 
             if eval_result is not None:
+                extra = (f" | t={cum_time:.0f}s | traffic={cum_traffic/1e6:.1f}MB | "
+                         f"E={cum_energy:.1f}J") if self.cost_model else ""
                 print(
                     f"  Epoch {epoch:4d} | train_loss={mean_loss:.4f} | "
-                    f"acc={eval_result.test_accuracy:.4f} | loss={eval_result.test_loss:.4f}"
+                    f"acc={eval_result.test_accuracy:.4f} | loss={eval_result.test_loss:.4f}{extra}"
                 )
 
         print("[SplitSimulator] Done.")
         return self.history
+
+    # ------------------------------------------------------------------
+    # Per-round system cost (latency / traffic / energy)
+    # ------------------------------------------------------------------
+
+    def _round_cost(self, selected: list):
+        """Compute this round's SplitRoundCost via the cost model, or an all-zero
+        cost if no cost model is attached."""
+        from flsim.system.split_cost import SplitRoundCost
+        if self.cost_model is None or self.profiles is None:
+            return SplitRoundCost(latency_s=0.0, traffic_bytes=0.0, total_energy_j=0.0)
+
+        cfg = self.config.learning
+        bw_per_client = self.config.wireless.total_bandwidth_hz / max(1, len(selected))
+        per_device = []
+        for client in selected:
+            profile = self.profiles[client.client_id]
+            gain = self.cost_model.channel_model.channel_gain(profile, self.cost_rng)
+            per_device.append(self.cost_model.device_cost(
+                profile=profile,
+                num_samples=client.num_samples,
+                local_epochs=cfg.local_epochs,
+                cycles_per_sample=profile.cycles_per_sample,
+                device_compute_fraction=self._device_compute_fraction,
+                activation_numel=self._activation_numel,
+                client_param_count=self._client_param_count,
+                bandwidth_hz=bw_per_client,
+                channel_gain=gain,
+            ))
+        return self.cost_model.combine(self._cost_mode(), per_device)
 
     # ------------------------------------------------------------------
     # Client selection

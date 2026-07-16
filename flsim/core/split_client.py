@@ -33,9 +33,9 @@ class SplitClient:
     - Decide aggregation strategy (FedAvg, sequential hand-off, etc.) — that's
       the orchestrator's job.
     - Copy the models it's given — callers control that (see module docstring).
-    - Compute simulated time/energy/channel metrics (out of scope for this
-      first split-learning implementation — see SplitSimulator's module
-      docstring for why).
+    - Compute simulated time/energy/channel metrics — those are the
+      SplitSimulator's job (via flsim.system.split_cost.SplitCostModel), kept
+      separate from the training relay here.
     """
 
     def __init__(self, client_id: int, dataset, indices: list):
