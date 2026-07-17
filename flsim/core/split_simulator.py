@@ -87,6 +87,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from flsim.core.training_utils import effective_work_samples, local_iters
 from flsim.system.split_model import SplitFullModel
 
 
@@ -345,6 +346,7 @@ class SplitSimulator:
                 client_param_count=self._client_param_count,
                 bandwidth_hz=bw_per_client,
                 channel_gain=gain,
+                work_samples=effective_work_samples(cfg, client.num_samples),
             ))
         return self.cost_model.combine(self._cost_mode(), per_device)
 
@@ -394,6 +396,7 @@ class SplitSimulator:
                 batch_size=cfg.batch_size,
                 learning_rate=cfg.learning_rate,
                 device=self.device,
+                max_iters=local_iters(cfg),
             )
             # server_model already updated in place — nothing further to do
             # for the server side.
@@ -442,6 +445,7 @@ class SplitSimulator:
                 batch_size=cfg.batch_size,
                 learning_rate=cfg.learning_rate,
                 device=self.device,
+                max_iters=local_iters(cfg),
             )
 
             if self.client_mode == "parallel_fedavg":

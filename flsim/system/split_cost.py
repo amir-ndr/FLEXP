@@ -109,12 +109,36 @@ class SplitCostModel:
         kappa: float,
         server_cpu_frequency_hz: float,
         downlink_negligible: bool = False,
+        q_device: float = 1.0,
+        q_server: float = 1.0,
+        downlink_tx_power_w: float = None,
     ):
+        """
+        Args (extending the class docstring):
+            q_device (float): device FLOPs-per-cycle q_n (paper eq. 7/12).
+                Device compute time = FLOPs / (f_device * q_device). Default 1.0
+                (so "cycles_per_sample" == FLOPs and time == cycles/freq, i.e.
+                the framework's original behaviour — fully backward compatible).
+            q_server (float): edge-server FLOPs-per-cycle q_S (paper eq. 10),
+                usually > q_device (server does more FLOPs/cycle). Default 1.0.
+            downlink_tx_power_w (float): BS transmit power for downlink
+                (model-download and gradient-download), P^DL in paper eq. 5/16.
+                When set, downlink LATENCY uses a rate computed at this (BS)
+                power instead of the device's uplink power, AND downlink energy
+                P^DL*(t_model_down + t_grad_down) is charged (paper eq. 16
+                includes these P^DL terms). When None (default), downlink reuses
+                the uplink rate and NO downlink energy is charged — the
+                framework's original symmetric-link, uplink-only-energy
+                convention. Ignored entirely if downlink_negligible=True.
+        """
         self.channel_model = channel_model
         self.noise_psd = noise_psd_w_per_hz
         self.kappa = kappa
         self.f_server = server_cpu_frequency_hz
         self.downlink_negligible = downlink_negligible
+        self.q_device = q_device
+        self.q_server = q_server
+        self.downlink_tx_power_w = downlink_tx_power_w
 
     # ------------------------------------------------------------------
     # Per-device cost (one round)
@@ -131,6 +155,7 @@ class SplitCostModel:
         client_param_count: int,
         bandwidth_hz: float,
         channel_gain: float,
+        work_samples: float = None,
     ) -> DevicePerRound:
         """
         Cost of one device's participation in one global round.
@@ -139,13 +164,18 @@ class SplitCostModel:
             profile:               ClientSystemProfile (reads cpu_frequency_hz, tx_power_w).
             num_samples (int):     n_k — this device's local sample count.
             local_epochs (int):    E — local passes per round.
-            cycles_per_sample (float): C_k — total (full-model) CPU cycles/sample.
+            cycles_per_sample (float): C_k — total (full-model) CPU cycles (or
+                FLOPs when q!=1; see q_device/q_server) per sample.
             device_compute_fraction (float): fraction of cycles on the device side
                 (from flops.compute_split_fraction); server gets (1 - fraction).
             activation_numel (int): smashed-data elements per sample (client-model output).
             client_param_count (int): device-side model size in elements.
             bandwidth_hz (float):  B_n allocated to this device (FDMA).
             channel_gain (float):  g_n linear channel power gain.
+            work_samples (float, optional): total sample-passes this round. If
+                given, OVERRIDES num_samples * local_epochs — use it to pass the
+                paper's H*b (H local iterations of a b-sample mini-batch) instead
+                of full-epoch work. None (default) keeps num_samples*local_epochs.
 
         Returns:
             DevicePerRound.
@@ -158,15 +188,29 @@ class SplitCostModel:
             noise_psd_w_per_hz=self.noise_psd,
         )
         rate_bps = max(rate_bps, 1.0)
-        dl_rate = 0.0 if self.downlink_negligible else rate_bps   # 0 => zero downlink time below
 
-        work = num_samples * local_epochs             # sample-passes this round
+        # Downlink rate: 0 (negligible), a separate BS-power rate (paper P^DL),
+        # or symmetric with the uplink (framework default). Same channel_gain as
+        # uplink (reciprocal link), only the transmit power differs.
+        if self.downlink_negligible:
+            dl_rate = 0.0
+        elif self.downlink_tx_power_w is not None:
+            dl_rate = max(self.channel_model.achievable_rate_bps(
+                bandwidth_hz=bandwidth_hz,
+                tx_power_w=self.downlink_tx_power_w,
+                channel_gain=channel_gain,
+                noise_psd_w_per_hz=self.noise_psd,
+            ), 1.0)
+        else:
+            dl_rate = rate_bps
+
+        work = work_samples if work_samples is not None else num_samples * local_epochs
         dev_cycles = cycles_per_sample * device_compute_fraction
         srv_cycles = cycles_per_sample * (1.0 - device_compute_fraction)
 
-        # ---- compute times (cycles / frequency) ----
-        t_dev_compute = (dev_cycles * work) / profile.cpu_frequency_hz
-        t_srv_compute = (srv_cycles * work) / self.f_server
+        # ---- compute times: FLOPs / (frequency * FLOPs-per-cycle q) (paper eq. 7/10/12) ----
+        t_dev_compute = (dev_cycles * work) / (profile.cpu_frequency_hz * self.q_device)
+        t_srv_compute = (srv_cycles * work) / (self.f_server * self.q_server)
 
         # ---- communication times (bits / rate) ----
         smashed_bits = activation_numel * BITS_PER_ELEMENT      # per sample
@@ -176,10 +220,16 @@ class SplitCostModel:
         t_model_down = 0.0 if dl_rate == 0.0 else model_bits / dl_rate
         t_model_up   = model_bits / rate_bps
 
-        # ---- energy: device compute + server compute (DVFS) + uplink TX ----
-        dev_compute_energy = self.kappa * dev_cycles * work * (profile.cpu_frequency_hz ** 2)
-        srv_compute_energy = self.kappa * srv_cycles * work * (self.f_server ** 2)
-        tx_energy = profile.tx_power_w * (t_smashed_up + t_model_up)   # uplink only
+        # ---- energy (paper eq. 16) ----
+        # compute: DVFS  kappa*f^3*t = kappa * FLOPs * work * f^2 / q  (device & server)
+        dev_compute_energy = self.kappa * dev_cycles * work * (profile.cpu_frequency_hz ** 2) / self.q_device
+        srv_compute_energy = self.kappa * srv_cycles * work * (self.f_server ** 2) / self.q_server
+        # TX: uplink P^UL*(smashed_up + model_up) always; downlink P^DL*(model_down +
+        # grad_down) only when a BS downlink power is configured (else the
+        # framework's uplink-only-energy convention, no downlink charge).
+        tx_energy = profile.tx_power_w * (t_smashed_up + t_model_up)
+        if self.downlink_tx_power_w is not None and not self.downlink_negligible:
+            tx_energy += self.downlink_tx_power_w * (t_model_down + t_grad_down)
 
         # ---- traffic (bytes): smashed both ways + device model both ways ----
         smashed_bytes = 2 * activation_numel * work * BYTES_PER_ELEMENT
@@ -233,6 +283,6 @@ class SplitCostModel:
         all data at the server frequency; energy = DVFS compute energy; traffic = 0.
         """
         work = total_samples * local_epochs
-        latency = (cycles_per_sample * work) / self.f_server
-        energy = self.kappa * cycles_per_sample * work * (self.f_server ** 2)
+        latency = (cycles_per_sample * work) / (self.f_server * self.q_server)
+        energy = self.kappa * cycles_per_sample * work * (self.f_server ** 2) / self.q_server
         return SplitRoundCost(latency_s=latency, traffic_bytes=0.0, total_energy_j=energy)

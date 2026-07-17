@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
+from flsim.core.training_utils import iter_local_batches
+
 
 @dataclass
 class ClientUpdate:
@@ -91,6 +93,7 @@ class Client:
         learning_rate: float,
         device: torch.device,
         proximal_mu: float = 0.0,
+        max_iters: int = None,
     ) -> tuple:
         """
         Perform local SGD on a deep copy of the global model.
@@ -102,12 +105,18 @@ class Client:
 
         Args:
             global_model (nn.Module): current global model (read-only reference).
-            local_epochs (int): I_k — number of local training epochs.
+            local_epochs (int): I_k — number of local training epochs (used only
+                when max_iters is None).
             batch_size (int): mini-batch size for SGD.
             learning_rate (float): local SGD learning rate.
             device (torch.device): device to train on.
             proximal_mu (float): FedProx proximal coefficient μ ≥ 0.
                 0.0 (default) = standard FedAvg (no proximal term).
+            max_iters (int, optional): H — if set, do exactly H mini-batch SGD
+                steps this round instead of local_epochs full passes (the
+                "local iterations" unit of semi-async split-FL papers). See
+                flsim.core.training_utils.iter_local_batches. None (default)
+                keeps the original full-epoch behaviour.
 
         Returns:
             tuple[OrderedDict, int, float]:
@@ -132,24 +141,23 @@ class Client:
         total_loss  = 0.0
         total_batches = 0
 
-        for _ in range(local_epochs):
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
-                optimizer.zero_grad()
-                loss = criterion(local_model(x), y)
+        for x, y in iter_local_batches(loader, local_epochs, max_iters):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(local_model(x), y)
 
-                # FedProx proximal term: (μ/2) * ||w - w_global||²
-                if proximal_mu > 0.0:
-                    prox = sum(
-                        ((p - g.to(device)) ** 2).sum()
-                        for p, g in zip(local_model.parameters(), global_params)
-                    )
-                    loss = loss + (proximal_mu / 2.0) * prox
+            # FedProx proximal term: (μ/2) * ||w - w_global||²
+            if proximal_mu > 0.0:
+                prox = sum(
+                    ((p - g.to(device)) ** 2).sum()
+                    for p, g in zip(local_model.parameters(), global_params)
+                )
+                loss = loss + (proximal_mu / 2.0) * prox
 
-                loss.backward()
-                optimizer.step()
-                total_loss  += loss.item()
-                total_batches += 1
+            loss.backward()
+            optimizer.step()
+            total_loss  += loss.item()
+            total_batches += 1
 
         mean_loss = total_loss / max(total_batches, 1)
         return local_model.state_dict(), self.num_samples, mean_loss

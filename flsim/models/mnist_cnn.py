@@ -31,7 +31,7 @@ class MnistCNN(nn.Module, Splittable):
     - Hold optimizer state.
     """
 
-    def __init__(self):
+    def __init__(self, num_classes: int = 10):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=5),    # (B,1,28,28) → (B,32,24,24)
@@ -45,7 +45,7 @@ class MnistCNN(nn.Module, Splittable):
             nn.Flatten(),                        # → (B, 1024)
             nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Linear(512, 10),
+            nn.Linear(512, num_classes),
         )
 
     def forward(self, x):

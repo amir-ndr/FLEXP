@@ -4,7 +4,23 @@ experiment:
   output_dir: "outputs/"
 
 data:
-  dataset: "mnist"          # mnist | cifar10
+  dataset: "mnist"          # mnist | cifar10 | cifar100 | ham10000
+  # Optional: force a specific architecture regardless of dataset default
+  # (mnist -> mnist_cnn, cifar10/cifar100/ham10000 -> cifar_cnn). Any
+  # flsim.models.factory registry key works for the 3-channel/32x32 datasets:
+  # "cifar_cnn" | "alexnet" | "vgg16" | "vgg19" | "resnet18" | "resnet34"
+  # (all CIFAR-10-adapted — see each model's module docstring). Leave null to
+  # use the dataset default.
+  model_name: null
+  # Optional: override the model's output class count (default: each
+  # dataset's natural count — mnist/cifar10=10, cifar100=100, ham10000=7).
+  # Leave null unless you have a reason to change it (e.g. a filtered subset
+  # of classes).
+  num_classes: null
+  # Required ONLY when dataset: "ham10000" — folder containing
+  # HAM10000_metadata.csv and the image subfolder(s). No auto-download is
+  # available for this dataset (see flsim.data.loaders.ham10000).
+  ham10000_root: null
   num_clients: 50
   partition: "iid"          # iid | shard | dirichlet
   dirichlet_alpha: 0.5
@@ -18,6 +34,19 @@ learning:
   local_epochs: 1
   batch_size: 32
   learning_rate: 0.01
+  # Local work per round — how much each client trains before its update counts.
+  #   local_iters: null  -> use local_epochs (E full passes over the local data;
+  #                         standard FedAvg — the framework's original behaviour).
+  #   local_iters: H (int > 0) -> do exactly H mini-batch SGD steps per round
+  #                         (H "local iterations", one mini-batch of `batch_size`
+  #                         each = H*batch_size sample-passes), OVERRIDING
+  #                         local_epochs. This is the local-work unit of
+  #                         semi-async split-FL papers (SAFSL's H); use it when a
+  #                         paper specifies iterations rather than epochs.
+  # Applies uniformly to EVERY paradigm (FL, FedAsync, SL, SFLV1/V2, SAFSL) —
+  # time, energy, traffic, AND training all use this same per-round work, so a
+  # cross-algorithm comparison stays fair (identical local work per round).
+  local_iters: null
   # Optional alternate stopping condition, applies to BOTH the sync Simulator
   # and the AsyncSimulator. Leave null (default) to stop after global_rounds
   # rounds/epochs, as before.
@@ -40,30 +69,55 @@ system:
   # CPU frequency heterogeneity mode:
   #   "fixed"        — all clients share cpu_frequency_hz
   #   "discrete_ghz" — each client draws from {f_min, f_min+step, ..., f_max} GHz
+  #   "uniform_ghz"  — each client draws CONTINUOUSLY ~ U[f_min, f_max] GHz
+  #                    (use when a paper gives a continuous device-frequency
+  #                    range, e.g. SAFSL: f ~ U[0.1, 2] x 1e9 cycles/s)
   cpu_freq_mode: "fixed"
   cpu_frequency_hz: 2.0e+9       # used when cpu_freq_mode="fixed"
-  cpu_freq_min_ghz: 0.1          # used when cpu_freq_mode="discrete_ghz"
-  cpu_freq_max_ghz: 0.8          # used when cpu_freq_mode="discrete_ghz"
-  cpu_freq_step_ghz: 0.1         # used when cpu_freq_mode="discrete_ghz"
+  cpu_freq_min_ghz: 0.1          # lower bound (discrete_ghz / uniform_ghz)
+  cpu_freq_max_ghz: 0.8          # upper bound (discrete_ghz / uniform_ghz)
+  cpu_freq_step_ghz: 0.1         # step size (discrete_ghz only)
   cycles_per_sample_min: 1.0e+6  # C_k lower bound (cycles per training sample)
   cycles_per_sample_max: 1.0e+7  # C_k upper bound
+  # NOTE: C_k is interpreted as FLOPs/sample when the split cost model's
+  # q_device/q_server (split.q_device/q_server) are != 1. For a paper that
+  # fixes the model's per-sample FLOPs (e.g. a specific ResNet), set
+  # cycles_per_sample_min == max == that measured FLOP count.
   switched_capacitance: 1.0e-28  # kappa for energy model
 
 wireless:
   # Channel model:
   #   "path_loss"  — 3GPP UMa (PL=128.1+37.6·log10(d_km)) + frozen log-normal shadowing
-  #   "exp_fading" — h = h0·ρ·d^{-2}, ρ~Exp(1) re-drawn each round (many FL papers)
+  #   "exp_fading" — g = h0·ρ·d^{-α}, ρ~Exp(1)=|CN(0,1)|² re-drawn each round
+  #                  (complex-Gaussian small-scale fading; many FL / split-FL papers)
   channel_model: "path_loss"
-  h0_path_loss_constant: 1.0e-6  # used when channel_model="exp_fading"
-  # Deployment geometry:
-  #   "square" — uniform in [-L/2, L/2]^2,  area_side_m defines L
-  #   "circle" — uniform in disk of radius R, area_radius_m defines R
+  h0_path_loss_constant: 1.0e-6  # used when channel_model="exp_fading" (SNR calibration constant)
+  # Distance path-loss exponent α for the exp_fading model's g = h0·ρ·d^{-α}.
+  # Default 2.0 (free-space). Papers that state a path-fading exponent set this
+  # directly (e.g. SAFSL: 1.3). Only used when channel_model="exp_fading".
+  exp_fading_path_exponent: 2.0
+  # Deployment geometry (how each client's distance to the BS is set):
+  #   "square"         — (x,y) uniform in [-L/2, L/2]^2, area_side_m defines L
+  #   "circle"         — (x,y) uniform in disk of radius R, area_radius_m defines R
+  #   "distance_range" — distance itself ~ U[dist_min_m, dist_max_m] (use when a
+  #                      paper gives a device-to-BS distance range, e.g. SAFSL:
+  #                      d ~ U[100, 1000] m). Distances above are DERIVED from
+  #                      (x,y); this mode sets distance directly.
   deployment_shape: "square"
   area_side_m: 500.0             # used when deployment_shape="square"
   area_radius_m: 500.0           # used when deployment_shape="circle"
+  dist_min_m: 100.0              # used when deployment_shape="distance_range"
+  dist_max_m: 1000.0             # used when deployment_shape="distance_range"
   total_bandwidth_hz: 2.0e+7     # B = 20 MHz
-  tx_power_dbm: 10.0             # p_max = 10 dBm
-  noise_psd_dbm_per_hz: -174.0   # N0 thermal noise floor
+  tx_power_dbm: 10.0             # homogeneous device tx power (used unless a range below is set)
+  # Optional per-device UPLINK tx power range (watts): when BOTH are set, each
+  # device draws p_n ~ U[tx_power_w_min, tx_power_w_max] W instead of the single
+  # tx_power_dbm above (e.g. SAFSL: p_n ~ U[0.1, 0.2] W). Leave null to use tx_power_dbm.
+  tx_power_w_min: null
+  tx_power_w_max: null
+  noise_psd_dbm_per_hz: -174.0   # N0 thermal noise floor in dBm/Hz
+                                 # (paper N0 in W/Hz -> dBm/Hz = 10·log10(N0)+30;
+                                 #  e.g. N0=1e-18 W/Hz -> -150 dBm/Hz)
   path_loss_intercept_db: 128.1  # used by path_loss model
   path_loss_exponent: 37.6       # used by path_loss model
   shadowing_std_db: 8.0          # used by path_loss model (0 = disable)
@@ -143,6 +197,23 @@ split:
   server_cpu_frequency_hz: 3.0e+9   # f_S — edge-server frequency (cycles/s).
                                     # The centralized "Normal" baseline also
                                     # runs on this (one powerful machine).
+  # FLOPs-per-cycle (hardware throughput). Compute time = FLOPs / (freq · q);
+  # compute energy = κ · FLOPs · f² / q. These are HARDWARE params (device vs
+  # server), NOT per-algorithm — the device value applies identically to every
+  # method's device-side compute (FL, FedAsync, SL, SFL, SAFSL), so comparisons
+  # stay fair. Defaults 1.0 = the framework's original behaviour (time=cycles/freq),
+  # so leaving them at 1.0 changes nothing. Papers that state throughputs set them
+  # (e.g. SAFSL: device q_n=1, edge-server q_S=2 -> server does 2 FLOPs/cycle).
+  # They only affect COMPUTE (time+energy); communication/traffic are untouched.
+  q_device: 1.0
+  q_server: 1.0
+  # Optional BS downlink transmit power (watts) for the model-download and
+  # gradient-download legs (paper P^DL). When set, downlink LATENCY uses a rate
+  # at this BS power (not the device's uplink power), AND downlink energy
+  # P^DL·(t_model_down + t_grad_down) is charged (paper eq. 16). Leave null to
+  # keep the framework's symmetric-link, uplink-only-energy convention
+  # (e.g. SAFSL: BS downlink power = 0.3 W).
+  downlink_tx_power_w: null
 
 # Plots generated after each run (and in comparison experiments).
 # Each entry produces one PNG. Remove entries you don't want.

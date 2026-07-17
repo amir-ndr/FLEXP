@@ -3,13 +3,15 @@ channel/exp_fading.py: Exponential small-scale fading channel model.
 
 Implements the channel model used in many FL-over-wireless papers:
 
-    h_{n,t} = h_0 · ρ_{n,t} · d_n^{-2}
+    g_{n,t} = h_0 · ρ_{n,t} · d_n^{-α}
 
 where:
     h_0          — path loss constant (absorbs frequency & geometry factors)
     ρ_{n,t}      — small-scale fading power gain, ρ ~ Exp(1), RE-DRAWN each round
+                   (= |CN(0,1)|², i.e. complex-Gaussian small-scale fading)
     d_n          — distance from client n to edge server (metres)
-    exponent = 2 — free-space path loss (not 3GPP's 37.6·log10(d_km))
+    α            — path_loss_exponent (default 2 = free-space; configurable,
+                   e.g. SAFSL uses 1.3). Not 3GPP's 37.6·log10(d_km).
 
 Key difference from PathLossChannelModel:
   ρ is drawn fresh every time channel_gain() is called (i.e., every round).
@@ -45,6 +47,7 @@ class ExpFadingChannelModel(ChannelModel):
         total_bandwidth_hz: float,
         noise_psd_w_per_hz: float,
         min_distance_m: float = 1.0,
+        path_loss_exponent: float = 2.0,
     ):
         """
         Args:
@@ -55,11 +58,15 @@ class ExpFadingChannelModel(ChannelModel):
             total_bandwidth_hz (float): total system bandwidth B in Hz.
             noise_psd_w_per_hz (float): thermal noise PSD N0 in W/Hz.
             min_distance_m (float): minimum distance clamp (avoids g→∞ at d=0).
+            path_loss_exponent (float): distance exponent α in the POWER gain
+                g = h0·ρ·d^{-α}. Default 2.0 (free-space). Papers that specify a
+                path-fading exponent set this directly (e.g. SAFSL: α = 1.3).
         """
         self.h0 = h0
         self.total_bandwidth_hz = total_bandwidth_hz
         self.noise_psd_w_per_hz = noise_psd_w_per_hz
         self.min_distance_m = min_distance_m
+        self.path_loss_exponent = path_loss_exponent
 
     # ------------------------------------------------------------------
     # ChannelModel interface
@@ -83,7 +90,9 @@ class ExpFadingChannelModel(ChannelModel):
         """
         d = max(profile.distance_m, self.min_distance_m)
         rho = rng.exponential(scale=1.0)   # ρ ~ Exp(1), fresh each round
-        g = self.h0 * rho / (d ** 2)
+        # ρ = |CN(0,1)|² (exponential power gain) IS the paper's complex-Gaussian
+        # small-scale fading; d^{-α} is the large-scale path fading (α configurable).
+        g = self.h0 * rho / (d ** self.path_loss_exponent)
         return g
 
     def achievable_rate_bps(

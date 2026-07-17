@@ -107,3 +107,35 @@ def compute_split_fraction(
         # Neither side has counted compute (unlikely) — split the cycles evenly.
         return 0.5
     return dev_macs / total
+
+
+def measure_activation_and_split(client_model, server_model, sample_client, device) -> tuple:
+    """
+    Measure (activation_numel, device_compute_fraction) once from one real
+    batch — the same two quantities flsim.core.split_simulator.SplitSimulator
+    measures via its own _measure_split_sizes(), factored out here so
+    flsim.core.split_async_simulator.SplitAsyncSimulator can reuse it without
+    duplicating the logic.
+
+    Args:
+        client_model, server_model: the split model halves (already on `device`).
+        sample_client: any client exposing .dataset/.indices (e.g. SplitClient) —
+            only used to pull one small batch to run through the model.
+        device: torch.device to run the measurement batch on.
+
+    Returns:
+        tuple[int, float]: (activation_numel per sample, device_compute_fraction).
+    """
+    from torch.utils.data import DataLoader, Subset
+
+    loader = DataLoader(
+        Subset(sample_client.dataset, sample_client.indices[: min(8, len(sample_client.indices))]),
+        batch_size=min(8, len(sample_client.indices)),
+    )
+    x, _ = next(iter(loader))
+    x = x.to(device)
+    with torch.no_grad():
+        smashed = client_model(x)
+    activation_numel = smashed[0].numel()
+    device_compute_fraction = compute_split_fraction(client_model, server_model, x)
+    return activation_numel, device_compute_fraction

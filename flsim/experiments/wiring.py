@@ -25,6 +25,10 @@ from flsim.channel.fdma import FDMAChannelModel
 from flsim.data.dirichlet import DirichletPartitioner
 from flsim.data.iid import IIDPartitioner
 from flsim.data.shard import ShardPartitioner
+from flsim.data.loaders.mnist import load_mnist
+from flsim.data.loaders.cifar10 import load_cifar10
+from flsim.data.loaders.cifar100 import load_cifar100
+from flsim.data.loaders.ham10000 import load_ham10000
 from flsim.profiles.factory import create_client_profiles
 
 
@@ -124,6 +128,7 @@ def _make_channel_model(config, noise_psd_w_per_hz: float):
             total_bandwidth_hz=cfg_w.total_bandwidth_hz,
             noise_psd_w_per_hz=noise_psd_w_per_hz,
             min_distance_m=cfg_w.min_distance_m,
+            path_loss_exponent=getattr(cfg_w, "exp_fading_path_exponent", 2.0),
         )
     raise ValueError(
         f"Unknown channel_model '{name}'. Choose 'path_loss' or 'exp_fading', "
@@ -144,22 +149,89 @@ def _make_profiles(config, num_samples_list: list, rng):
         deployment_shape=cfg_w.deployment_shape,
         area_side_m=getattr(cfg_w, "area_side_m", 500.0),
         area_radius_m=getattr(cfg_w, "area_radius_m", 500.0),
+        dist_min_m=getattr(cfg_w, "dist_min_m", 100.0),
+        dist_max_m=getattr(cfg_w, "dist_max_m", 1000.0),
         cpu_freq_mode=cfg_s.cpu_freq_mode,
         cpu_frequency_hz=getattr(cfg_s, "cpu_frequency_hz", 2.0e9),
         cpu_freq_min_ghz=getattr(cfg_s, "cpu_freq_min_ghz", 0.1),
         cpu_freq_max_ghz=getattr(cfg_s, "cpu_freq_max_ghz", 0.8),
         cpu_freq_step_ghz=getattr(cfg_s, "cpu_freq_step_ghz", 0.1),
+        tx_power_w_min=getattr(cfg_w, "tx_power_w_min", None),
+        tx_power_w_max=getattr(cfg_w, "tx_power_w_max", None),
         cycles_per_sample_min=cfg_s.cycles_per_sample_min,
         cycles_per_sample_max=cfg_s.cycles_per_sample_max,
         shadowing_std_db=getattr(cfg_w, "shadowing_std_db", 0.0),
     )
 
 
-def _model_name_for_dataset(dataset: str) -> str:
-    mapping = {"mnist": "mnist_cnn", "cifar10": "cifar_cnn"}
+def _model_name_for_dataset(dataset: str, model_name: str = None) -> str:
+    """
+    Resolve which model architecture to build.
+
+    If model_name is given (data.model_name in YAML, e.g. "resnet18",
+    "vgg16", "alexnet" — see flsim.models.factory.list_models() for the full
+    registry), it is used directly, letting you pick any registered CIFAR-10
+    architecture without touching this mapping. Otherwise falls back to each
+    dataset's default model.
+    """
+    if model_name is not None:
+        return model_name
+    mapping = {
+        "mnist": "mnist_cnn",
+        "cifar10": "cifar_cnn",
+        "cifar100": "cifar_cnn",
+        "ham10000": "cifar_cnn",
+    }
     if dataset not in mapping:
         raise ValueError(f"Unknown dataset '{dataset}'. Choose from: {list(mapping)}")
     return mapping[dataset]
+
+
+def _num_classes_for_dataset(dataset: str, num_classes: int = None) -> int:
+    """
+    Resolve how many output classes the model's final layer needs.
+
+    If num_classes is given (data.num_classes in YAML), it is used directly.
+    Otherwise falls back to each dataset's natural class count.
+    """
+    if num_classes is not None:
+        return num_classes
+    mapping = {"mnist": 10, "cifar10": 10, "cifar100": 100, "ham10000": 7}
+    if dataset not in mapping:
+        raise ValueError(f"Unknown dataset '{dataset}'. Choose from: {list(mapping)}")
+    return mapping[dataset]
+
+
+def _load_dataset(config):
+    """
+    Load (train_dataset, test_dataset) for config.data.dataset.
+
+    Centralizes the dataset dispatch shared by every experiment base class
+    (Experiment, AsyncExperiment, SplitExperiment) — add a new dataset here
+    once and every paradigm picks it up.
+
+    ham10000 additionally requires config.data.ham10000_root (no
+    auto-download is available for it — see flsim.data.loaders.ham10000).
+    """
+    dataset = config.data.dataset
+    if dataset == "mnist":
+        return load_mnist()
+    elif dataset == "cifar10":
+        return load_cifar10()
+    elif dataset == "cifar100":
+        return load_cifar100()
+    elif dataset == "ham10000":
+        root = getattr(config.data, "ham10000_root", None)
+        if not root:
+            raise ValueError(
+                "data.ham10000_root must be set to load HAM10000 (no "
+                "auto-download available — point it at the folder containing "
+                "HAM10000_metadata.csv and the image subfolder(s); see "
+                "flsim.data.loaders.ham10000 module docstring)."
+            )
+        return load_ham10000(root=os.path.expanduser(root))
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
 
 
 # ---------------------------------------------------------------------------

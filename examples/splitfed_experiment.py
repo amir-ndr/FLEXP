@@ -74,12 +74,12 @@ from flsim.algorithms.fedasync import FedAsync
 from flsim.experiments.base import RunResult
 from flsim.experiments.split_base import SplitExperiment
 from flsim.experiments.async_base import AsyncExperiment
-from flsim.experiments.wiring import load_config, set_seeds, _model_name_for_dataset
+from flsim.experiments.wiring import (
+    load_config, set_seeds, _load_dataset, _model_name_for_dataset, _num_classes_for_dataset,
+)
 from flsim.models.factory import create_model
 from flsim.core.evaluator import Evaluator
 from flsim.system.split_cost import SplitCostModel
-from flsim.data.loaders.mnist import load_mnist
-from flsim.data.loaders.cifar10 import load_cifar10
 
 
 BASE_CONFIG = os.path.join(
@@ -314,14 +314,12 @@ class SplitFedFigure2Experiment(SplitExperiment, AsyncExperiment):
         set_seeds(config.experiment.seed)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if config.data.dataset == "mnist":
-            train_ds, test_ds = load_mnist()
-        elif config.data.dataset == "cifar10":
-            train_ds, test_ds = load_cifar10()
-        else:
-            raise ValueError(f"Unknown dataset: {config.data.dataset}")
+        train_ds, test_ds = _load_dataset(config)
 
-        model = create_model(_model_name_for_dataset(config.data.dataset)).to(device)
+        model = create_model(
+            _model_name_for_dataset(config.data.dataset, getattr(config.data, "model_name", None)),
+            num_classes=_num_classes_for_dataset(config.data.dataset, getattr(config.data, "num_classes", None)),
+        ).to(device)
         optimizer = torch.optim.SGD(model.parameters(), lr=config.learning.learning_rate)
         criterion = nn.CrossEntropyLoss()
         loader = DataLoader(train_ds, batch_size=config.learning.batch_size, shuffle=True)
@@ -401,7 +399,7 @@ class SplitFedFigure2Experiment(SplitExperiment, AsyncExperiment):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _model_size_elements(dataset: str) -> int:
+    def _model_size_elements(config) -> int:
         """
         Full-model size in ELEMENTS, counted from the state_dict (parameters +
         buffers, e.g. BatchNorm running stats) — the EXACT quantity the sync/
@@ -411,12 +409,14 @@ class SplitFedFigure2Experiment(SplitExperiment, AsyncExperiment):
         (e.g. CifarCNN's BatchNorm); for MnistCNN there are no buffers, so it is
         identical to the parameter count.
         """
-        model = create_model(_model_name_for_dataset(dataset))
+        model_name = _model_name_for_dataset(config.data.dataset, getattr(config.data, "model_name", None))
+        num_classes = _num_classes_for_dataset(config.data.dataset, getattr(config.data, "num_classes", None))
+        model = create_model(model_name, num_classes=num_classes)
         return sum(t.numel() for t in model.state_dict().values())
 
     def _add_fl_traffic(self, result: RunResult) -> None:
         """FedAvg traffic per round = 2·K·|W| (full model down + up), constant."""
-        elems = self._model_size_elements(result.config.data.dataset)
+        elems = self._model_size_elements(result.config)
         K = int(result.config.learning.clients_per_round)
         per_round = 2 * K * elems * 4   # bytes (float32)
         df = result.df
@@ -433,7 +433,7 @@ class SplitFedFigure2Experiment(SplitExperiment, AsyncExperiment):
         K× more epochs, so the CUMULATIVE traffic matches FL — which is why the
         fair comparison for async is on cumulative / time axes, not per-round.
         """
-        elems = self._model_size_elements(result.config.data.dataset)
+        elems = self._model_size_elements(result.config)
         per_epoch = 2 * elems * 4   # bytes: one client, down + up
         df = result.df
         df["traffic_bytes"] = float(per_epoch)

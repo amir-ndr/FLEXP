@@ -23,6 +23,7 @@ import torch
 import numpy as np
 
 from flsim.core.logger import RoundResult
+from flsim.core.training_utils import effective_work_samples, local_iters
 from flsim.system.energy import EnergyModel
 
 
@@ -246,11 +247,16 @@ class Simulator:
                 noise_psd_w_per_hz=noise_psd,
             )
 
+            # Per-round work (sample-passes): H*b when learning.local_iters is set,
+            # else num_samples*local_epochs — the same coherent quantity used for
+            # time AND energy (and for training below, via max_iters).
+            work = effective_work_samples(cfg, client.num_samples)
+
             # Simulated time — use allocator-assigned f_hz and g_k from this round.
             t_comp = self.time_model.compute_training_time(
                 client.profile,
-                num_samples=client.num_samples,
-                local_epochs=cfg.local_epochs,
+                num_samples=work,
+                local_epochs=1,
                 batch_size=cfg.batch_size,
                 cpu_freq_hz=f_hz,
             )
@@ -273,8 +279,8 @@ class Simulator:
             # Energy — use allocator-assigned f_hz and p_w.
             e_comp = self.energy_model.compute_energy_j(
                 client.profile,
-                local_epochs=cfg.local_epochs,
-                num_samples=client.num_samples,
+                local_epochs=1,
+                num_samples=work,
                 cpu_freq_hz=f_hz,
             )
             e_tx = self.energy_model.transmission_energy_j(
@@ -292,6 +298,7 @@ class Simulator:
                 learning_rate=cfg.learning_rate,
                 device=self.device,
                 proximal_mu=getattr(client, "proximal_mu", 0.0),
+                max_iters=local_iters(cfg),
             )
 
             from flsim.core.client import ClientUpdate

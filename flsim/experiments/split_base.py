@@ -40,18 +40,18 @@ from flsim.core.split_client import SplitClient
 from flsim.core.split_simulator import SplitSimulator
 from flsim.experiments.base import Experiment, RunResult, _apply_config_overrides, _print_header
 from flsim.experiments.wiring import (
+    _load_dataset,
     _make_channel_model,
     _make_partitioner,
     _make_profiles,
     _model_name_for_dataset,
+    _num_classes_for_dataset,
     load_config,
     set_seeds,
 )
 from flsim.models.factory import create_model
 from flsim.system.split_model import split_model, num_layers
 from flsim.system.split_cost import SplitCostModel
-from flsim.data.loaders.mnist import load_mnist
-from flsim.data.loaders.cifar10 import load_cifar10
 
 
 _SPLIT_CSV_COLUMNS = [
@@ -109,19 +109,15 @@ class SplitExperiment(Experiment):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # ---- dataset ----
-        if config.data.dataset == "mnist":
-            train_ds, test_ds = load_mnist()
-        elif config.data.dataset == "cifar10":
-            train_ds, test_ds = load_cifar10()
-        else:
-            raise ValueError(f"Unknown dataset: {config.data.dataset}")
+        train_ds, test_ds = _load_dataset(config)
 
         partitioner    = _make_partitioner(config.data)
         client_indices = partitioner.partition(train_ds, config.data.num_clients, rng)
 
         # ---- split the model at cut_layer ----
-        model_name = _model_name_for_dataset(config.data.dataset)
-        full_model = create_model(model_name)
+        model_name = _model_name_for_dataset(config.data.dataset, getattr(config.data, "model_name", None))
+        num_classes = _num_classes_for_dataset(config.data.dataset, getattr(config.data, "num_classes", None))
+        full_model = create_model(model_name, num_classes=num_classes)
         n_layers   = num_layers(full_model)
         resolved_cut = cut_layer if cut_layer is not None else getattr(config.learning, "cut_layer", None)
         if resolved_cut is None:
@@ -148,13 +144,17 @@ class SplitExperiment(Experiment):
         config._noise_psd_w_per_hz = noise_psd
         channel_model = _make_channel_model(config, noise_psd)
         profiles = _make_profiles(config, [len(i) for i in client_indices], rng)
-        server_freq = float(getattr(getattr(config, "split", None), "server_cpu_frequency_hz", 3.0e9))
+        split_cfg = getattr(config, "split", None)
+        server_freq = float(getattr(split_cfg, "server_cpu_frequency_hz", 3.0e9))
         cost_model = SplitCostModel(
             channel_model=channel_model,
             noise_psd_w_per_hz=noise_psd,
             kappa=config.system.switched_capacitance,
             server_cpu_frequency_hz=server_freq,
             downlink_negligible=bool(getattr(config.wireless, "downlink_negligible", False)),
+            q_device=float(getattr(split_cfg, "q_device", 1.0)),
+            q_server=float(getattr(split_cfg, "q_server", 1.0)),
+            downlink_tx_power_w=getattr(split_cfg, "downlink_tx_power_w", None),
         )
 
         evaluator = Evaluator(test_dataset=test_ds)

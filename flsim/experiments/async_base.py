@@ -71,20 +71,20 @@ from flsim.core.evaluator import Evaluator
 from flsim.core.server import Server
 from flsim.experiments.base import Experiment, RunResult, _apply_config_overrides, _print_header
 from flsim.experiments.wiring import (
+    _load_dataset,
     _make_algorithm,
     _make_allocator,
     _make_channel_model,
     _make_partitioner,
     _make_profiles,
     _model_name_for_dataset,
+    _num_classes_for_dataset,
     load_config,
     set_seeds,
 )
 from flsim.models.factory import create_model
 from flsim.system.cellular_time import CellularTimeModel
 from flsim.system.energy import EnergyModel
-from flsim.data.loaders.mnist import load_mnist
-from flsim.data.loaders.cifar10 import load_cifar10
 
 
 class AsyncExperiment(Experiment):
@@ -149,17 +149,15 @@ class AsyncExperiment(Experiment):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # ---- dataset ----
-        if config.data.dataset == "mnist":
-            train_ds, test_ds = load_mnist()
-        elif config.data.dataset == "cifar10":
-            train_ds, test_ds = load_cifar10()
-        else:
-            raise ValueError(f"Unknown dataset: {config.data.dataset}")
+        train_ds, test_ds = _load_dataset(config)
 
         partitioner    = _make_partitioner(config.data)
         client_indices = partitioner.partition(train_ds, config.data.num_clients, rng)
 
-        global_model = create_model(_model_name_for_dataset(config.data.dataset)).to(device)
+        global_model = create_model(
+            _model_name_for_dataset(config.data.dataset, getattr(config.data, "model_name", None)),
+            num_classes=_num_classes_for_dataset(config.data.dataset, getattr(config.data, "num_classes", None)),
+        ).to(device)
 
         # ---- pre-converted scalars ----
         noise_psd             = dbm_to_watts(config.wireless.noise_psd_dbm_per_hz)

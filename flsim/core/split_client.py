@@ -23,6 +23,8 @@ from torch.utils.data import DataLoader, Subset
 import torch
 import torch.nn as nn
 
+from flsim.core.training_utils import iter_local_batches
+
 
 class SplitClient:
     """
@@ -62,11 +64,13 @@ class SplitClient:
         batch_size: int,
         learning_rate: float,
         device: torch.device,
+        max_iters: int = None,
     ) -> tuple:
         """
         Train client_model and server_model together via the relay mechanism,
-        for local_epochs passes over this client's own data. Both models are
-        updated IN PLACE by their optimizers.
+        for local_epochs passes over this client's own data (or exactly
+        max_iters mini-batch co-training iterations when max_iters is set — the
+        paper's H). Both models are updated IN PLACE by their optimizers.
 
         Per batch (paper Algorithm 2 / Algorithm 1's inner loop):
           1. Client forward pass up to the cut layer -> smashed data A.
@@ -87,11 +91,16 @@ class SplitClient:
         Args:
             client_model: the client-side sub-model (layers before the cut).
             server_model: the server-side sub-model (layers from the cut on).
-            local_epochs (int): E — number of local epochs per Algorithm 2.
+            local_epochs (int): E — number of local epochs per Algorithm 2
+                (used only when max_iters is None).
             batch_size (int): mini-batch size for SGD.
             learning_rate (float): SGD learning rate (shared by both optimizers,
                 matching the paper's single eta for the whole split network).
             device (torch.device): device to train on.
+            max_iters (int, optional): H — if set, do exactly H mini-batch
+                co-training iterations this round instead of local_epochs full
+                passes (the paper's H local iterations, one mini-batch B^tau per
+                iteration). See flsim.core.training_utils.iter_local_batches.
 
         Returns:
             tuple[OrderedDict, OrderedDict, int, float]:
@@ -112,33 +121,32 @@ class SplitClient:
         total_loss = 0.0
         total_batches = 0
 
-        for _ in range(local_epochs):
-            for x, y in loader:
-                x, y = x.to(device), y.to(device)
+        for x, y in iter_local_batches(loader, local_epochs, max_iters):
+            x, y = x.to(device), y.to(device)
 
-                client_opt.zero_grad()
-                server_opt.zero_grad()
+            client_opt.zero_grad()
+            server_opt.zero_grad()
 
-                # ---- client forward (up to cut layer) ----
-                smashed = client_model(x)
+            # ---- client forward (up to cut layer) ----
+            smashed = client_model(x)
 
-                # ---- "send" smashed data across the wire ----
-                # Fresh leaf tensor, disconnected from the client's graph —
-                # this IS the simulated communication boundary.
-                smashed_relay = smashed.detach().requires_grad_(True)
+            # ---- "send" smashed data across the wire ----
+            # Fresh leaf tensor, disconnected from the client's graph —
+            # this IS the simulated communication boundary.
+            smashed_relay = smashed.detach().requires_grad_(True)
 
-                # ---- server forward + backward ----
-                output = server_model(smashed_relay)
-                loss = criterion(output, y)
-                loss.backward()   # fills server_model grads AND smashed_relay.grad (= dA)
-                server_opt.step()
+            # ---- server forward + backward ----
+            output = server_model(smashed_relay)
+            loss = criterion(output, y)
+            loss.backward()   # fills server_model grads AND smashed_relay.grad (= dA)
+            server_opt.step()
 
-                # ---- relay dA back to the client, finish client backward ----
-                smashed.backward(smashed_relay.grad)
-                client_opt.step()
+            # ---- relay dA back to the client, finish client backward ----
+            smashed.backward(smashed_relay.grad)
+            client_opt.step()
 
-                total_loss += loss.item()
-                total_batches += 1
+            total_loss += loss.item()
+            total_batches += 1
 
         mean_loss = total_loss / max(total_batches, 1)
         return client_model.state_dict(), server_model.state_dict(), self.num_samples, mean_loss
