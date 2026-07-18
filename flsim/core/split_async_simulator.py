@@ -234,6 +234,20 @@ class SplitAsyncSimulator:
         self._effective_bw = config.wireless.total_bandwidth_hz / max(1, self._window_size)
         self._downlink_negligible = bool(getattr(config.wireless, "downlink_negligible", False))
 
+        # Dedicated RNG for cost-model channel draws, seeded independently of
+        # the training/selection RNG — same fairness rationale as
+        # SplitSimulator.cost_rng: cost randomness must not shift with each
+        # variant's different training path (and vice versa).
+        seed = int(getattr(getattr(config, "experiment", None), "seed", 0))
+        self.cost_rng = np.random.RandomState(seed)
+
+        # Server-capacity sharing (paper: sum_n f^S_n <= f^S,max): all
+        # window_size in-flight devices co-train concurrently, so the edge
+        # server allocates each an equal share f_S / window_size. Disable via
+        # split.server_frequency_shared: false.
+        self._server_freq_shared = bool(getattr(getattr(config, "split", None),
+                                                "server_frequency_shared", True))
+
         # Measured once (don't change across rounds) — same quantities
         # SplitSimulator measures via its own _measure_split_sizes().
         self._client_param_count = sum(t.numel() for t in self.client_model.state_dict().values())
@@ -378,7 +392,7 @@ class SplitAsyncSimulator:
         cfg = self.config.learning
         profile = self.profiles[cid]
 
-        gain = self.cost_model.channel_model.channel_gain(profile, self.rng)
+        gain = self.cost_model.channel_model.channel_gain(profile, self.cost_rng)
         bw_alloc = self.allocator.allocate_bandwidth([profile], self._effective_bw, channel_gains={cid: gain})
         pw_alloc = self.allocator.allocate_power([profile], profile.tx_power_w, channel_gains={cid: gain})
         fq_alloc = self.allocator.allocate_cpu_freq([profile], profile.cpu_frequency_hz, channel_gains={cid: gain})
@@ -399,6 +413,11 @@ class SplitAsyncSimulator:
             max_iters=local_iters(cfg),
         )
 
+        # Server share for this device: f_S / window_size while window_size
+        # devices co-train concurrently (paper: sum_n f^S_n <= f^S,max).
+        srv_freq = (self.cost_model.f_server / self._window_size
+                    if self._server_freq_shared and self._window_size > 1 else None)
+
         device_cost = self.cost_model.device_cost(
             profile=profile,
             num_samples=client.num_samples,
@@ -410,6 +429,7 @@ class SplitAsyncSimulator:
             bandwidth_hz=bw_hz,
             channel_gain=gain,
             work_samples=effective_work_samples(cfg, client.num_samples),
+            server_freq_hz=srv_freq,
         )
 
         arrival_time = current_time + device_cost.full_path_s

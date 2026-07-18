@@ -232,6 +232,12 @@ class AsyncSimulator:
         self._downlink_negligible = bool(
             getattr(config.wireless, "downlink_negligible", False)
         )
+        # Optional BS downlink power P^DL — same unified downlink convention
+        # as the sync Simulator / SplitCostModel (rate at BS power + downlink
+        # energy charged when set; None = original symmetric behaviour).
+        self._downlink_tx_power_w = getattr(
+            config.wireless, "downlink_tx_power_w", None
+        )
 
         # Insertion counter for stable priority-queue tie-breaking
         self._seq = 0
@@ -583,6 +589,7 @@ class AsyncSimulator:
                 size_bits=self._upload_bits,
                 bandwidth_hz=bw_hz,
                 channel_gain=gain,
+                tx_power_w=self._downlink_tx_power_w,
             )
 
         # ---- energy ----
@@ -595,6 +602,10 @@ class AsyncSimulator:
         e_tx = self.energy_model.transmission_energy_j(
             client.profile, upload_time_s=t_up, tx_power_w=p_w,
         )
+        # Downlink TX energy P^DL·t_dn — charged only when a BS downlink power
+        # is configured (matches SplitCostModel / sync Simulator convention).
+        if self._downlink_tx_power_w is not None and t_dn > 0.0:
+            e_tx += self._downlink_tx_power_w * t_dn
 
         # ---- local training (on snapshot of the global model the client received) ----
         # Ordinarily this is the CURRENT global model (staleness then arises

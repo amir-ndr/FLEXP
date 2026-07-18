@@ -92,6 +92,15 @@ class Simulator:
         self._downlink_negligible = bool(
             getattr(config.wireless, "downlink_negligible", False)
         )
+        # Optional BS downlink power P^DL (wireless.downlink_tx_power_w): when
+        # set, the downlink rate is computed at the BS's power (not the
+        # device's) AND downlink TX energy P^DL·t_dn is charged — the SAME
+        # asymmetric-downlink convention SplitCostModel uses, so FL/FedAsync
+        # and the split paradigms share one downlink physics. None (default)
+        # keeps the original symmetric-rate, uplink-only-energy behaviour.
+        self._downlink_tx_power_w = getattr(
+            config.wireless, "downlink_tx_power_w", None
+        )
 
     def run(self) -> None:
         """
@@ -274,6 +283,7 @@ class Simulator:
                     size_bits=upload_bits,
                     bandwidth_hz=bw_hz,
                     channel_gain=g_k,
+                    tx_power_w=self._downlink_tx_power_w,
                 )
 
             # Energy — use allocator-assigned f_hz and p_w.
@@ -286,6 +296,10 @@ class Simulator:
             e_tx = self.energy_model.transmission_energy_j(
                 client.profile, upload_time_s=t_up, tx_power_w=p_w,
             )
+            # Downlink TX energy P^DL·t_dn — charged only when a BS downlink
+            # power is configured (matches SplitCostModel / paper eq. 16).
+            if self._downlink_tx_power_w is not None and t_dn > 0.0:
+                e_tx += self._downlink_tx_power_w * t_dn
 
             # PyTorch local training (wall-clock time is NOT simulated time)
             self.server.algorithm.configure_client(

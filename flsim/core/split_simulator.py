@@ -332,6 +332,20 @@ class SplitSimulator:
 
         cfg = self.config.learning
         bw_per_client = self.config.wireless.total_bandwidth_hz / max(1, len(selected))
+
+        # Server-capacity sharing (paper: sum_n f^S_n <= f^S,max). In SFLV1 the
+        # server runs ALL selected devices' server-side jobs concurrently, so
+        # each is allocated an equal share f_S / n_concurrent. SL and SFLV2
+        # serve one device's stream at a time (sequential server), so each job
+        # runs at the full f_S — their latency formulas already SUM the server
+        # terms across devices. Disable via split.server_frequency_shared: false
+        # (restores the old every-device-at-full-f_S behaviour).
+        srv_freq = None   # None -> device_cost uses full f_S
+        shared = bool(getattr(getattr(self.config, "split", None),
+                              "server_frequency_shared", True))
+        if shared and self._cost_mode() == "sflv1" and len(selected) > 1:
+            srv_freq = self.cost_model.f_server / len(selected)
+
         per_device = []
         for client in selected:
             profile = self.profiles[client.client_id]
@@ -347,6 +361,7 @@ class SplitSimulator:
                 bandwidth_hz=bw_per_client,
                 channel_gain=gain,
                 work_samples=effective_work_samples(cfg, client.num_samples),
+                server_freq_hz=srv_freq,
             ))
         return self.cost_model.combine(self._cost_mode(), per_device)
 

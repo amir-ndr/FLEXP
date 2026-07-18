@@ -72,16 +72,26 @@ class EqualSplitAllocator(ResourceAllocator):
         **kwargs,
     ) -> dict:
         """
-        All clients transmit at maximum power p_max.
+        Each client transmits at its own profile power p_k = profile.tx_power_w.
+
+        In the homogeneous default (wireless.tx_power_dbm, no per-device
+        range) every profile's tx_power_w equals dbm_to_watts(tx_power_dbm)
+        == p_max_w, so this is IDENTICAL to the old "everyone at p_max"
+        behaviour. With a per-device power range (wireless.tx_power_w_min/max,
+        e.g. p_n ~ U[0.1, 0.2] W), the profile power is each device's actual
+        max — using it keeps the sync/async uplink physics consistent with
+        the split cost model, which reads profile.tx_power_w directly.
 
         Args:
             selected_profiles: list of ClientSystemProfile.
-            p_max_w (float): maximum transmit power in watts.
+            p_max_w (float): system-level max transmit power in watts (kept
+                for custom allocators that optimise against a shared cap;
+                unused by this default policy — the profile power IS the cap).
 
         Returns:
-            dict[int, float]: {client_id: p_max_w}.
+            dict[int, float]: {client_id: profile.tx_power_w}.
         """
-        return {p.client_id: p_max_w for p in selected_profiles}
+        return {p.client_id: p.tx_power_w for p in selected_profiles}
 
     def allocate_cpu_freq(
         self,

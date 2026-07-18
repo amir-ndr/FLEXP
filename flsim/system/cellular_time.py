@@ -69,7 +69,7 @@ class CellularTimeModel(TimeModel):
 
     def compute_upload_time(
         self, profile, size_bits: float, bandwidth_hz: float,
-        channel_gain: float = None,
+        channel_gain: float = None, tx_power_w: float = None,
     ) -> float:
         """
         Simulated upload (uplink) time in seconds.
@@ -86,15 +86,18 @@ class CellularTimeModel(TimeModel):
                 round and must not be re-drawn here).  If None, the gain is
                 recomputed via the channel model (safe for frozen models like
                 PathLossChannelModel).
+            tx_power_w (float, optional): transmit power override; None
+                (default) uses profile.tx_power_w.
 
         Returns:
             float: simulated upload time in seconds.
         """
         if channel_gain is None:
             channel_gain = self.channel_model.channel_gain(profile, rng=None)
+        p_w = tx_power_w if tx_power_w is not None else profile.tx_power_w
         rate_bps = self.channel_model.achievable_rate_bps(
             bandwidth_hz=bandwidth_hz,
-            tx_power_w=profile.tx_power_w,
+            tx_power_w=p_w,
             channel_gain=channel_gain,
             noise_psd_w_per_hz=self.noise_psd_w_per_hz,
         )
@@ -103,24 +106,27 @@ class CellularTimeModel(TimeModel):
 
     def compute_download_time(
         self, profile, size_bits: float, bandwidth_hz: float,
-        channel_gain: float = None,
+        channel_gain: float = None, tx_power_w: float = None,
     ) -> float:
         """
         Simulated download (downlink) time in seconds.
 
-        Uses the same uplink Shannon rate as a simplifying assumption
-        (symmetric channel). Downlink asymmetry can be added by injecting
-        a separate downlink channel model in a future extension.
+        By default uses the same uplink Shannon rate (symmetric-channel
+        assumption). Pass tx_power_w = the BS's downlink power (e.g.
+        wireless.downlink_tx_power_w) to compute the downlink rate at the BS's
+        power instead — the asymmetric-link model of split-FL papers, applied
+        here identically for FL so all paradigms share one downlink physics.
 
         Args:
             profile: ClientSystemProfile.
             size_bits (float): size of global model in bits.
             bandwidth_hz (float): allocated downlink bandwidth in Hz.
             channel_gain (float, optional): pre-computed gain (see compute_upload_time).
+            tx_power_w (float, optional): BS downlink power P^DL; None keeps
+                the symmetric assumption (device power).
 
         Returns:
             float: simulated download time in seconds.
         """
-        # NOTE: Using uplink rate as a proxy for downlink (symmetric assumption).
-        # To add asymmetry, inject a separate downlink ChannelModel.
-        return self.compute_upload_time(profile, size_bits, bandwidth_hz, channel_gain)
+        return self.compute_upload_time(profile, size_bits, bandwidth_hz,
+                                        channel_gain, tx_power_w=tx_power_w)

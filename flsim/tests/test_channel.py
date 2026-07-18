@@ -179,12 +179,25 @@ class TestEqualSplitAllocator:
         assert result == {}
 
     def test_power_all_at_pmax(self):
+        """Homogeneous case: profile powers all equal p_max -> unchanged behaviour."""
         alloc = self._alloc()
         profiles = _profiles(4)
         p_max = 0.01
         result = alloc.allocate_power(profiles, p_max)
         for v in result.values():
             assert v == p_max
+
+    def test_power_heterogeneous_uses_profile_power(self):
+        """Per-device power (wireless.tx_power_w_min/max mode): each client
+        transmits at its OWN profile power — consistent with SplitCostModel,
+        which reads profile.tx_power_w directly."""
+        alloc = self._alloc()
+        profiles = [_FakeProfile(distance_m=100.0, client_id=i,
+                                 tx_power_w=0.1 + 0.025 * i)
+                    for i in range(4)]
+        result = alloc.allocate_power(profiles, p_max_w=0.01)
+        for p in profiles:
+            assert result[p.client_id] == p.tx_power_w
 
     def test_cpu_freq_from_profile(self):
         alloc = self._alloc()

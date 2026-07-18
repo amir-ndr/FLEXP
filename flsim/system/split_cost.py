@@ -156,6 +156,7 @@ class SplitCostModel:
         bandwidth_hz: float,
         channel_gain: float,
         work_samples: float = None,
+        server_freq_hz: float = None,
     ) -> DevicePerRound:
         """
         Cost of one device's participation in one global round.
@@ -176,10 +177,17 @@ class SplitCostModel:
                 given, OVERRIDES num_samples * local_epochs — use it to pass the
                 paper's H*b (H local iterations of a b-sample mini-batch) instead
                 of full-epoch work. None (default) keeps num_samples*local_epochs.
+            server_freq_hz (float, optional): the server frequency f^S_{n} this
+                device is ALLOCATED for this round. The paper's f^S,max is the
+                BS's total capacity, split across concurrently-served devices
+                (sum_n f^S_n <= f^S,max) — so parallel variants (SFLV1, async
+                split) pass f_S/n_concurrent here, while sequential-server
+                variants (SL, SFLV2) pass None (= full f_S, one job at a time).
 
         Returns:
             DevicePerRound.
         """
+        f_srv = server_freq_hz if server_freq_hz is not None else self.f_server
         # ---- FDMA link rate (Shannon), same primitive as the sync/async sims ----
         rate_bps = self.channel_model.achievable_rate_bps(
             bandwidth_hz=bandwidth_hz,
@@ -210,7 +218,7 @@ class SplitCostModel:
 
         # ---- compute times: FLOPs / (frequency * FLOPs-per-cycle q) (paper eq. 7/10/12) ----
         t_dev_compute = (dev_cycles * work) / (profile.cpu_frequency_hz * self.q_device)
-        t_srv_compute = (srv_cycles * work) / (self.f_server * self.q_server)
+        t_srv_compute = (srv_cycles * work) / (f_srv * self.q_server)
 
         # ---- communication times (bits / rate) ----
         smashed_bits = activation_numel * BITS_PER_ELEMENT      # per sample
@@ -223,7 +231,7 @@ class SplitCostModel:
         # ---- energy (paper eq. 16) ----
         # compute: DVFS  kappa*f^3*t = kappa * FLOPs * work * f^2 / q  (device & server)
         dev_compute_energy = self.kappa * dev_cycles * work * (profile.cpu_frequency_hz ** 2) / self.q_device
-        srv_compute_energy = self.kappa * srv_cycles * work * (self.f_server ** 2) / self.q_server
+        srv_compute_energy = self.kappa * srv_cycles * work * (f_srv ** 2) / self.q_server
         # TX: uplink P^UL*(smashed_up + model_up) always; downlink P^DL*(model_down +
         # grad_down) only when a BS downlink power is configured (else the
         # framework's uplink-only-energy convention, no downlink charge).

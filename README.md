@@ -930,15 +930,25 @@ framework's original behavior, so leaving them unset changes nothing). They are
 **hardware** parameters, not per-algorithm — set them once and they apply the
 same way to every split method, keeping cross-paradigm comparison fair:
 
-| `split.*` | Meaning | Default |
+| Knob | Meaning | Default |
 |---|---|---|
-| `q_device` / `q_server` | FLOPs-per-cycle of device / edge server. Compute time = `FLOPs/(f·q)`, energy = `κ·FLOPs·f²/q`. Only affects **compute** (never traffic). `q=1` ⇒ original `cycles/freq` formula. | `1.0` / `1.0` |
-| `downlink_tx_power_w` | BS downlink power `P^DL` for model-download + gradient-download. When set, downlink latency uses this (BS) power and downlink energy is charged; when `null`, downlink reuses the uplink rate with no downlink-energy charge (original behavior). | `null` |
+| `split.q_device` / `split.q_server` | FLOPs-per-cycle of device / edge server. Compute time = `FLOPs/(f·q)`, energy = `κ·FLOPs·f²/q`. Only affects **compute** (never traffic). `q=1` ⇒ original `cycles/freq` formula. | `1.0` / `1.0` |
+| `split.server_frequency_shared` | `f_S` is the BS's **total** capacity (paper: `Σ f^S_n ≤ f^S,max`): concurrent server-side jobs (SFLV1; the async-split in-flight window) each get `f_S/n_concurrent`; sequential-server modes (SL, SFLV2) run one job at a time at full `f_S`. `false` restores the old every-device-at-full-`f_S` behavior (a BS with n× the stated capacity — usually wrong). | `true` |
+| `wireless.downlink_tx_power_w` | BS downlink power `P^DL` — **unified across all paradigms**: when set, FL/FedAsync *and* the split methods compute downlink rate at the BS power and charge downlink energy `P^DL·t_down`; when `null`, all paradigms use the symmetric-rate, uplink-only-energy convention. | `null` |
 
 `q_server > q_device` models a fast edge server (e.g. `q_device=1, q_server=2`);
 `q` is the correct place to represent per-hardware throughput without touching
 the shared `cycles_per_sample` (FLOPs) that every method uses. Because they only
 touch compute, communication overhead (MB) stays identical regardless.
+
+> **Limit-case consistency (verified numerically).** The paradigms collapse into
+> each other at their boundary settings, and the cost model respects this:
+> `FedAsyncTopKFastTotal(k = window = N)` produces **exactly** sync FedAvg's
+> per-round time & energy; `SAFSL(k = window = N)` produces **exactly** SFLV1's
+> per-round latency, energy & traffic; and SFLV1 with `cut_layer = max`
+> degenerates to FL within the (small) smashed-data term — 0.01 % time /
+> 1.6 % energy under identical channels. This is what makes cross-paradigm
+> comparisons meaningful: all five paradigms sit on one physical base.
 
 ---
 
@@ -1396,13 +1406,23 @@ wireless:
   upload_size_bits:      28100    # used when fixed
   downlink_negligible:   false    # true → model-broadcast (download) time = 0
                                   # applies to BOTH sync and async simulators
+  downlink_tx_power_w:   null     # BS downlink power P^DL — UNIFIED for ALL
+                                  # paradigms: when set, downlink rate uses the
+                                  # BS power and downlink energy P^DL·t_dn is
+                                  # charged (sync, async, split, async-split
+                                  # alike); null = symmetric rate, uplink-only
+                                  # energy (original behaviour)
 
 # Split learning cost model (SplitSimulator / SplitAsyncSimulator)
 split:
-  server_cpu_frequency_hz: 3.0e+9   # edge-server frequency f_S
+  server_cpu_frequency_hz: 3.0e+9   # edge-server TOTAL capacity f_S,max
   q_device:              1.0        # device FLOPs/cycle (1.0 = original cycles/freq)
   q_server:              1.0        # edge-server FLOPs/cycle (e.g. 2.0 = fast server)
-  downlink_tx_power_w:   null       # BS downlink power P^DL; null = symmetric, no dl energy
+  server_frequency_shared: true     # true: concurrent server-side jobs (SFLV1,
+                                    # async-split window) each get f_S/n_concurrent
+                                    # (Σ f^S_n ≤ f^S,max); sequential-server modes
+                                    # (SL, SFLV2) always use full f_S per job.
+                                    # false = old every-device-at-full-f_S
 
 # Async FL only — ignored by synchronous Simulator (also read by SplitAsyncSimulator)
 async_fl:

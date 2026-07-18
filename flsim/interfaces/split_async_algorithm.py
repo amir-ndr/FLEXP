@@ -82,6 +82,11 @@ class SplitAsyncAlgorithm:
         Returns:
             list[SplitClient]: selected clients.
         """
+        if num_to_trigger >= len(all_clients):
+            # Full participation — same shortcut as SplitSimulator._select_clients,
+            # so the k = window = N special case degenerates EXACTLY to the
+            # synchronous variant (same client order, no RNG consumed).
+            return list(all_clients)
         indices = rng.choice(len(all_clients), size=num_to_trigger, replace=False)
         return [all_clients[i] for i in indices]
 

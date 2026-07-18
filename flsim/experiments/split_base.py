@@ -146,6 +146,12 @@ class SplitExperiment(Experiment):
         profiles = _make_profiles(config, [len(i) for i in client_indices], rng)
         split_cfg = getattr(config, "split", None)
         server_freq = float(getattr(split_cfg, "server_cpu_frequency_hz", 3.0e9))
+        # BS downlink power: unified location is wireless.downlink_tx_power_w
+        # (shared by sync/async/split so all paradigms use ONE downlink physics);
+        # split.downlink_tx_power_w is honoured as a legacy fallback.
+        dl_power = getattr(config.wireless, "downlink_tx_power_w", None)
+        if dl_power is None:
+            dl_power = getattr(split_cfg, "downlink_tx_power_w", None)
         cost_model = SplitCostModel(
             channel_model=channel_model,
             noise_psd_w_per_hz=noise_psd,
@@ -154,7 +160,7 @@ class SplitExperiment(Experiment):
             downlink_negligible=bool(getattr(config.wireless, "downlink_negligible", False)),
             q_device=float(getattr(split_cfg, "q_device", 1.0)),
             q_server=float(getattr(split_cfg, "q_server", 1.0)),
-            downlink_tx_power_w=getattr(split_cfg, "downlink_tx_power_w", None),
+            downlink_tx_power_w=dl_power,
         )
 
         evaluator = Evaluator(test_dataset=test_ds)

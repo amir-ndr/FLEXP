@@ -48,10 +48,13 @@ FAIRNESS / COHERENCE (identical local work + one physical base for ALL methods)
 PAPER PARAMETERS (SAFSL system model)
 -------------------------------------
   N=10 devices; >= 0.8N aggregated/round; device dist ~ U[100,1000] m;
-  device freq ~ U[0.1,2]e9 cyc/s (q_n=1); edge server f_S=3e10 (q_S=2);
-  B=50 MHz; device tx power ~ U[0.1,0.2] W; BS downlink power 0.3 W;
-  N0=1e-18 W/Hz (=-150 dBm/Hz); path-fading exponent 1.3, complex-Gaussian
-  small-scale fading; b=64; kappa=1e-28. Model split at CUT_LAYER of ResNet-18.
+  device freq ~ U[0.1,2]e9 cyc/s (q_n=1); edge server f_S,max=3e10 (q_S=2),
+  SHARED across concurrently-served devices (sum_n f^S_n <= f^S,max — see
+  split.server_frequency_shared); B=50 MHz; device tx power ~ U[0.1,0.2] W;
+  BS downlink power 0.3 W (unified downlink physics for ALL paradigms — see
+  wireless.downlink_tx_power_w); N0=1e-18 W/Hz (=-150 dBm/Hz); path-fading
+  exponent 1.3, complex-Gaussian small-scale fading; H=16 local iterations;
+  b=64; lr=1e-4; kappa=1e-28. Model split at CUT_LAYER of ResNet-18.
 
 RUNTIME NOTE
 ------------
@@ -113,9 +116,9 @@ BUFFER_K           = int(round(PARTICIPATION_FRAC * NUM_DEVICES))   # SAFSL |S_t
 WINDOW_SIZE        = NUM_DEVICES                          # concurrent in-flight devices
 
 # ---- Local training (identical for ALL methods -> fair) ----
-LOCAL_ITERS   = 10      # H: mini-batch SGD steps per round (paper's local iterations)
-BATCH_SIZE    = 64
-LEARNING_RATE = 0.0001
+LOCAL_ITERS   = 16      # H: mini-batch SGD steps per round (paper: H = 16)
+BATCH_SIZE    = 64      # b  (paper: 64)
+LEARNING_RATE = 0.0001  # eta (paper: 1e-4)
 
 # ---- Physical parameters (paper) ----
 BANDWIDTH_HZ         = 50.0e6      # B = 50 MHz
@@ -185,6 +188,10 @@ SHARED_OVERRIDES = {
     "wireless.tx_power_w_max":           DEV_TX_POWER_MAX_W,
     "wireless.noise_psd_dbm_per_hz":     NOISE_PSD_DBM_PER_HZ,
     "wireless.min_distance_m":           1.0,
+    # BS downlink power P^DL — UNIFIED downlink physics for every paradigm
+    # (FL/FedAsync downlink rate + energy AND the split methods' model/gradient
+    # downlink all use this same BS power; see wireless.downlink_tx_power_w).
+    "wireless.downlink_tx_power_w":      BS_DOWNLINK_POWER_W,
     # FL/FedAsync exchange the FULL model -> size their up/down comm by the real net.
     "wireless.upload_size_mode":         "model",
     # --- compute (paper): device f ~ U[0.1,2] GHz, fixed per-sample FLOPs ---
@@ -198,7 +205,6 @@ SHARED_OVERRIDES = {
     "split.server_cpu_frequency_hz": SERVER_FREQ_HZ,
     "split.q_device":                Q_DEVICE,
     "split.q_server":                Q_SERVER,
-    "split.downlink_tx_power_w":     BS_DOWNLINK_POWER_W,
     "learning.cut_layer":            CUT_LAYER,
 }
 
@@ -324,7 +330,8 @@ class SAFSLExperiment(SplitExperiment, AsyncExperiment):
             server_cpu_frequency_hz=float(config.split.server_cpu_frequency_hz),
             q_device=float(config.split.q_device),
             q_server=float(config.split.q_server),
-            downlink_tx_power_w=getattr(config.split, "downlink_tx_power_w", None),
+            downlink_tx_power_w=getattr(config.wireless, "downlink_tx_power_w",
+                                        getattr(config.split, "downlink_tx_power_w", None)),
         )
         evaluator = Evaluator(test_dataset=test_ds)
 
