@@ -124,6 +124,13 @@ wireless:
   min_distance_m: 1.0            # clamp for all channel models (avoids g→∞)
   upload_size_bits: 28100        # used when upload_size_mode="fixed"
   upload_size_mode: "fixed"      # fixed | model
+  # Optional BS downlink transmit power P^DL (watts) — UNIFIED across ALL
+  # paradigms (sync, async, split, async-split). When set: downlink rate is
+  # computed at this BS power (instead of the device's uplink power), and
+  # downlink TX energy P^DL·t_down is charged (split-FL paper eq. 16 style).
+  # Leave null for the original symmetric-rate, uplink-only-energy convention.
+  # (e.g. SAFSL: 0.3 W)
+  downlink_tx_power_w: null
   # Downlink (model broadcast) time:
   #   false — download time is computed like upload (symmetric channel).
   #   true  — download time = 0 (base station has unlimited power/bandwidth,
@@ -207,13 +214,18 @@ split:
   # They only affect COMPUTE (time+energy); communication/traffic are untouched.
   q_device: 1.0
   q_server: 1.0
-  # Optional BS downlink transmit power (watts) for the model-download and
-  # gradient-download legs (paper P^DL). When set, downlink LATENCY uses a rate
-  # at this BS power (not the device's uplink power), AND downlink energy
-  # P^DL·(t_model_down + t_grad_down) is charged (paper eq. 16). Leave null to
-  # keep the framework's symmetric-link, uplink-only-energy convention
-  # (e.g. SAFSL: BS downlink power = 0.3 W).
+  # DEPRECATED alias for wireless.downlink_tx_power_w (still honoured by the
+  # split cost model if the wireless one is null) — prefer the wireless key,
+  # which applies the SAME downlink physics to every paradigm.
   downlink_tx_power_w: null
+  # Server-capacity sharing (paper: sum_n f^S_n <= f^S,max). true (default):
+  # when several devices' server-side jobs run CONCURRENTLY (SFLV1; async
+  # split's whole in-flight window), each is allocated an equal share
+  # f_S / n_concurrent — the BS's stated capacity is a TOTAL, not per-device.
+  # Sequential-server modes (SL, SFLV2) always use the full f_S per job (one
+  # stream at a time). false restores the old every-device-at-full-f_S
+  # behaviour (models a BS with n_concurrent x f_S capacity — usually wrong).
+  server_frequency_shared: true
 
 # Plots generated after each run (and in comparison experiments).
 # Each entry produces one PNG. Remove entries you don't want.
