@@ -297,6 +297,28 @@ class Experiment:
                              config=config, csv_path=csv_path, df=df)
         print(f"[Experiment] Done — final_acc={result.final_accuracy:.4f}  "
               f"best_acc={result.best_accuracy:.4f}\n")
+        return self.finalize_run(result, run_name)
+
+    # ------------------------------------------------------------------
+    # Automatic per-run outputs (unified CSV + standard plots)
+    # ------------------------------------------------------------------
+
+    def finalize_run(self, result, run_name: str):
+        """
+        Produce this run's canonical `<run_name>_unified.csv` + the standard
+        plot set, so EVERY algorithm/paradigm gets the same CSV + plots with no
+        per-algorithm code. Called automatically by run_single / run_single_async
+        / run_single_split; call it yourself for a simulator you wired by hand:
+
+            result = self.finalize_run(result, "my_run")
+
+        Additive — the simulator's own logger/CSV and any extra columns are left
+        untouched. See flsim.experiments.reporting. Returns `result` (unchanged
+        object; its `.df` is kept as-is so downstream code sees the raw columns).
+        """
+        from flsim.experiments.reporting import write_standard_outputs
+        run_dir = os.path.join(self.output_dir, run_name)
+        write_standard_outputs(result.df, result.label, run_dir, run_name)
         return result
 
     # ------------------------------------------------------------------

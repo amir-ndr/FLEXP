@@ -117,12 +117,14 @@ class ParallelSFLSimulator:
         device: torch.device,
         profiles: list = None,
         cost_model=None,
+        num_classes: int = None,
     ):
         if not isinstance(algorithm, ParallelSFLAlgorithm):
             raise TypeError(
                 f"ParallelSFLSimulator requires a ParallelSFLAlgorithm, got "
                 f"{type(algorithm).__name__}."
             )
+        self._num_classes_arg = num_classes
         self.clients = clients
         self.global_bottom = bottom_model.to(device)
         self.global_top = top_model.to(device)
@@ -157,13 +159,27 @@ class ParallelSFLSimulator:
     # ------------------------------------------------------------------
 
     def _infer_num_classes(self) -> int:
+        """
+        Number of label classes M. Prefer an explicit num_classes (constructor
+        arg or config.data.num_classes); otherwise infer ROBUSTLY from the FULL
+        dataset — never a subset, since a non-IID client's first samples can
+        miss the higher labels and undersize the histogram (IndexError).
+        """
+        if self._num_classes_arg is not None:
+            return int(self._num_classes_arg)
         nc = getattr(getattr(self.config, "data", None), "num_classes", None)
         if nc:
             return int(nc)
-        # fall back to max label + 1 across all clients
+        # Robust fallback: max label + 1 over the whole dataset (use .targets
+        # when available, else scan every client's every index).
+        ds = self.clients[0].dataset
+        tgts = getattr(ds, "targets", None)
+        if tgts is not None:
+            arr = tgts.tolist() if hasattr(tgts, "tolist") else list(tgts)
+            return int(max(int(t) for t in arr)) + 1
         m = 0
         for c in self.clients:
-            for idx in c.indices[: min(64, len(c.indices))]:
+            for idx in c.indices:
                 _, y = c.dataset[idx]
                 m = max(m, int(y))
         return m + 1

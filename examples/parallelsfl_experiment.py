@@ -113,6 +113,16 @@ ACC_TARGETS       = [0.80, 0.85, 0.90, 0.95]
 
 METHOD_ORDER = ["FL", "SFLv2", "SAFSL", "ParallelSFL"]
 
+# Unified CSV schema every method is normalized to, so any of them can be
+# plotted / compared with the same code. Method-specific extras (staleness,
+# num_clusters) stay in each method's own raw CSV; this is the common core.
+CANONICAL_COLUMNS = [
+    "round", "train_loss", "test_accuracy", "test_loss",
+    "simulated_time_s", "round_latency_s", "avg_waiting_time_s",
+    "traffic_bytes", "cumulative_traffic_bytes",
+    "total_energy_j", "cumulative_energy_j",
+]
+
 
 def _phi_flops_per_sample() -> float:
     """Full-model FP+BP FLOPs/sample (~6*MACs) for MnistCNN, fixed for all clients."""
@@ -180,9 +190,12 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
                               "learning.clients_per_round": NUM_CLIENTS},
             components={"algorithm": FedAvg()},
         )
+        # FL's traffic is added post-hoc (the sync sim doesn't track it), so
+        # re-finalize to fold traffic into its auto-generated unified CSV/plots.
         self._add_full_model_traffic(results["FL"], per_step_clients=NUM_CLIENTS)
+        self.finalize_run(results["FL"], "psfl_fl")
 
-        # 2. SFLv2 — sync split, server side sequential.
+        # 2. SFLv2 — sync split, server side sequential. (auto-finalized by run_single_split)
         results["SFLv2"] = self.run_single_split(
             run_name="psfl_sflv2", label="SFLv2",
             config_overrides={**SHARED_OVERRIDES,
@@ -211,7 +224,26 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
         self._plot_bars_at_targets(results)
         self._plot_waiting_time(results)
         self._time_to_accuracy_table(results)
+        self._write_combined_csv(results)
         return results
+
+    def _write_combined_csv(self, results):
+        """One long-format CSV (all methods stacked, identical columns + a
+        'method' column) — the single file to plot anything from. Each method's
+        raw df is mapped onto the framework's CANONICAL schema (reporting.
+        normalize_df) so every method contributes the exact same columns."""
+        from flsim.experiments import reporting
+        frames = []
+        for name in [m for m in METHOD_ORDER if m in results]:
+            d = reporting.normalize_df(results[name].df)
+            d.insert(0, "method", name)
+            frames.append(d)
+        combined = pd.concat(frames, ignore_index=True)
+        out = os.path.join(self.output_dir, "all_methods_unified.csv")
+        os.makedirs(self.output_dir, exist_ok=True)
+        combined.to_csv(out, index=False)
+        print(f"[ParallelSFLComparison] Saved combined {out} ({len(combined)} rows, "
+              f"columns: {list(combined.columns)})")
 
     # ==================================================================
     # ParallelSFL run builder
@@ -250,13 +282,15 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
             algorithm=ParallelSFL(lam=0.5, tau_max=LOCAL_ITERS),
             evaluator=Evaluator(test_dataset=test_ds), config=config, rng=rng, device=device,
             profiles=profiles, cost_model=cost_model,
+            num_classes=_num_classes_for_dataset(config.data.dataset,
+                                                 getattr(config.data, "num_classes", None)),
         )
         history = sim.run()
 
         run_dir = os.path.join(self.output_dir, run_name)
         os.makedirs(run_dir, exist_ok=True)
         csv_path = os.path.join(run_dir, f"{run_name}.csv")
-        cols = ["round", "test_accuracy", "test_loss", "simulated_time_s",
+        cols = ["round", "train_loss", "test_accuracy", "test_loss", "simulated_time_s",
                 "traffic_bytes", "cumulative_traffic_bytes",
                 "total_energy_j", "cumulative_energy_j",
                 "round_latency_s", "avg_waiting_time_s", "num_clusters"]
@@ -266,6 +300,7 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
             for r in history:
                 w.writerow({
                     "round": r.round,
+                    "train_loss": f"{r.train_loss:.6f}",
                     "test_accuracy": f"{r.test_accuracy:.6f}" if r.test_accuracy is not None else "",
                     "test_loss": f"{r.test_loss:.6f}" if r.test_loss is not None else "",
                     "simulated_time_s": f"{r.simulated_time_s:.6f}",
@@ -278,7 +313,8 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
                     "num_clusters": r.num_clusters,
                 })
         df = pd.read_csv(csv_path)
-        return RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=df)
+        result = RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=df)
+        return self.finalize_run(result, run_name)   # auto unified CSV + standard plots
 
     # ==================================================================
     # SAFSL run builder (same as examples/SAFSL_experiment.py)
@@ -325,15 +361,16 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
         run_dir = os.path.join(self.output_dir, run_name)
         os.makedirs(run_dir, exist_ok=True)
         csv_path = os.path.join(run_dir, f"{run_name}.csv")
-        cols = ["round", "test_accuracy", "test_loss", "simulated_time_s",
+        cols = ["round", "train_loss", "test_accuracy", "test_loss", "simulated_time_s",
                 "traffic_bytes", "cumulative_traffic_bytes",
-                "total_energy_j", "cumulative_energy_j", "round_latency_s"]
+                "total_energy_j", "cumulative_energy_j", "round_latency_s", "staleness"]
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             for r in history:
                 w.writerow({
                     "round": r.global_epoch,
+                    "train_loss": f"{r.train_loss:.6f}",
                     "test_accuracy": f"{r.test_accuracy:.6f}" if r.test_accuracy is not None else "",
                     "test_loss": f"{r.test_loss:.6f}" if r.test_loss is not None else "",
                     "simulated_time_s": f"{r.simulated_time_s:.6f}",
@@ -342,9 +379,11 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
                     "total_energy_j": f"{r.total_energy_j:.6e}",
                     "cumulative_energy_j": f"{r.cumulative_energy_j:.6e}",
                     "round_latency_s": f"{r.round_latency_s:.6f}",
+                    "staleness": r.staleness,
                 })
         df = pd.read_csv(csv_path)
-        return RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=df)
+        result = RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=df)
+        return self.finalize_run(result, run_name)   # auto unified CSV + standard plots
 
     # ------------------------------------------------------------------
     # FL full-model traffic column (its CSV has time+energy but no traffic)
@@ -362,7 +401,12 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
         df["cumulative_traffic_bytes"] = per_step * (np.arange(len(df)) + 1)
 
     # ==================================================================
-    # Analysis + plots
+    # Analysis + plots (cross-method comparison)
+    #
+    # The per-run unified CSV + standard "inside" plots are produced
+    # AUTOMATICALLY by the framework (Experiment.finalize_run ->
+    # flsim.experiments.reporting) for every method — no per-algorithm code.
+    # Only the cross-method COMPARISON below is experiment-specific.
     # ==================================================================
 
     @staticmethod

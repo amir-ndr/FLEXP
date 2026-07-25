@@ -243,4 +243,4 @@ class SplitExperiment(Experiment):
             f"[SplitExperiment] Done — "
             f"final_acc={result.final_accuracy:.4f}  best_acc={result.best_accuracy:.4f}\n"
         )
-        return result
+        return self.finalize_run(result, run_name)

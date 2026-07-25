@@ -1416,6 +1416,67 @@ on the same time / cumulative axes as every other paradigm.
 `total_energy_j`, `cumulative_energy_j`, `num_clusters` — same time / cumulative
 axes plus the cluster-specific waiting time and cluster count.
 
+### Unified CSV + standard plots (automatic, every run)
+
+The per-paradigm CSVs above have *different* columns, which makes cross-method
+plotting fiddly. So **on top of** each run's own CSV, the framework writes one
+**canonical** CSV and a standard plot set automatically — you never write CSV or
+plotting code for a new algorithm. Every run's folder gets:
+
+```
+outputs/<exp>/<run_name>/
+  <run_name>.csv                 # the paradigm's raw CSV (unchanged)
+  <run_name>_unified.csv         # canonical schema — IDENTICAL columns for every paradigm
+  <run_name>_acc_vs_round.png    <run_name>_acc_vs_time.png
+  <run_name>_test_loss.png       <run_name>_train_loss.png
+  <run_name>_cumulative_energy.png   <run_name>_cumulative_traffic.png
+  <run_name>_round_latency.png   <run_name>_avg_waiting_time.png
+```
+
+The unified CSV always has these 11 columns (see `flsim/experiments/reporting.py`,
+`CANONICAL_COLUMNS`), regardless of algorithm:
+
+```
+round, train_loss, test_accuracy, test_loss,
+simulated_time_s, round_latency_s, avg_waiting_time_s,
+traffic_bytes, cumulative_traffic_bytes,
+total_energy_j, cumulative_energy_j
+```
+
+It's built by `reporting.normalize_df()`, which *aliases* each simulator's quirky
+header onto the canonical name (e.g. `global_epoch`→`round`,
+`round_duration_s`/`total_time_s`→`round_latency_s`, `mean_train_loss`→
+`train_loss`) and fills any column a paradigm doesn't have with `NaN`. Plots for
+an all-`NaN` metric are silently skipped, so e.g. a sync run just won't emit an
+`avg_waiting_time.png`. **This is additive** — nothing in the raw CSV or the
+algorithm's numbers changes; the unified files sit alongside.
+
+**How you get it for a new algorithm / experiment — nothing to write:**
+
+- If your experiment uses `run_single`, `run_single_async`, or
+  `run_single_split`, the unified CSV + plots are produced automatically (those
+  methods end with `return self.finalize_run(result, run_name)`).
+- If you **hand-wire a simulator** (a brand-new paradigm that doesn't go through
+  those methods), make **one** call before returning:
+
+  ```python
+  result = RunResult(name=run_name, label=label, config=config,
+                     csv_path=csv_path, df=df)
+  return self.finalize_run(result, run_name)   # <- unified CSV + standard plots
+  ```
+
+  (This is exactly what the ParallelSFL experiment's two custom builders do.)
+
+**Paradigm-specific metrics (e.g. `staleness`) are kept, not lost.** They are
+*not* in the unified schema on purpose — FL/SFL have no such concept, so forcing
+the column in would put an empty field on every sync method and make the
+"identical columns" guarantee false. Your async raw CSV still has `staleness`
+(and `alpha_used`, `client_id`, …) exactly as before — plot those from the raw
+CSV. To promote a metric *into* the unified schema (and its auto-plot) for the
+paradigms that have it, add it to `CANONICAL_COLUMNS` + `_ALIASES` in
+`flsim/experiments/reporting.py` — one place, all paradigms; it shows up as `NaN`
+(and its plot is skipped) wherever the metric doesn't exist.
+
 ### Metric glossary
 
 | Metric | Definition |
