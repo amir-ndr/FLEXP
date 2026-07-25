@@ -42,6 +42,7 @@ source /global/home/hpc6175/venvs/env1/bin/activate
 # Run from the repo root regardless of where sbatch was invoked from.
 cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 mkdir -p slurm/logs
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Workaround: this cluster's ldconfig cache points libcuda.so.1 at
 # /usr/lib64/nvidia/libcuda.so.1, which doesn't exist on these GPU nodes —
@@ -78,7 +79,7 @@ echo "===================================================="
 # Assert torch actually sees the GPU, and FAIL LOUDLY if it doesn't — a silent
 # CPU fallback would make this (relay-heavy, 50-worker) job take days instead of
 # hours, so it's much better to stop here than waste the allocation.
-python3 -c "
+python -c "
 import sys, torch
 ok = torch.cuda.is_available()
 print('torch:', torch.__version__,

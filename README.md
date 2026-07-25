@@ -1,7 +1,7 @@
 # flsim — Federated Learning Simulator
 
 A research-grade FL simulator with a clean, layered architecture designed for easy extension.
-It supports five training paradigms, each with its own orchestrator (OTA reuses the
+It supports six training paradigms, each with its own orchestrator (OTA reuses the
 sync `Simulator` via an uplink-physics hook) but a shared
 component/experiment/plotting stack:
 
@@ -12,6 +12,7 @@ component/experiment/plotting stack:
 | **Over-the-air** aggregation (AirComp) | `Simulator` + uplink-physics hook | `FedOTA` |
 | **Split learning** (SL / SplitFed) | `SplitSimulator` | SL, SFLV1, SFLV2 (via `client_mode` × `server_mode`) |
 | **Asynchronous split learning** (semi-async) | `SplitAsyncSimulator` | `SAFSL` (buffered, staleness-weighted split-FL) |
+| **Cluster split learning** | `ParallelSFLSimulator` | `ParallelSFL` (top submodel on a peer worker; KL-clustering + adaptive frequency) |
 
 The recurring design principle across all four: **write a new algorithm or
 experiment by overriding only the methods that change.** Each section below ends
@@ -41,6 +42,9 @@ python examples/splitfed_experiment.py
 # (accuracy-vs-latency + energy/overhead-to-accuracy bars + time-to-accuracy table)
 python examples/SAFSL_experiment.py
 
+# Cluster split learning — ParallelSFL vs FL / SFLv2 / SAFSL on MNIST (50 clients, heterogeneous)
+python examples/parallelsfl_experiment.py
+
 # With CLI overrides
 python examples/fedavg_experiment.py --rounds 50 --clients_per_round 5 --lr 0.005
 
@@ -49,8 +53,8 @@ python plot_results.py outputs/fedAVG/fedavg/fedavg.csv
 ```
 
 For long runs on a GPU cluster, ready-made SLURM scripts live in `slurm/`
-(`run_fedasync.slurm`, `run_ota.slurm`, `run_splitfed.slurm`, `run_safsl.slurm`, …) —
-each auto-detects CUDA and logs the GPU it landed on.
+(`run_fedasync.slurm`, `run_ota.slurm`, `run_splitfed.slurm`, `run_safsl.slurm`,
+`run_parallelsfl.slurm`, …) — each auto-detects CUDA and logs the GPU it landed on.
 
 > **Note:** There is no `run.py`. The entry point is always an experiment file
 > in `examples/` (or your own script). All wiring utilities live in `flsim/experiments/wiring.py`.
@@ -66,6 +70,7 @@ FLEXP/
 │   │   ├── algorithm.py           FederatedAlgorithm       (sync: select_clients, configure_client, aggregate)
 │   │   ├── async_algorithm.py     AsyncFederatedAlgorithm  (async: select_clients, mixing_weight, aggregate_async, aggregate_buffered)
 │   │   ├── split_async_algorithm.py SplitAsyncAlgorithm    (async split: select_clients, participation_weight, aggregate_buffered)
+│   │   ├── parallel_sfl_algorithm.py ParallelSFLAlgorithm  (cluster split: cluster_workers, assign_frequencies, aggregate_bottom, global_weights)
 │   │   ├── splittable.py          Splittable               (split learning: ordered_layers)
 │   │   ├── allocator.py           ResourceAllocator        (allocate_bandwidth, allocate_power, allocate_cpu_freq)
 │   │   ├── channel_model.py       ChannelModel             (channel_gain, achievable_rate_bps)
@@ -77,7 +82,8 @@ FLEXP/
 │   │   ├── fedprox.py             FedProx  (sync, proximal regularisation)
 │   │   ├── fedasync.py            FedAsync + FedAsyncTopKFastTotal (semi-async) + FedAsyncSimulatedStaleness
 │   │   ├── fedota.py              FedOTA   (over-the-air / AirComp aggregation)
-│   │   └── safsl.py               SAFSL    (semi-async split learning: data-size × staleness weighting)
+│   │   ├── safsl.py               SAFSL    (semi-async split learning: data-size × staleness weighting)
+│   │   └── parallel_sfl.py        ParallelSFL (cluster split learning: KL-clustering + adaptive frequency)
 │   │
 │   ├── allocators/              # Resource allocation policies
 │   │   └── equal_split.py         EqualSplitAllocator (FDMA equal split, max power, profile freq)
@@ -146,23 +152,28 @@ split / async-split) — pick them in the config; nothing else changes.
 Registered in `flsim/models/factory.py` (`create_model(name, num_classes=...)`).
 All CNNs implement `Splittable`, so any of them can be used in split learning too.
 
-| `data.model_name` | Input | Params | Splittable layers | Notes |
+| `data.model_name` | Input | Params | Fwd MACs @64×64 | Splittable layers |
 |---|---|---|---|---|
-| `mnist_cnn` | 1×28×28 | ~0.6 M | 10 | default for `mnist` |
-| `cifar_cnn` | 3×32×32 | ~0.5 M | 17 | default for `cifar10`/`cifar100`/`ham10000` |
-| `alexnet` | 3×32×32 | ~36 M | 21 | CIFAR-adapted (smaller kernels/strides) |
-| `vgg16` / `vgg19` | 3×32×32 | ~15 / 20 M | 46 / 55 | CIFAR-adapted VGG-BN, single-Linear classifier |
-| `resnet18` / `resnet34` | 3×32×32 | ~11 / 21 M | 14 / 22 | CIFAR-adapted stem (3×3 s1, no initial maxpool) |
+| `mnist_cnn` | 1×28×28 | ~0.6 M | — | 10 |
+| `cifar_cnn` | 3×32×32 | ~0.5 M | — | 17 |
+| `alexnet` | 3×**64+** | 57 M | 0.094 G | 22 |
+| `vgg16` / `vgg19` | 3×**64+** | 134 / 140 M | 1.4 / 1.71 G | 53 / 62 |
+| `resnet18` / `resnet34` | 3×**32/64** | 11 / 21 M | 0.15 / 0.30 G | 15 / 23 |
 
-AlexNet/VGG/ResNet are the standard **CIFAR-10 adaptations** used in the FL/vision
-literature — same block structure and depth as the ImageNet originals, resized
-for 32×32 input (the framework's canonical 3-channel size; higher-res datasets
-are resized to it).
+`alexnet`, `vgg*`, `resnet*` are the **standard ImageNet architectures**
+(downsampling stems + `AdaptiveAvgPool`, so they run at any input resolution) —
+their params/MACs match the reference papers (e.g. ResNet-34 = 0.30 GMACs,
+VGG-19 = 1.72 GMACs, AlexNet = 0.098 GMACs; note papers usually quote **MACs**
+labeled as "FLOPs" — our forward FLOPs = 2×MACs). Use `data.image_size: 64` to
+feed them 64×64 (their downsampling stems need ≥64×64 — **AlexNet won't run at
+32×32**). `mnist_cnn`/`cifar_cnn` remain small task-specific CNNs at their native
+sizes.
 
 ```yaml
 data:
   dataset:     cifar10
-  model_name:  resnet18   # null → dataset default (mnist→mnist_cnn, cifar*→cifar_cnn)
+  model_name:  resnet34   # null → dataset default (mnist→mnist_cnn, cifar*→cifar_cnn)
+  image_size:  64         # resize input; needed for the standard-stem models
   num_classes: null       # null → dataset's natural count (auto)
 ```
 
@@ -935,6 +946,8 @@ same way to every split method, keeping cross-paradigm comparison fair:
 | `split.q_device` / `split.q_server` | FLOPs-per-cycle of device / edge server. Compute time = `FLOPs/(f·q)`, energy = `κ·FLOPs·f²/q`. Only affects **compute** (never traffic). `q=1` ⇒ original `cycles/freq` formula. | `1.0` / `1.0` |
 | `split.server_frequency_shared` | `f_S` is the BS's **total** capacity (paper: `Σ f^S_n ≤ f^S,max`): concurrent server-side jobs (SFLV1; the async-split in-flight window) each get `f_S/n_concurrent`; sequential-server modes (SL, SFLV2) run one job at a time at full `f_S`. `false` restores the old every-device-at-full-`f_S` behavior (a BS with n× the stated capacity — usually wrong). | `true` |
 | `wireless.downlink_tx_power_w` | BS downlink power `P^DL` — **unified across all paradigms**: when set, FL/FedAsync *and* the split methods compute downlink rate at the BS power and charge downlink energy `P^DL·t_down`; when `null`, all paradigms use the symmetric-rate, uplink-only-energy convention. | `null` |
+| `system.energy_scope` | **Unified across all paradigms.** `"total"`: device compute + edge-server compute + uplink TX + downlink TX (paper eq. 16 literal). `"device"`: DEVICE/battery only (device compute + device uplink TX) — excludes the plugged-in server's compute and the BS's downlink TX. Use `"device"` for a battery-cost comparison: a fast (e.g. 30 GHz) edge server's DVFS energy scales as f², so under `"total"` it dominates ~700× and makes split appear to cost *more* than FL; `"device"` correctly shows split *saving* device energy (offloaded compute leaves the battery). | `"total"` |
+| `wireless.min_snr_db` | SNR floor (dB): the achievable rate is computed at `max(SNR, floor)`, bounding worst-case transmission time. **Essential with `channel_model: exp_fading`**, whose `ρ~Exp(1)` is unbounded-below — a deep fade (`ρ≈0`) otherwise yields a near-zero rate and a huge round-duration spike (a rare fade made one client's upload ~3000× the median). `null` = no floor. | `null` |
 
 `q_server > q_device` models a fast edge server (e.g. `q_device=1, q_server=2`);
 `q` is the correct place to represent per-hardware throughput without touching
@@ -945,10 +958,15 @@ touch compute, communication overhead (MB) stays identical regardless.
 > each other at their boundary settings, and the cost model respects this:
 > `FedAsyncTopKFastTotal(k = window = N)` produces **exactly** sync FedAvg's
 > per-round time & energy; `SAFSL(k = window = N)` produces **exactly** SFLV1's
-> per-round latency, energy & traffic; and SFLV1 with `cut_layer = max`
-> degenerates to FL within the (small) smashed-data term — 0.01 % time /
-> 1.6 % energy under identical channels. This is what makes cross-paradigm
-> comparisons meaningful: all five paradigms sit on one physical base.
+> per-round latency, energy & traffic. And **SFLV1 is mathematically FedAvg at
+> ANY cut layer** (the split only moves *where* compute/comm happen, never the
+> math): with data order controlled, SFLV1 at `cut_layer = max` matches FedAvg's
+> accuracy **bitwise, every round** (verified: 0.0 difference). Its *timing*
+> and *energy* are ~FL with a small, irreducible residual (~4–7 % time,
+> <0.1 % device energy) — the server always holds ≥1 layer (`cut ≤ N−1`), so a
+> smashed-data exchange + last-layer server compute always remain. This is what
+> makes cross-paradigm comparisons meaningful: all five paradigms sit on one
+> physical base.
 
 ---
 
@@ -1079,6 +1097,74 @@ latency, energy(J)- and communication-overhead(MB)-to-accuracy bar charts
 (targets 40/50/60/70 %), and a time-to-accuracy table. It sets every physical
 parameter (N, distances, freqs, powers, `q`, downlink power, cut layer, N0) at
 the top of the file — the reference for a full paper replication.
+
+---
+
+## Cluster split learning (ParallelSFL)
+
+`ParallelSFL` (Liao et al., ACM MobiCom '24) tackles system + statistical
+heterogeneity by **clustering** the workers. Unlike SplitFed (where the PS/edge
+server holds the top submodel for everyone), each cluster has one **top worker**
+— a peer device — that holds the top submodel; the cluster's **bottom workers**
+run an SFLV1-style relay against it, the top worker aggregates its bottoms, and
+the PS aggregates the `(bottom, top)` pairs across clusters. Only full models
+cross the PS link, once per cluster per round — no per-sample smashed data on
+the PS — so the PS is never the bottleneck. Run by
+`flsim.core.parallel_sfl_simulator.ParallelSFLSimulator`.
+
+### The four override points
+
+A ParallelSFL algorithm subclasses `ParallelSFLAlgorithm`
+(`flsim/interfaces/parallel_sfl_algorithm.py`). Same "override only what
+changes" pattern — each hook has a working default:
+
+| Method | Purpose |
+|---|---|
+| `cluster_workers(workers, rng)` | Partition workers into clusters (1 top + N_c bottoms). Default: capability-balanced greedy. |
+| `assign_frequencies(clusters)` | Per-cluster local iterations `τ_c`. Default: uniform. |
+| `aggregate_bottom(states, num_samples)` | Intra-cluster bottom aggregation (paper Eq. 4). Default: uniform mean. |
+| `global_weights(clusters)` | Cross-cluster weights `ρ_c` (paper Eq. 18). Default: `N_c·τ_c`. |
+
+The clustering / frequency hooks consume `WorkerInfo` (label distribution +
+per-worker compute/comm times) that the simulator measures from the client
+partitions + system profiles — so the algorithm is a pure function of those
+numbers. The intra-cluster relay training (a **shared** top submodel updated
+with the gradient *averaged* over the cluster's N_c bottom workers, Eq. 3;
+each bottom updated with its own full gradient, Eq. 2) lives in the simulator
+and is verified bitwise-exact (an N_c=1 cluster reproduces unsplit training).
+
+### Built-in: `ParallelSFL`
+
+Implements the paper's two contributions: **Algorithm 1** greedy clustering
+(K-means on label-KL for statistical heterogeneity + greedy assignment
+minimizing `KL(Φ_c‖Φ0)` under the bandwidth/throughput constraints, `U_c =
+λ·W_c + (1-λ)·KL`) and **Eq. 17** frequency optimization (faster clusters run
+more local iterations, aligning round-completion times to cut waiting).
+
+```python
+from flsim.core.parallel_sfl_simulator import ParallelSFLSimulator
+from flsim.algorithms.parallel_sfl import ParallelSFL
+
+sim = ParallelSFLSimulator(
+    clients=clients, bottom_model=bottom, top_model=top,
+    algorithm=ParallelSFL(lam=0.5, tau_max=5),
+    evaluator=evaluator, config=config, rng=rng, device=device,
+    profiles=profiles, cost_model=cost_model,   # profiles/cost enable the timing + energy/traffic metrics
+)
+history = sim.run()   # list[ParallelSFLEpochResult]
+```
+
+> **Energy note.** In ParallelSFL the top submodel runs on a peer **device**, so
+> under `energy_scope: device` its compute + transmit energy count (there is no
+> free server) — unlike SFLV1/V2/SAFSL, where the top runs on the plugged-in
+> edge server and is excluded from device energy. That asymmetry is real and is
+> reflected faithfully.
+
+`examples/parallelsfl_experiment.py` compares **ParallelSFL / FL / SFLv2 /
+SAFSL** on MNIST/MnistCNN with 50 clients under Dirichlet data heterogeneity +
+per-device system heterogeneity, producing accuracy-vs-time & -vs-round curves,
+energy/overhead-to-accuracy bars, an average-waiting-time curve (the Eq. 17
+story), and a time-to-accuracy table.
 
 ---
 
@@ -1324,6 +1410,12 @@ Read these off the object `run_single*()` returns, instead of digging into the C
 `round_latency_s` — the split cost columns plus async `staleness`, so it plots
 on the same time / cumulative axes as every other paradigm.
 
+**Cluster split (`ParallelSFLSimulator` — ParallelSFL):** `round`,
+`test_accuracy`, `test_loss`, `simulated_time_s`, `round_latency_s`,
+`avg_waiting_time_s` (Eq. 16), `traffic_bytes`, `cumulative_traffic_bytes`,
+`total_energy_j`, `cumulative_energy_j`, `num_clusters` — same time / cumulative
+axes plus the cluster-specific waiting time and cluster count.
+
 ### Metric glossary
 
 | Metric | Definition |
@@ -1357,6 +1449,8 @@ data:
   dataset:     mnist | cifar10 | cifar100 | ham10000
   model_name:  null       # null → dataset default; else any factory key
                           # (cifar_cnn | alexnet | vgg16 | vgg19 | resnet18 | resnet34)
+  image_size:  null       # resize inputs (px); null = native. Set 64 for the
+                          # standard-stem models (alexnet/vgg/resnet need ≥64)
   num_classes: null       # null → dataset's natural count (auto)
   ham10000_root: null     # required only for dataset: ham10000 (local folder)
   num_clients: 100
@@ -1388,10 +1482,14 @@ system:
   cycles_per_sample_min: 1.0e+7  # C_k (= FLOPs/sample when split q ≠ 1); set
   cycles_per_sample_max: 1.0e+7  # min==max to fix a model's per-sample FLOPs
   switched_capacitance: 1.0e-28
+  energy_scope:         total | device   # device = battery only (compute+uplink TX),
+                                         # excludes server compute + BS downlink TX
 
 wireless:
   channel_model:         path_loss | exp_fading
   exp_fading_path_exponent: 2.0  # α in g = h0·ρ·d⁻ᵅ (exp_fading only; e.g. 1.3)
+  min_snr_db:            null    # SNR floor (dB); bounds deep-fade rate/time spikes
+                                 # (needed with exp_fading — ρ~Exp(1) is unbounded)
   deployment_shape:      square | circle | distance_range
   area_side_m:           500.0    # used when square
   area_radius_m:         500.0    # used when circle
