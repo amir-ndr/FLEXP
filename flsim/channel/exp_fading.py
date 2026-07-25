@@ -48,6 +48,7 @@ class ExpFadingChannelModel(ChannelModel):
         noise_psd_w_per_hz: float,
         min_distance_m: float = 1.0,
         path_loss_exponent: float = 2.0,
+        min_snr: float = 0.0,
     ):
         """
         Args:
@@ -61,12 +62,18 @@ class ExpFadingChannelModel(ChannelModel):
             path_loss_exponent (float): distance exponent α in the POWER gain
                 g = h0·ρ·d^{-α}. Default 2.0 (free-space). Papers that specify a
                 path-fading exponent set this directly (e.g. SAFSL: α = 1.3).
+            min_snr (float): linear SNR floor — the achievable rate is computed
+                at max(snr, min_snr). ESSENTIAL with this model: ρ~Exp(1) is
+                unbounded-below, so a deep fade (ρ≈0) would otherwise give a
+                near-zero rate and an unbounded transmission time. 0.0 (default)
+                = no floor (raw Rayleigh, spiky).
         """
         self.h0 = h0
         self.total_bandwidth_hz = total_bandwidth_hz
         self.noise_psd_w_per_hz = noise_psd_w_per_hz
         self.min_distance_m = min_distance_m
         self.path_loss_exponent = path_loss_exponent
+        self.min_snr = min_snr
 
     # ------------------------------------------------------------------
     # ChannelModel interface
@@ -115,5 +122,6 @@ class ExpFadingChannelModel(ChannelModel):
             float: achievable uplink rate in bits per second.
         """
         snr = (channel_gain * tx_power_w) / (noise_psd_w_per_hz * bandwidth_hz)
+        snr = max(snr, self.min_snr)   # SNR floor bounds worst-case rate/time under deep fades
         return bandwidth_hz * math.log2(1.0 + snr)
 

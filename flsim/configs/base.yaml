@@ -21,6 +21,11 @@ data:
   # HAM10000_metadata.csv and the image subfolder(s). No auto-download is
   # available for this dataset (see flsim.data.loaders.ham10000).
   ham10000_root: null
+  # Optional input resize (pixels). null = each dataset's native size
+  # (mnist 28, cifar 32). Set to 64 to match papers that resize CIFAR/HAM to
+  # 64x64 — REQUIRED for the standard-stem ImageNet models (alexnet/vgg/resnet),
+  # whose downsampling stems need >= 64x64 (and whose FLOPs are quoted at 64x64).
+  image_size: null
   num_clients: 50
   partition: "iid"          # iid | shard | dirichlet
   dirichlet_alpha: 0.5
@@ -84,6 +89,16 @@ system:
   # fixes the model's per-sample FLOPs (e.g. a specific ResNet), set
   # cycles_per_sample_min == max == that measured FLOP count.
   switched_capacitance: 1.0e-28  # kappa for energy model
+  # Which energy counts toward total_energy_j (UNIFIED across all paradigms):
+  #   "total"  (default) — device compute + edge-server compute + uplink TX +
+  #                        downlink TX (everything; paper eq. 16 literal).
+  #   "device"           — DEVICE/battery only: device compute + device uplink
+  #                        TX. Excludes the plugged-in server's compute and the
+  #                        BS's downlink TX. Use this for a battery-cost
+  #                        comparison where offloading to the server SAVES the
+  #                        device energy (otherwise a fast edge server's DVFS
+  #                        energy ~f² dominates and flips the result).
+  energy_scope: "total"
 
 wireless:
   # Channel model:
@@ -122,6 +137,11 @@ wireless:
   path_loss_exponent: 37.6       # used by path_loss model
   shadowing_std_db: 8.0          # used by path_loss model (0 = disable)
   min_distance_m: 1.0            # clamp for all channel models (avoids g→∞)
+  # Minimum SNR floor (dB): the achievable rate is computed at max(SNR, floor),
+  # bounding worst-case transmission time. ESSENTIAL with channel_model:
+  # exp_fading, whose ρ~Exp(1) is unbounded-below — a deep fade (ρ≈0) otherwise
+  # gives a near-zero rate and a huge round-duration spike. null = no floor.
+  min_snr_db: null
   upload_size_bits: 28100        # used when upload_size_mode="fixed"
   upload_size_mode: "fixed"      # fixed | model
   # Optional BS downlink transmit power P^DL (watts) — UNIFIED across ALL

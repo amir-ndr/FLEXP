@@ -1,40 +1,40 @@
 """
-models/resnet.py: ResNet-18 / ResNet-34 (He et al., 2015), adapted for CIFAR-10.
+models/resnet.py: ResNet-18 / ResNet-34 (He et al., 2015), STANDARD ImageNet
+architecture — resolution-flexible.
 
-The original ResNet is sized for 224x224 ImageNet input (7x7 stride-2 stem +
-3x3 stride-2 maxpool, downsampling by 4x before the first residual block).
-Applied to CIFAR-10's 32x32 input, that stem alone would shrink the image to
-8x8 before any residual block runs, discarding most of the (already small)
-spatial detail. This is the standard CIFAR-10 ResNet adaptation used
-throughout the FL/vision literature: the same BasicBlock / stage structure
-and the same per-stage block counts as the ImageNet ResNet-18 ([2,2,2,2]
-blocks) and ResNet-34 ([3,4,6,3] blocks), but the stem is a single 3x3
-stride-1 conv (no initial maxpool) so the first residual stage still sees the
-full 32x32 resolution.
+Uses the paper's / torchvision's standard stem: a 7x7 stride-2 conv followed by
+a 3x3 stride-2 max-pool, downsampling the input by 4x before the first residual
+stage. This is the architecture whose FLOP counts match the SAFSL paper
+(ResNet-34 ~= 0.30 GFLOPs forward at 64x64 input). An `AdaptiveAvgPool2d(1)`
+before the classifier makes the network run at ANY input resolution (32x32,
+64x64, ...) without changing the classifier dimension.
 
-Stage output sizes for a 32x32 input:
-  stem               -> (B,64,32,32)
-  layer1 (stride 1)  -> (B,64,32,32)
-  layer2 (stride 2)  -> (B,128,16,16)
-  layer3 (stride 2)  -> (B,256,8,8)
-  layer4 (stride 2)  -> (B,512,4,4)
-  avgpool(4)         -> (B,512,1,1) -> Linear(512,10)
+Stage output sizes for a 64x64 input (the SAFSL paper resizes CIFAR-10 /
+HAM10000 to 64x64):
+  stem conv 7x7 s2   -> (B,64,32,32)
+  stem maxpool 3x3 s2-> (B,64,16,16)
+  layer1 (stride 1)  -> (B,64,16,16)
+  layer2 (stride 2)  -> (B,128,8,8)
+  layer3 (stride 2)  -> (B,256,4,4)
+  layer4 (stride 2)  -> (B,512,2,2)
+  adaptiveavgpool(1) -> (B,512,1,1) -> Linear(512,num_classes)
 
-Input: (B, 3, 32, 32)
-Output: (B, 10)
+Output: (B, num_classes)
 
-Splittable — IMPORTANT caveat: unlike MnistCNN/CifarCNN/AlexNet/VGG (pure
-feed-forward stacks), a BasicBlock has an internal skip connection
-(out = relu(conv-bn-conv-bn(x) + shortcut(x))), so it CANNOT be decomposed
-into its individual Conv/BatchNorm/ReLU layers the way split_model() expects
-— chaining those pieces one at a time in a plain nn.Sequential would drop the
-skip path entirely and silently produce a different, broken network. Each
-BasicBlock is therefore exposed as ONE ATOMIC element of ordered_layers():
-split_model() can cut BETWEEN blocks (or between stages), never inside one.
-This matches how split learning is applied to ResNets in the literature (cut
-points chosen at stage/block boundaries). ordered_layers() has 14 elements
-for ResNet-18 (3 stem + 8 blocks + 3 head) and 22 for ResNet-34 (3 stem + 16
-blocks + 3 head); valid cut_layer is [1, N-1].
+NOTE — earlier this file used a CIFAR-adapted stem (3x3 stride-1, no maxpool)
+that KEPT full resolution and therefore did ~8x MORE compute per sample than
+the paper's numbers. That was switched to the standard downsampling stem so the
+measured FLOPs match the paper. If you specifically want the high-resolution
+CIFAR variant, restore a 3x3 stride-1 conv1 and drop self.maxpool.
+
+Splittable — IMPORTANT caveat: a BasicBlock has an internal skip connection
+(out = relu(conv-bn-conv-bn(x) + shortcut(x))), so it CANNOT be decomposed into
+its individual Conv/BN/ReLU layers. Each BasicBlock is therefore ONE ATOMIC
+element of ordered_layers(): split_model() may cut BETWEEN blocks/stages, never
+inside one (the paper notes the ResNet split layer must sit at block
+boundaries). ordered_layers() has 15 elements for ResNet-18 (4 stem + 8 blocks
++ 3 head) and 23 for ResNet-34 (4 stem + 16 blocks + 3 head); valid cut_layer
+is [1, N-1].
 """
 
 import torch.nn as nn
@@ -76,7 +76,7 @@ class BasicBlock(nn.Module):
 
 class ResNet(nn.Module, Splittable):
     """
-    ResNet, CIFAR-10-adapted (see module docstring). Use ResNet18 / ResNet34
+    Standard ImageNet ResNet (see module docstring). Use ResNet18 / ResNet34
     below rather than constructing this directly.
 
     This class does NOT:
@@ -89,16 +89,18 @@ class ResNet(nn.Module, Splittable):
         super().__init__()
         self.in_planes = 64
 
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        # Standard ImageNet stem: 7x7 stride-2 conv + 3x3 stride-2 maxpool (4x downsample).
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_stage(64, num_blocks[0], stride=1)
         self.layer2 = self._make_stage(128, num_blocks[1], stride=2)
         self.layer3 = self._make_stage(256, num_blocks[2], stride=2)
         self.layer4 = self._make_stage(512, num_blocks[3], stride=2)
 
-        self.avgpool = nn.AvgPool2d(kernel_size=4)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))   # resolution-flexible
         self.flatten = nn.Flatten()
         self.linear = nn.Linear(512 * BasicBlock.expansion, num_classes)
 
@@ -113,12 +115,12 @@ class ResNet(nn.Module, Splittable):
     def forward(self, x):
         """
         Args:
-            x: tensor of shape (B, 3, 32, 32).
+            x: tensor of shape (B, 3, H, W) — any resolution (e.g. 64x64).
 
         Returns:
             tensor of shape (B, num_classes) — unnormalized logits.
         """
-        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.maxpool(self.relu(self.bn1(self.conv1(x))))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
@@ -128,23 +130,23 @@ class ResNet(nn.Module, Splittable):
         return self.linear(out)
 
     def ordered_layers(self) -> list:
-        """Stem (conv1, bn1, relu) + every BasicBlock (atomic) + (avgpool, flatten, linear)."""
+        """Stem (conv1, bn1, relu, maxpool) + every BasicBlock (atomic) + (avgpool, flatten, linear)."""
         return (
-            [self.conv1, self.bn1, self.relu]
+            [self.conv1, self.bn1, self.relu, self.maxpool]
             + list(self.layer1) + list(self.layer2) + list(self.layer3) + list(self.layer4)
             + [self.avgpool, self.flatten, self.linear]
         )
 
 
 class ResNet18(ResNet):
-    """ResNet-18 ([2,2,2,2] BasicBlocks), CIFAR-10-adapted."""
+    """ResNet-18 ([2,2,2,2] BasicBlocks), standard ImageNet architecture."""
 
     def __init__(self, num_classes: int = 10):
         super().__init__(num_blocks=[2, 2, 2, 2], num_classes=num_classes)
 
 
 class ResNet34(ResNet):
-    """ResNet-34 ([3,4,6,3] BasicBlocks), CIFAR-10-adapted."""
+    """ResNet-34 ([3,4,6,3] BasicBlocks), standard ImageNet architecture."""
 
     def __init__(self, num_classes: int = 10):
         super().__init__(num_blocks=[3, 4, 6, 3], num_classes=num_classes)

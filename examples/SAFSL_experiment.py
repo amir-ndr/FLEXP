@@ -105,9 +105,10 @@ BASE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "flsim", "configs", 
 OUTPUT_DIR = "outputs/safsl_experiment/"
 
 # ---- Problem ----
-DATASET   = "cifar10"
-MODEL     = "resnet18"
-CUT_LAYER = 6            # ResNet-18: device keeps stem+stage1+first stage2 conv (dev ~38% FLOPs)
+DATASET    = "cifar10"
+MODEL      = "resnet34"   # paper's model (standard ImageNet stem); AlexNet / VGG-19 also available
+IMAGE_SIZE = 64           # paper resizes CIFAR-10 / HAM10000 to 64x64 (needed for the standard stems)
+CUT_LAYER  = 8            # ResNet-34: cut at a block boundary (device keeps stem + first blocks)
 
 # ---- Fleet / federation (paper) ----
 NUM_DEVICES        = 10
@@ -137,6 +138,12 @@ PATH_FADING_EXPONENT = 1.3
 KAPPA                = 1.0e-28
 H0_CHANNEL_CONST     = 1.0e-6      # exp-fading SNR-calibration constant (paper cites [39];
                                    # tuned here for a reasonable cell-edge SNR — adjust to taste)
+MIN_SNR_DB           = 0.0         # SNR floor: bounds deep-fade transmission spikes
+                                   # (ρ~Exp(1) is unbounded-below). ~0 dB is well below
+                                   # the median SNR here, so it only clips rare deep fades.
+ENERGY_SCOPE         = "device"    # battery-cost comparison: count device compute + device
+                                   # uplink TX only (exclude the plugged-in edge server's
+                                   # compute and BS downlink TX) — so offloading SAVES energy.
 
 # ---- Run length & evaluation (time-to-accuracy is extracted post-hoc) ----
 # CLUSTER SETTING. For a laptop sanity check, cut these hard (see RUNTIME NOTE).
@@ -156,9 +163,13 @@ def _resnet_flops_per_sample() -> float:
     FP+BP ~= 6*MACs (standard training-FLOPs convention). This is the paper's
     per-sample computing workload Phi; the split cost model divides it between
     device and server by the measured cut-layer FLOP fraction.
+
+    Measured at IMAGE_SIZE (64x64) with the STANDARD-stem models, so the MACs
+    match the paper's quoted numbers (its "FLOPs" are MACs: ResNet-34 0.30 G,
+    VGG-19 1.72 G, AlexNet 0.098 G — reproduced here to within a few %).
     """
     m = create_model(MODEL, num_classes=_num_classes_for_dataset(DATASET))
-    x = torch.randn(2, 3, 32, 32)
+    x = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
     return 6.0 * forward_macs(m, x)
 
 
@@ -169,6 +180,7 @@ PHI_FLOPS_PER_SAMPLE = _resnet_flops_per_sample()
 SHARED_OVERRIDES = {
     "data.dataset":               DATASET,
     "data.model_name":            MODEL,
+    "data.image_size":            IMAGE_SIZE,      # resize to 64x64 (paper + standard stems)
     "data.num_clients":           NUM_DEVICES,
     "data.partition":             "iid",
     "learning.batch_size":        BATCH_SIZE,
@@ -188,6 +200,8 @@ SHARED_OVERRIDES = {
     "wireless.tx_power_w_max":           DEV_TX_POWER_MAX_W,
     "wireless.noise_psd_dbm_per_hz":     NOISE_PSD_DBM_PER_HZ,
     "wireless.min_distance_m":           1.0,
+    "wireless.min_snr_db":               MIN_SNR_DB,      # bound deep-fade spikes
+    "system.energy_scope":               ENERGY_SCOPE,    # device/battery-only energy
     # BS downlink power P^DL — UNIFIED downlink physics for every paradigm
     # (FL/FedAsync downlink rate + energy AND the split methods' model/gradient
     # downlink all use this same BS power; see wireless.downlink_tx_power_w).
@@ -332,6 +346,7 @@ class SAFSLExperiment(SplitExperiment, AsyncExperiment):
             q_server=float(config.split.q_server),
             downlink_tx_power_w=getattr(config.wireless, "downlink_tx_power_w",
                                         getattr(config.split, "downlink_tx_power_w", None)),
+            energy_scope=getattr(config.system, "energy_scope", "total"),
         )
         evaluator = Evaluator(test_dataset=test_ds)
 

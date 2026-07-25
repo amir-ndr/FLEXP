@@ -21,23 +21,24 @@ _CIFAR100_STD  = (0.2673, 0.2564, 0.2762)
 _DEFAULT_DATA_ROOT = os.path.expanduser("~/.flsim/data")
 
 
-def load_cifar100(data_root: str = _DEFAULT_DATA_ROOT):
+def load_cifar100(data_root: str = _DEFAULT_DATA_ROOT, image_size: int = None):
     """
     Load CIFAR-100 (fine labels, 100 classes) train and test datasets with
     standard normalisation.
 
     Args:
         data_root (str): directory for storing downloaded data.
+        image_size (int, optional): if set, resize to (image_size, image_size)
+            — e.g. 64 for the standard-stem ImageNet models. None keeps 32x32.
 
     Returns:
         tuple[torchvision.datasets.CIFAR100, torchvision.datasets.CIFAR100]:
             (train_dataset, test_dataset). Both expose .targets (fine label,
             0-99), consumed directly by flsim.data.{shard,dirichlet}.
     """
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD),
-    ])
+    tfms = [T.Resize((image_size, image_size))] if image_size else []
+    tfms += [T.ToTensor(), T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD)]
+    transform = T.Compose(tfms)
 
     train = torchvision.datasets.CIFAR100(
         root=data_root, train=True, download=True, transform=transform

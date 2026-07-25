@@ -57,12 +57,24 @@ class DevicePerRound:
     t_srv_compute:  float
     t_grad_down:    float
     t_model_up:     float
-    # energy (joules) — device compute + server compute + uplink TX (see module docstring)
+    # energy (joules), split by WHO spends it:
+    #   dev_compute_energy_j, up_tx_energy_j  -> the DEVICE (battery)
+    #   srv_compute_energy_j, dn_tx_energy_j  -> the INFRASTRUCTURE (edge server + BS)
     dev_compute_energy_j: float
     srv_compute_energy_j: float
-    tx_energy_j:          float
+    up_tx_energy_j:       float   # device uplink TX (smashed-data up + device-model up)
+    dn_tx_energy_j:       float   # BS downlink TX (model down + gradients down)
     # traffic (bytes)
     traffic_bytes:  float
+    # which parts count toward total_energy_j: "total" (device + infrastructure)
+    # or "device" (battery only — device compute + device uplink TX). See
+    # SplitCostModel(energy_scope=...).
+    energy_scope:   str = "total"
+
+    @property
+    def tx_energy_j(self) -> float:
+        """All TX energy (uplink + downlink) — kept for back-compat / reporting."""
+        return self.up_tx_energy_j + self.dn_tx_energy_j
 
     @property
     def device_path_s(self) -> float:
@@ -77,7 +89,15 @@ class DevicePerRound:
 
     @property
     def total_energy_j(self) -> float:
-        return self.dev_compute_energy_j + self.srv_compute_energy_j + self.tx_energy_j
+        """
+        Energy attributed to this device-round. "device" scope = battery only
+        (device compute + device uplink TX) — excludes the plugged-in edge
+        server's compute and the BS's downlink TX. "total" = everything.
+        """
+        if self.energy_scope == "device":
+            return self.dev_compute_energy_j + self.up_tx_energy_j
+        return (self.dev_compute_energy_j + self.srv_compute_energy_j
+                + self.up_tx_energy_j + self.dn_tx_energy_j)
 
 
 @dataclass
@@ -112,6 +132,7 @@ class SplitCostModel:
         q_device: float = 1.0,
         q_server: float = 1.0,
         downlink_tx_power_w: float = None,
+        energy_scope: str = "total",
     ):
         """
         Args (extending the class docstring):
@@ -130,6 +151,13 @@ class SplitCostModel:
                 the uplink rate and NO downlink energy is charged — the
                 framework's original symmetric-link, uplink-only-energy
                 convention. Ignored entirely if downlink_negligible=True.
+            energy_scope (str): which parts count toward each device-round's
+                total_energy_j. "total" (default): device compute + server
+                compute + uplink TX + downlink TX (everything, paper eq. 16).
+                "device": DEVICE/battery only — device compute + device uplink
+                TX; excludes the plugged-in edge server's compute and the BS's
+                downlink TX. Use "device" for a battery-cost comparison where
+                offloading to the server should SAVE energy.
         """
         self.channel_model = channel_model
         self.noise_psd = noise_psd_w_per_hz
@@ -139,6 +167,7 @@ class SplitCostModel:
         self.q_device = q_device
         self.q_server = q_server
         self.downlink_tx_power_w = downlink_tx_power_w
+        self.energy_scope = energy_scope
 
     # ------------------------------------------------------------------
     # Per-device cost (one round)
@@ -232,12 +261,14 @@ class SplitCostModel:
         # compute: DVFS  kappa*f^3*t = kappa * FLOPs * work * f^2 / q  (device & server)
         dev_compute_energy = self.kappa * dev_cycles * work * (profile.cpu_frequency_hz ** 2) / self.q_device
         srv_compute_energy = self.kappa * srv_cycles * work * (f_srv ** 2) / self.q_server
-        # TX: uplink P^UL*(smashed_up + model_up) always; downlink P^DL*(model_down +
-        # grad_down) only when a BS downlink power is configured (else the
-        # framework's uplink-only-energy convention, no downlink charge).
-        tx_energy = profile.tx_power_w * (t_smashed_up + t_model_up)
+        # TX energy, split by who transmits:
+        #   uplink   P^UL*(smashed_up + model_up)  -> the DEVICE (battery)
+        #   downlink P^DL*(model_down + grad_down)  -> the BS (only when a BS
+        #            downlink power is configured; else no downlink charge)
+        up_tx_energy = profile.tx_power_w * (t_smashed_up + t_model_up)
+        dn_tx_energy = 0.0
         if self.downlink_tx_power_w is not None and not self.downlink_negligible:
-            tx_energy += self.downlink_tx_power_w * (t_model_down + t_grad_down)
+            dn_tx_energy = self.downlink_tx_power_w * (t_model_down + t_grad_down)
 
         # ---- traffic (bytes): smashed both ways + device model both ways ----
         smashed_bytes = 2 * activation_numel * work * BYTES_PER_ELEMENT
@@ -250,7 +281,8 @@ class SplitCostModel:
             t_grad_down=t_grad_down, t_model_up=t_model_up,
             dev_compute_energy_j=dev_compute_energy,
             srv_compute_energy_j=srv_compute_energy,
-            tx_energy_j=tx_energy, traffic_bytes=traffic_bytes,
+            up_tx_energy_j=up_tx_energy, dn_tx_energy_j=dn_tx_energy,
+            traffic_bytes=traffic_bytes, energy_scope=self.energy_scope,
         )
 
     # ------------------------------------------------------------------

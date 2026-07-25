@@ -101,6 +101,11 @@ class Simulator:
         self._downlink_tx_power_w = getattr(
             config.wireless, "downlink_tx_power_w", None
         )
+        # Energy scope (system.energy_scope): "total" (default) charges the
+        # device's downlink RX-side (BS transmit) energy too; "device" counts
+        # only device-battery energy (compute + uplink TX), matching the split
+        # cost model's device scope so FL/FedAsync stay comparable to split.
+        self._energy_scope = getattr(config.system, "energy_scope", "total")
 
     def run(self) -> None:
         """
@@ -296,9 +301,11 @@ class Simulator:
             e_tx = self.energy_model.transmission_energy_j(
                 client.profile, upload_time_s=t_up, tx_power_w=p_w,
             )
-            # Downlink TX energy P^DL·t_dn — charged only when a BS downlink
-            # power is configured (matches SplitCostModel / paper eq. 16).
-            if self._downlink_tx_power_w is not None and t_dn > 0.0:
+            # Downlink TX energy P^DL·t_dn — charged only in "total" scope (it's
+            # the BS's energy, not the device battery) and only when a BS
+            # downlink power is configured (matches SplitCostModel / paper eq. 16).
+            if (self._energy_scope != "device"
+                    and self._downlink_tx_power_w is not None and t_dn > 0.0):
                 e_tx += self._downlink_tx_power_w * t_dn
 
             # PyTorch local training (wall-clock time is NOT simulated time)

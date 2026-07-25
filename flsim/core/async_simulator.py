@@ -238,6 +238,9 @@ class AsyncSimulator:
         self._downlink_tx_power_w = getattr(
             config.wireless, "downlink_tx_power_w", None
         )
+        # Energy scope — see Simulator: "device" counts only device-battery
+        # energy (compute + uplink TX), consistent with the split cost model.
+        self._energy_scope = getattr(config.system, "energy_scope", "total")
 
         # Insertion counter for stable priority-queue tie-breaking
         self._seq = 0
@@ -602,9 +605,10 @@ class AsyncSimulator:
         e_tx = self.energy_model.transmission_energy_j(
             client.profile, upload_time_s=t_up, tx_power_w=p_w,
         )
-        # Downlink TX energy P^DL·t_dn — charged only when a BS downlink power
-        # is configured (matches SplitCostModel / sync Simulator convention).
-        if self._downlink_tx_power_w is not None and t_dn > 0.0:
+        # Downlink TX energy P^DL·t_dn — charged only in "total" scope and when
+        # a BS downlink power is configured (matches SplitCostModel / Simulator).
+        if (self._energy_scope != "device"
+                and self._downlink_tx_power_w is not None and t_dn > 0.0):
             e_tx += self._downlink_tx_power_w * t_dn
 
         # ---- local training (on snapshot of the global model the client received) ----

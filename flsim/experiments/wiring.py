@@ -107,6 +107,12 @@ def _make_allocator(config):
     return EqualSplitAllocator()
 
 
+def _min_snr_linear(cfg_w) -> float:
+    """wireless.min_snr_db → linear SNR floor (0.0 = no floor when null)."""
+    db = getattr(cfg_w, "min_snr_db", None)
+    return 0.0 if db is None else 10.0 ** (float(db) / 10.0)
+
+
 def _make_channel_model(config, noise_psd_w_per_hz: float):
     """
     Instantiate the channel model specified by wireless.channel_model.
@@ -121,6 +127,7 @@ def _make_channel_model(config, noise_psd_w_per_hz: float):
             total_bandwidth_hz=cfg_w.total_bandwidth_hz,
             noise_psd_w_per_hz=noise_psd_w_per_hz,
             min_distance_m=cfg_w.min_distance_m,
+            min_snr=_min_snr_linear(cfg_w),
         )
     elif name == "exp_fading":
         return ExpFadingChannelModel(
@@ -129,6 +136,7 @@ def _make_channel_model(config, noise_psd_w_per_hz: float):
             noise_psd_w_per_hz=noise_psd_w_per_hz,
             min_distance_m=cfg_w.min_distance_m,
             path_loss_exponent=getattr(cfg_w, "exp_fading_path_exponent", 2.0),
+            min_snr=_min_snr_linear(cfg_w),
         )
     raise ValueError(
         f"Unknown channel_model '{name}'. Choose 'path_loss' or 'exp_fading', "
@@ -214,12 +222,16 @@ def _load_dataset(config):
     auto-download is available for it — see flsim.data.loaders.ham10000).
     """
     dataset = config.data.dataset
+    # Optional input resize (data.image_size) — e.g. 64 to match papers that
+    # resize CIFAR/HAM to 64x64 for the standard-stem ImageNet models. None =
+    # each dataset's native size (mnist 28, cifar 32, ham10000 its own default).
+    image_size = getattr(config.data, "image_size", None)
     if dataset == "mnist":
         return load_mnist()
     elif dataset == "cifar10":
-        return load_cifar10()
+        return load_cifar10(image_size=image_size)
     elif dataset == "cifar100":
-        return load_cifar100()
+        return load_cifar100(image_size=image_size)
     elif dataset == "ham10000":
         root = getattr(config.data, "ham10000_root", None)
         if not root:
@@ -229,7 +241,8 @@ def _load_dataset(config):
                 "HAM10000_metadata.csv and the image subfolder(s); see "
                 "flsim.data.loaders.ham10000 module docstring)."
             )
-        return load_ham10000(root=os.path.expanduser(root))
+        return load_ham10000(root=os.path.expanduser(root),
+                             image_size=(image_size or 32))
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 

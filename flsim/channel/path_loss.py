@@ -40,16 +40,21 @@ class PathLossChannelModel(ChannelModel):
         total_bandwidth_hz: float,
         noise_psd_w_per_hz: float,
         min_distance_m: float = 1.0,
+        min_snr: float = 0.0,
     ):
         """
         Args:
             total_bandwidth_hz (float): total system bandwidth B in Hz.
             noise_psd_w_per_hz (float): thermal noise PSD N0 in W/Hz.
             min_distance_m (float): minimum distance clamp to avoid log singularity at d=0.
+            min_snr (float): linear SNR floor — the achievable rate is computed
+                at max(snr, min_snr), bounding worst-case transmission time
+                under deep fades. 0.0 (default) = no floor.
         """
         self.total_bandwidth_hz = total_bandwidth_hz
         self.noise_psd_w_per_hz = noise_psd_w_per_hz
         self.min_distance_m = min_distance_m
+        self.min_snr = min_snr
 
     # ------------------------------------------------------------------
     # ChannelModel interface
@@ -103,6 +108,7 @@ class PathLossChannelModel(ChannelModel):
         """
         noise_power_w = noise_psd_w_per_hz * bandwidth_hz
         snr = (channel_gain * tx_power_w) / noise_power_w
+        snr = max(snr, self.min_snr)   # SNR floor bounds worst-case rate/time
         rate_bps = bandwidth_hz * math.log2(1.0 + snr)
         return rate_bps
 

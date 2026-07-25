@@ -161,6 +161,7 @@ class SplitExperiment(Experiment):
             q_device=float(getattr(split_cfg, "q_device", 1.0)),
             q_server=float(getattr(split_cfg, "q_server", 1.0)),
             downlink_tx_power_w=dl_power,
+            energy_scope=getattr(config.system, "energy_scope", "total"),
         )
 
         evaluator = Evaluator(test_dataset=test_ds)

@@ -1,31 +1,24 @@
 """
-models/alexnet.py: AlexNet (Krizhevsky et al., 2012), adapted for CIFAR-10.
+models/alexnet.py: AlexNet (Krizhevsky et al., 2012), STANDARD architecture —
+resolution-flexible.
 
-The original AlexNet is sized for 224x224 ImageNet input (11x11 stride-4 stem,
-5 conv layers, three 4096-wide FC layers). Applied verbatim to a 32x32
-CIFAR-10 image, that stem alone collapses the spatial dimension to <=1 before
-the later conv layers ever run. This is the standard CIFAR-10 adaptation used
-throughout the FL/vision literature: the same 5 conv + 3 maxpool + 3 FC
-structure as the original, with kernel sizes/strides shrunk to fit CIFAR-10's
-much smaller input instead of assuming 224x224.
+Uses the standard (torchvision-style) AlexNet: an 11x11 stride-4 conv stem,
+5 conv layers, 3 max-pools, an AdaptiveAvgPool((6,6)), and three FC layers
+(4096-4096-num_classes). This is the architecture whose parameter/FLOP counts
+match the SAFSL paper (AlexNet ~= 60M params, ~0.098 GFLOPs forward at 64x64).
+The AdaptiveAvgPool makes it run at ANY input resolution (32x32, 64x64, ...)
+without changing the classifier dimension.
 
-Architecture:
-  Conv(3->64, 3x3, pad=1)    -> ReLU -> MaxPool(2)            # 32 -> 16
-  Conv(64->192, 3x3, pad=1)  -> ReLU -> MaxPool(2)             # 16 -> 8
-  Conv(192->384, 3x3, pad=1) -> ReLU
-  Conv(384->256, 3x3, pad=1) -> ReLU
-  Conv(256->256, 3x3, pad=1) -> ReLU -> MaxPool(2)             # 8 -> 4
-  Flatten -> Dropout(0.5) -> Linear(4096->4096) -> ReLU
-          -> Dropout(0.5) -> Linear(4096->4096) -> ReLU
-          -> Linear(4096->10)
+NOTE — earlier this file used a CIFAR-adapted variant (small 3x3 kernels, no
+stride-4 stem) sized for 32x32. That was switched to the standard architecture
+so the measured params/FLOPs match the paper.
 
-Input: (B, 3, 32, 32)
-Output: (B, 10)
+Input: (B, 3, H, W)   (the SAFSL paper resizes CIFAR-10 / HAM10000 to 64x64)
+Output: (B, num_classes)
 
-Splittable (flsim.interfaces.splittable): ordered_layers() exposes the 21
-layers below as a flat list (indices 0-12 = features, 13-20 = classifier), so
-flsim.system.split_model.split_model() can cut the network at any index in
-[1, 20].
+Splittable: ordered_layers() exposes every layer (features + adaptive pool +
+classifier) as a flat list — a pure feed-forward stack, so split_model() may
+cut at any index in [1, N-1].
 """
 
 import torch.nn as nn
@@ -35,7 +28,7 @@ from flsim.interfaces.splittable import Splittable
 
 class AlexNet(nn.Module, Splittable):
     """
-    AlexNet, CIFAR-10-adapted (see module docstring).
+    AlexNet, standard architecture (see module docstring).
 
     This class does NOT:
     - Manage training loops.
@@ -46,24 +39,25 @@ class AlexNet(nn.Module, Splittable):
     def __init__(self, num_classes: int = 10):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),     # (B,3,32,32) -> (B,64,32,32)
+            nn.Conv2d(3, 64, kernel_size=11, stride=4, padding=2),
             nn.ReLU(),
-            nn.MaxPool2d(2),                                 # -> (B,64,16,16)
-            nn.Conv2d(64, 192, kernel_size=3, padding=1),   # -> (B,192,16,16)
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            nn.Conv2d(64, 192, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.MaxPool2d(2),                                 # -> (B,192,8,8)
-            nn.Conv2d(192, 384, kernel_size=3, padding=1),  # -> (B,384,8,8)
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            nn.Conv2d(192, 384, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(384, 256, kernel_size=3, padding=1),  # -> (B,256,8,8)
+            nn.Conv2d(384, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),  # -> (B,256,8,8)
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),                                 # -> (B,256,4,4)
+            nn.MaxPool2d(kernel_size=3, stride=2),
         )
+        self.avgpool = nn.AdaptiveAvgPool2d((6, 6))   # resolution-flexible; keeps 256*6*6=9216 FC input
         self.classifier = nn.Sequential(
-            nn.Flatten(),                                    # -> (B, 4096)
+            nn.Flatten(),
             nn.Dropout(0.5),
-            nn.Linear(256 * 4 * 4, 4096),
+            nn.Linear(256 * 6 * 6, 4096),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(4096, 4096),
@@ -74,13 +68,13 @@ class AlexNet(nn.Module, Splittable):
     def forward(self, x):
         """
         Args:
-            x: tensor of shape (B, 3, 32, 32).
+            x: tensor of shape (B, 3, H, W).
 
         Returns:
             tensor of shape (B, num_classes) — unnormalized logits.
         """
-        return self.classifier(self.features(x))
+        return self.classifier(self.avgpool(self.features(x)))
 
     def ordered_layers(self) -> list:
-        """21 layers in forward order: features[0:13] then classifier[0:8]."""
-        return list(self.features) + list(self.classifier)
+        """features + adaptive pool + classifier, in forward order (flat, any cut valid)."""
+        return list(self.features) + [self.avgpool] + list(self.classifier)
