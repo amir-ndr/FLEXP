@@ -33,8 +33,14 @@ Modelling choices (fixed at build time by the experiment / user):
   * latency combination per variant (energy always sums over all devices):
         SL     : sum over devices          (clients processed sequentially)
         SFLV1  : max over devices          (clients + server fully parallel)
-        SFLV2  : max(device paths) + sum(server compute)  (client parallel,
-                                                           server sequential)
+        SFLV2  : staged synchronization barriers, faithful to AdaptSFL eq.
+                 (16)-(25) with client-side MA every round (I=1):
+                   maxᵢ(FP + activation-uplink)
+                 + Σᵢ(server FP+BP)          [single edge server, workload summed]
+                 + maxᵢ(gradient-downlink + client BP)
+                 + maxᵢ(client-model uplink)   + maxᵢ(client-model downlink)
+                 Each device-side phase waits for its own straggler (a sum of
+                 per-phase maxes), rather than one max over the whole pipeline.
 
 Everything is a pure function of measured sizes + rates — cheap to call each
 round, easy to reuse in your own split-based experiment.
@@ -66,6 +72,14 @@ class DevicePerRound:
     dn_tx_energy_j:       float   # BS downlink TX (model down + gradients down)
     # traffic (bytes)
     traffic_bytes:  float
+    # FP/BP split of device compute, with t_dev_fp + t_dev_bp == t_dev_compute
+    # (exactly). Used by the SFLV2 staged-barrier latency (server sits BETWEEN
+    # device FP and device BP), so FP joins the activation-uplink phase and BP
+    # joins the gradient-downlink phase. Default 0 keeps any externally- or
+    # legacy-constructed DevicePerRound valid; every other consumer reads only
+    # t_dev_compute / device_path_s / full_path_s, which are unchanged.
+    t_dev_fp: float = 0.0
+    t_dev_bp: float = 0.0
     # which parts count toward total_energy_j: "total" (device + infrastructure)
     # or "device" (battery only — device compute + device uplink TX). See
     # SplitCostModel(energy_scope=...).
@@ -249,6 +263,13 @@ class SplitCostModel:
         t_dev_compute = (dev_cycles * work) / (profile.cpu_frequency_hz * self.q_device)
         t_srv_compute = (srv_cycles * work) / (f_srv * self.q_server)
 
+        # FP/BP split of the device compute: backward ≈ 2× forward (see
+        # flsim.system.flops), so FP is 1/3 of FP+BP. t_dev_bp is the exact
+        # remainder so t_dev_fp + t_dev_bp == t_dev_compute (no float drift) —
+        # device_path_s / full_path_s stay byte-identical for the other modes.
+        t_dev_fp = t_dev_compute / 3.0
+        t_dev_bp = t_dev_compute - t_dev_fp
+
         # ---- communication times (bits / rate) ----
         smashed_bits = activation_numel * BITS_PER_ELEMENT      # per sample
         model_bits   = client_param_count * BITS_PER_ELEMENT
@@ -282,7 +303,9 @@ class SplitCostModel:
             dev_compute_energy_j=dev_compute_energy,
             srv_compute_energy_j=srv_compute_energy,
             up_tx_energy_j=up_tx_energy, dn_tx_energy_j=dn_tx_energy,
-            traffic_bytes=traffic_bytes, energy_scope=self.energy_scope,
+            traffic_bytes=traffic_bytes,
+            t_dev_fp=t_dev_fp, t_dev_bp=t_dev_bp,
+            energy_scope=self.energy_scope,
         )
 
     # ------------------------------------------------------------------
@@ -303,8 +326,17 @@ class SplitCostModel:
         elif mode == "sflv1":
             latency = max(d.full_path_s for d in per_device)              # fully parallel
         elif mode == "sflv2":
-            latency = (max(d.device_path_s for d in per_device)          # device parallel
-                       + sum(d.t_srv_compute for d in per_device))        # server sequential
+            # Staged synchronization barriers per AdaptSFL eq. (16)-(25), I=1
+            # (client-side model aggregation every round). Each device-side phase
+            # blocks on its own straggler; the single edge server processes all
+            # devices' activations sequentially (summed workload).
+            phase_fp_up      = max(d.t_dev_fp + d.t_smashed_up for d in per_device)  # eq. 16+17
+            server_seq       = sum(d.t_srv_compute for d in per_device)             # eq. 18+19
+            phase_grad_bp    = max(d.t_grad_down + d.t_dev_bp for d in per_device)  # eq. 20+21
+            phase_model_up   = max(d.t_model_up   for d in per_device)              # eq. 22
+            phase_model_down = max(d.t_model_down for d in per_device)              # eq. 24
+            latency = (phase_fp_up + server_seq + phase_grad_bp
+                       + phase_model_up + phase_model_down)
         else:
             raise ValueError(f"mode must be 'sl'|'sflv1'|'sflv2', got {mode!r}")
 
