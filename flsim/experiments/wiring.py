@@ -144,10 +144,58 @@ def _make_channel_model(config, noise_psd_w_per_hz: float):
     )
 
 
-def _make_profiles(config, num_samples_list: list, rng):
-    """Create one ClientSystemProfile per client from system + wireless config."""
+def _measure_model_macs(model, train_ds, device=None) -> float:
+    """Per-sample MACs of `model`, measured on one REAL training sample (so the
+    input shape / channels / resolution match the actual dataset). The sample is
+    placed on the MODEL's own device (the split full-model stays on CPU while
+    sync/async models are on `device`), so `device` is accepted but ignored."""
+    from flsim.system.flops import forward_macs
+    try:
+        dev = next(model.parameters()).device
+    except StopIteration:
+        dev = torch.device("cpu")
+    x = train_ds[0][0]
+    if not torch.is_tensor(x):
+        x = torch.as_tensor(x)
+    x = x.unsqueeze(0).to(dev)
+    return float(forward_macs(model, x))
+
+
+def _resolve_cycles_per_sample(config, model, train_ds, device):
+    """Resolve the per-sample compute workload C fed to every client profile.
+
+    Controlled by system.cycles_per_sample_mode:
+      "model_macs" (default): C = the model's measured MACs (forward_macs) — ties
+          compute time/energy to the ACTUAL model for any dataset/algorithm, with
+          no manual FLOP-setting. This is the paper convention (a model's quoted
+          "FLOPs" is its MAC count).
+      "manual": C stays config.system.cycles_per_sample_min/max (a fixed workload
+          unrelated to the model — for reproducing a paper that gives C directly).
+
+    Returns a float C for "model_macs", or None for "manual" (the caller then lets
+    _make_profiles fall back to the config's cycles_per_sample_min/max).
+    """
+    mode = getattr(config.system, "cycles_per_sample_mode", "model_macs")
+    if mode == "manual":
+        return None
+    if mode != "model_macs":
+        raise ValueError(
+            f"system.cycles_per_sample_mode must be 'model_macs' or 'manual', got {mode!r}"
+        )
+    return _measure_model_macs(model, train_ds, device)
+
+
+def _make_profiles(config, num_samples_list: list, rng, cycles_per_sample=None):
+    """Create one ClientSystemProfile per client from system + wireless config.
+
+    cycles_per_sample (float, optional): if given, OVERRIDES the config's
+    cycles_per_sample_min/max for every client (used by the "model_macs" mode to
+    feed the measured model MACs). None keeps the config values.
+    """
     cfg_s = config.system
     cfg_w = config.wireless
+    c_min = cfg_s.cycles_per_sample_min if cycles_per_sample is None else cycles_per_sample
+    c_max = cfg_s.cycles_per_sample_max if cycles_per_sample is None else cycles_per_sample
     return create_client_profiles(
         num_clients=config.data.num_clients,
         num_samples_list=num_samples_list,
@@ -166,8 +214,9 @@ def _make_profiles(config, num_samples_list: list, rng):
         cpu_freq_step_ghz=getattr(cfg_s, "cpu_freq_step_ghz", 0.1),
         tx_power_w_min=getattr(cfg_w, "tx_power_w_min", None),
         tx_power_w_max=getattr(cfg_w, "tx_power_w_max", None),
-        cycles_per_sample_min=cfg_s.cycles_per_sample_min,
-        cycles_per_sample_max=cfg_s.cycles_per_sample_max,
+        cycles_per_sample_min=c_min,
+        cycles_per_sample_max=c_max,
+        flops_per_cycle=getattr(cfg_s, "flops_per_cycle", 1.0),
         shadowing_std_db=getattr(cfg_w, "shadowing_std_db", 0.0),
     )
 

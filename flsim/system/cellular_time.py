@@ -50,7 +50,13 @@ class CellularTimeModel(TimeModel):
         """
         Simulated training time in seconds.
 
-        Formula: tau_k = (I_k * C_k * D_k) / f_k
+        Formula: tau_k = (I_k * C_k * D_k) / (f_k * q_k)
+
+        q_k = profile.flops_per_cycle (FLOPs-per-cycle). Default 1.0 gives the
+        original tau_k = I_k*C_k*D_k/f_k (C_k treated as literal CPU cycles).
+        When C_k holds the model's FLOPs/sample, q_k>1 converts FLOPs→cycles so
+        the effective throughput is f_k*q_k (real SIMD/GPU hardware) — the
+        sync/async analog of SplitCostModel.q_device.
 
         Args:
             profile: ClientSystemProfile with cpu_frequency_hz, cycles_per_sample.
@@ -64,7 +70,8 @@ class CellularTimeModel(TimeModel):
             float: simulated training time in seconds.
         """
         f_k = cpu_freq_hz if cpu_freq_hz is not None else profile.cpu_frequency_hz
-        tau_k = (local_epochs * profile.cycles_per_sample * num_samples) / f_k
+        q_k = getattr(profile, "flops_per_cycle", 1.0)
+        tau_k = (local_epochs * profile.cycles_per_sample * num_samples) / (f_k * q_k)
         return tau_k
 
     def compute_upload_time(

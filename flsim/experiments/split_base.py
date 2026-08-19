@@ -44,6 +44,7 @@ from flsim.experiments.wiring import (
     _make_channel_model,
     _make_partitioner,
     _make_profiles,
+    _resolve_cycles_per_sample,
     _model_name_for_dataset,
     _num_classes_for_dataset,
     load_config,
@@ -143,7 +144,12 @@ class SplitExperiment(Experiment):
         noise_psd = dbm_to_watts(config.wireless.noise_psd_dbm_per_hz)
         config._noise_psd_w_per_hz = noise_psd
         channel_model = _make_channel_model(config, noise_psd)
-        profiles = _make_profiles(config, [len(i) for i in client_indices], rng)
+        # Per-sample compute workload C = the FULL model's MACs (default
+        # "model_macs" mode); the split cost model then divides it across the cut
+        # via device_compute_fraction. "manual" mode keeps the config value.
+        cps = _resolve_cycles_per_sample(config, full_model, train_ds, device)
+        profiles = _make_profiles(config, [len(i) for i in client_indices], rng,
+                                  cycles_per_sample=cps)
         split_cfg = getattr(config, "split", None)
         server_freq = float(getattr(split_cfg, "server_cpu_frequency_hz", 3.0e9))
         # BS downlink power: unified location is wireless.downlink_tx_power_w

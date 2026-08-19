@@ -158,19 +158,19 @@ METHOD_ORDER = ["FL", "FedAsync", "SL", "SFLV1", "SFLV2", "SAFSL"]
 
 def _resnet_flops_per_sample() -> float:
     """
-    Full-model FLOPs per sample for the chosen model (FP + BP), fixed for every
-    client. 1 MAC = 2 FLOPs; forward = 2*MACs; backward ~= 2*forward; so
-    FP+BP ~= 6*MACs (standard training-FLOPs convention). This is the paper's
-    per-sample computing workload Phi; the split cost model divides it between
-    device and server by the measured cut-layer FLOP fraction.
+    Per-sample computing workload Phi = the model's MACs — the paper convention:
+    a model's quoted "FLOPs" is its MAC count (ResNet-34 0.30 G, VGG-19 1.72 G,
+    AlexNet 0.098 G — reproduced here to within a few %). NOT 6*MACs (true FP+BP
+    training FLOPs): the papers plug the MAC count in directly, and using 6*MACs
+    inflated the simulated time ~6×. The split cost model divides Phi between
+    device and server by the measured cut-layer fraction.
 
-    Measured at IMAGE_SIZE (64x64) with the STANDARD-stem models, so the MACs
-    match the paper's quoted numbers (its "FLOPs" are MACs: ResNet-34 0.30 G,
-    VGG-19 1.72 G, AlexNet 0.098 G — reproduced here to within a few %).
+    (Equivalent to the framework default system.cycles_per_sample_mode="model_macs";
+    set explicitly here because this experiment wires its simulators by hand.)
     """
     m = create_model(MODEL, num_classes=_num_classes_for_dataset(DATASET))
     x = torch.randn(2, 3, IMAGE_SIZE, IMAGE_SIZE)
-    return 6.0 * forward_macs(m, x)
+    return float(forward_macs(m, x))
 
 
 PHI_FLOPS_PER_SAMPLE = _resnet_flops_per_sample()

@@ -48,6 +48,15 @@ class ClientSystemProfile:
     # ---- Dataset ----------------------------------------------------------
     num_samples: int        # D_k: number of local training samples
 
+    # ---- Compute throughput (FLOPs-per-cycle) -----------------------------
+    # q_k: hardware FLOPs executed per CPU cycle (SIMD lanes × cores, etc.).
+    # Compute time = cycles_per_sample·D / (f·q); compute energy = κ·cycles_per_sample·D·f²/q.
+    # When cycles_per_sample holds the model's FLOPs (not raw cycles), q converts
+    # FLOPs→cycles: effective throughput is f·q. Default 1.0 reproduces the
+    # framework's original behaviour (treat cycles_per_sample as literal cycles,
+    # i.e. 1 FLOP/cycle). Mirrors SplitCostModel.q_device for the sync/async path.
+    flops_per_cycle: float = 1.0
+
     @staticmethod
     def from_position(
         client_id: int,
@@ -58,6 +67,7 @@ class ClientSystemProfile:
         tx_power_w: float,
         shadowing_db: float,
         num_samples: int,
+        flops_per_cycle: float = 1.0,
     ) -> "ClientSystemProfile":
         """
         Construct a profile from raw (x, y) coordinates; distance is computed.
@@ -86,4 +96,5 @@ class ClientSystemProfile:
             tx_power_w=tx_power_w,
             shadowing_db=shadowing_db,
             num_samples=num_samples,
+            flops_per_cycle=flops_per_cycle,
         )

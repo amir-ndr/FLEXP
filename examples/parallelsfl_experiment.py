@@ -125,10 +125,14 @@ CANONICAL_COLUMNS = [
 
 
 def _phi_flops_per_sample() -> float:
-    """Full-model FP+BP FLOPs/sample (~6*MACs) for MnistCNN, fixed for all clients."""
+    """Per-sample compute workload Phi = the model's MACs (paper convention — a
+    model's quoted "FLOPs" is its MAC count), fixed for all clients. NOT 6*MACs
+    (true FP+BP), which inflated the simulated time ~6×. (Equivalent to the
+    framework default system.cycles_per_sample_mode="model_macs"; set explicitly
+    because this experiment wires its ParallelSFL simulator by hand.)"""
     m = create_model(MODEL, num_classes=_num_classes_for_dataset(DATASET))
     x = torch.randn(2, 1, 28, 28)
-    return 6.0 * forward_macs(m, x)
+    return float(forward_macs(m, x))
 
 
 PHI_FLOPS_PER_SAMPLE = _phi_flops_per_sample()

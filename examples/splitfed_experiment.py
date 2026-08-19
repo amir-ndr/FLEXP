@@ -333,7 +333,14 @@ class SplitFedFigure2Experiment(SplitExperiment, AsyncExperiment):
             server_cpu_frequency_hz=float(getattr(getattr(config, "split", None),
                                                   "server_cpu_frequency_hz", 3.0e9)),
         )
-        cycles = (config.system.cycles_per_sample_min + config.system.cycles_per_sample_max) / 2.0
+        # Per-sample compute workload C — resolved the SAME way as the split runs
+        # (system.cycles_per_sample_mode: "model_macs" default measures the model's
+        # MACs; "manual" uses cycles_per_sample_min/max), so Normal is on the same
+        # compute scale as SL/SFLV1/SFLV2 rather than the arbitrary config constant.
+        from flsim.experiments.wiring import _resolve_cycles_per_sample
+        cycles = _resolve_cycles_per_sample(config, model, train_ds, device)
+        if cycles is None:   # "manual" mode
+            cycles = (config.system.cycles_per_sample_min + config.system.cycles_per_sample_max) / 2.0
         total_samples = len(train_ds)
 
         run_dir = os.path.join(self.output_dir, run_name)

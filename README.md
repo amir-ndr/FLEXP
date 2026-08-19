@@ -923,7 +923,15 @@ The split CSV therefore adds `simulated_time_s`, `round_latency_s`,
 `traffic_bytes`, `cumulative_traffic_bytes`, `total_energy_j`,
 `cumulative_energy_j` (the first two and last two share the sync/async column
 names). Latency combines per variant: SL = sum over devices (sequential),
-SFLV1 = max (parallel), SFLV2 = max(device paths) + sum(server compute); traffic
+SFLV1 = max (parallel), and SFLV2 uses **staged synchronization barriers**
+faithful to AdaptSFL Eq. (16)–(25) with client-side aggregation every round
+(`I = 1`): `maxᵢ(FP + activation-uplink) + Σᵢ(server FP+BP) +
+maxᵢ(gradient-downlink + client-BP) + maxᵢ(model-uplink) + maxᵢ(model-downlink)`
+— each device-side phase waits on its own straggler (device FP/BP is split ⅓/⅔
+from the true cut-layer FLOPs, since backward ≈ 2× forward), while the single
+edge server processes all devices' activations sequentially. This is stricter
+than a single max over the whole device pipeline, so it captures cross-phase
+straggler compounding the lumped form missed. Traffic
 and energy always sum over devices (so they are identical across SL/SFLV1/SFLV2,
 matching the paper's Table 2). `examples/splitfed_experiment.py` plots
 accuracy-vs-simulated-time, cumulative energy, per-round traffic, and per-round
@@ -953,6 +961,21 @@ same way to every split method, keeping cross-paradigm comparison fair:
 `q` is the correct place to represent per-hardware throughput without touching
 the shared `cycles_per_sample` (FLOPs) that every method uses. Because they only
 touch compute, communication overhead (MB) stays identical regardless.
+
+### Where the per-sample compute workload comes from (`cycles_per_sample_mode`)
+
+Compute time = `C·(H·b)/(f·q)`, so the per-sample workload `C` sets the whole
+timing scale. `system.cycles_per_sample_mode` controls it:
+
+| Mode | `C` | Use |
+|---|---|---|
+| `"model_macs"` (**default**) | **measured from the actual model** via `forward_macs` (its MAC count) | any new algorithm/dataset gets model-consistent, paper-scale time automatically — no manual FLOP-setting |
+| `"manual"` | `system.cycles_per_sample_min/max` verbatim | a paper that states `C` directly, or a deliberately fixed cost |
+
+A model's quoted **"FLOPs" is its MAC count** (ResNet-34 @ 64×64 = 0.30e9), so
+`model_macs` reproduces the papers exactly — **not** `6×MACs` (true FP+BP), which
+inflates simulated time ~6×. This is uniform across sync / async / split (the
+split cost model measures the full model, then divides by the cut fraction).
 
 > **Limit-case consistency (verified numerically).** The paradigms collapse into
 > each other at their boundary settings, and the cost model respects this:
@@ -1540,8 +1563,10 @@ system:
   cpu_freq_min_ghz:     0.1      # discrete_ghz / uniform_ghz lower bound
   cpu_freq_max_ghz:     0.8      # discrete_ghz / uniform_ghz upper bound
   cpu_freq_step_ghz:    0.1      # discrete_ghz only
-  cycles_per_sample_min: 1.0e+7  # C_k (= FLOPs/sample when split q ≠ 1); set
-  cycles_per_sample_max: 1.0e+7  # min==max to fix a model's per-sample FLOPs
+  cycles_per_sample_mode: model_macs | manual  # model_macs (default) = C_k measured
+                                 #   from the model's MACs; manual = use the two below
+  cycles_per_sample_min: 1.0e+7  # C_k, used only in "manual" mode
+  cycles_per_sample_max: 1.0e+7  # min==max to fix a per-sample workload
   switched_capacitance: 1.0e-28
   energy_scope:         total | device   # device = battery only (compute+uplink TX),
                                          # excludes server compute + BS downlink TX

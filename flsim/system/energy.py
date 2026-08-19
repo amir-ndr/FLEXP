@@ -50,10 +50,17 @@ class EnergyModel:
         """
         Simulated computation energy in joules.
 
-        Formula: E_k_comp = kappa * I_k * C_k * D_k * f_k^2
+        Formula: E_k_comp = kappa * I_k * C_k * D_k * f_k^2 / q_k
+
+        q_k = profile.flops_per_cycle (FLOPs-per-cycle). Default 1.0 gives the
+        original E = kappa*I*C*D*f² (C treated as literal cycles). When C holds
+        the model's FLOPs/sample, cycles = FLOPs/q so the DVFS energy
+        kappa*cycles*f² = kappa*FLOPs*f²/q — consistent with the compute time
+        (both divide by q) and with SplitCostModel's device compute energy.
 
         Args:
-            profile: ClientSystemProfile with cpu_frequency_hz, cycles_per_sample.
+            profile: ClientSystemProfile with cpu_frequency_hz, cycles_per_sample,
+                flops_per_cycle.
             local_epochs (int): I_k — local epochs per round.
             num_samples (int): D_k — number of local training samples.
             cpu_freq_hz (float, optional): override f_k from the allocator.
@@ -64,7 +71,8 @@ class EnergyModel:
         """
         f_k = cpu_freq_hz if cpu_freq_hz is not None else profile.cpu_frequency_hz
         C_k = profile.cycles_per_sample
-        E_comp = self.kappa * local_epochs * C_k * num_samples * (f_k ** 2)
+        q_k = getattr(profile, "flops_per_cycle", 1.0)
+        E_comp = self.kappa * local_epochs * C_k * num_samples * (f_k ** 2) / q_k
         return E_comp
 
     def transmission_energy_j(

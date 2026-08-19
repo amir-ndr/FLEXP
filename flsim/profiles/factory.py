@@ -57,6 +57,8 @@ def create_client_profiles(
     # --- Compute cycles ---
     cycles_per_sample_min: float = 1.0e6,
     cycles_per_sample_max: float = 1.0e7,
+    # --- Compute throughput (FLOPs-per-cycle q_k; homogeneous) ---
+    flops_per_cycle: float = 1.0,
     # --- Shadowing (used only with 3GPP path-loss channel model) ---
     shadowing_std_db: float = 0.0,
 ) -> List[ClientSystemProfile]:
@@ -158,6 +160,7 @@ def create_client_profiles(
             tx_power_w=float(tx_powers[k]),
             shadowing_db=float(shadows[k]),
             num_samples=num_samples_list[k],
+            flops_per_cycle=float(flops_per_cycle),
         )
         if profile.distance_m < min_distance_m:
             object.__setattr__(profile, "distance_m", min_distance_m)

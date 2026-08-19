@@ -77,6 +77,7 @@ from flsim.experiments.wiring import (
     _make_channel_model,
     _make_partitioner,
     _make_profiles,
+    _resolve_cycles_per_sample,
     _model_name_for_dataset,
     _num_classes_for_dataset,
     load_config,
@@ -169,7 +170,11 @@ class AsyncExperiment(Experiment):
                                        _make_channel_model(config, noise_psd))
         allocator     = components.get("allocator", _make_allocator(config))
 
-        profiles = _make_profiles(config, [len(i) for i in client_indices], rng)
+        # Per-sample compute workload C from the actual model (default) or config
+        # (system.cycles_per_sample_mode) — see flsim.experiments.wiring.
+        cps = _resolve_cycles_per_sample(config, global_model, train_ds, device)
+        profiles = _make_profiles(config, [len(i) for i in client_indices], rng,
+                                  cycles_per_sample=cps)
 
         time_model   = components.get("time_model",
                                       CellularTimeModel(channel_model, noise_psd))

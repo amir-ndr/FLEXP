@@ -82,12 +82,33 @@ system:
   cpu_freq_min_ghz: 0.1          # lower bound (discrete_ghz / uniform_ghz)
   cpu_freq_max_ghz: 0.8          # upper bound (discrete_ghz / uniform_ghz)
   cpu_freq_step_ghz: 0.1         # step size (discrete_ghz only)
-  cycles_per_sample_min: 1.0e+6  # C_k lower bound (cycles per training sample)
-  cycles_per_sample_max: 1.0e+7  # C_k upper bound
-  # NOTE: C_k is interpreted as FLOPs/sample when the split cost model's
-  # q_device/q_server (split.q_device/q_server) are != 1. For a paper that
-  # fixes the model's per-sample FLOPs (e.g. a specific ResNet), set
+  # How the per-sample compute workload C_k is set (drives compute time/energy):
+  #   "model_macs" (DEFAULT) — C_k is MEASURED from the actual model via
+  #        forward_macs (its MAC count, which equals a model's quoted "FLOPs").
+  #        Ties timing to whatever model/dataset you pick, automatically and
+  #        consistently across every algorithm — no manual FLOP-setting. The
+  #        cycles_per_sample_min/max below are then IGNORED.
+  #   "manual" — use cycles_per_sample_min/max below verbatim (a fixed workload
+  #        unrelated to the model; for reproducing a paper that states C directly,
+  #        or for a deliberately fixed cost).
+  cycles_per_sample_mode: "model_macs"
+  cycles_per_sample_min: 1.0e+6  # C_k lower bound (used only in "manual" mode)
+  cycles_per_sample_max: 1.0e+7  # C_k upper bound (used only in "manual" mode)
+  # NOTE: C_k is interpreted as FLOPs/sample when q (flops_per_cycle below, or
+  # the split cost model's q_device/q_server) is != 1. For a paper that fixes
+  # the model's per-sample FLOPs (e.g. a specific ResNet), set
   # cycles_per_sample_min == max == that measured FLOP count.
+  #
+  # flops_per_cycle: hardware FLOPs executed per CPU cycle q_k (SIMD lanes ×
+  # cores, or GPU throughput). Compute time = C_k·D/(f·q); compute energy =
+  # κ·C_k·D·f²/q. This is the SYNC/ASYNC analog of split.q_device — it was
+  # previously MISSING from the sync/async path (implicit q=1), which forced
+  # "1 FLOP per cycle" (microcontroller) whenever C_k held FLOPs, inflating
+  # compute time/energy ~100–1000× vs real hardware. So when C_k = model FLOPs
+  # and f is a real clock (e.g. 0.1–2 GHz), set q to the device's FLOPs/cycle
+  # (mobile CPU/GPU ≈ 64–1024) so effective throughput f·q ≈ 0.1–1 TFLOPS.
+  # Default 1.0 = original behaviour (treat C_k as literal CPU cycles).
+  flops_per_cycle: 1.0
   switched_capacitance: 1.0e-28  # kappa for energy model
   # Which energy counts toward total_energy_j (UNIFIED across all paradigms):
   #   "total"  (default) — device compute + edge-server compute + uplink TX +
