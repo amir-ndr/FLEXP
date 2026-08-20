@@ -89,18 +89,25 @@ sys.exit(0 if ok else 1)
 "
 
 # ---------------------------------------------------------------------------
-# 3. Run the experiment
+# 3. Run the experiment(s)
 #
-# Compares four paradigms on MNIST / MnistCNN, 50 clients, Dirichlet(alpha=0.3)
-# data heterogeneity + per-device system heterogeneity, all on ONE physical
-# base with IDENTICAL max local work (H = ParallelSFL tau_max):
-#   ParallelSFL / FL / SFLv2 / SAFSL
-# Produces: accuracy-vs-time & accuracy-vs-round curves, energy(J)- and
-# overhead(MB)-to-accuracy bars, an average-waiting-time curve, and a
-# time-to-accuracy table. All knobs (NUM_CLIENTS, DIRICHLET_ALPHA, LOCAL_ITERS,
-# heterogeneity ranges, cut layer) are at the top of
-# examples/parallelsfl_experiment.py — edit there, not here.
+# examples/parallelsfl_experiment.py drives THREE experiments, selected with
+# --exp (any subset), on --dataset {mnist | cifar10}:
+#   1  Comparison: CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL (Dirichlet 0.3).
+#   2  N & H sweep for CSA-SFL under non-IID delta=0.1 (outputs -> exp2/):
+#        acc-vs-time (varying N), acc-vs-comm-overhead (varying N),
+#        acc-vs-time (varying H).
+#   3  Ablation (outputs -> exp3/): full CSA-SFL vs "uniform aggregation" and
+#        "random clustering" variants — acc-vs-training-time.
+# All knobs (NUM_CLIENTS, LOCAL_ITERS, N/H sweep lists, heterogeneity ranges,
+# cut layer) are at the top of examples/parallelsfl_experiment.py.
+#
+# Choose experiments/dataset by exporting EXP / DATASET (defaults: all three,
+# mnist), e.g.  sbatch --export=ALL,EXP="1 2 3",DATASET=cifar10 <this file>
 # ---------------------------------------------------------------------------
-python examples/parallelsfl_experiment.py
+EXP="${EXP:-1 2 3}"
+DATASET="${DATASET:-mnist}"
+echo "Running experiments: --exp ${EXP} --dataset ${DATASET}"
+python examples/parallelsfl_experiment.py --exp ${EXP} --dataset "${DATASET}"
 
 echo "Job finished at $(date)"

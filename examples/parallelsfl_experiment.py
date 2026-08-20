@@ -1,14 +1,29 @@
 """
-examples/parallelsfl_experiment.py: ParallelSFL vs FL / SFLv2 / SAFSL on
-MNIST + MnistCNN under DATA and SYSTEM heterogeneity.
+examples/parallelsfl_experiment.py: CSA-SFL and baselines on MNIST/MnistCNN
+(or CIFAR-10/ResNet-18) under DATA and SYSTEM heterogeneity. THREE experiments,
+selected with `--exp` (any subset) and `--dataset {mnist|cifar10}`:
 
-Compares four paradigms, all on ONE coherent physical base (FDMA Shannon rate,
-DVFS compute energy, FLOPs/(f*q) compute time) so the comparison is meaningful:
+  1  Comparison: CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL (Dirichlet 0.3).
+  2  N & H sweep for CSA-SFL under non-IID delta=0.1 (outputs -> exp2/):
+       accuracy-vs-time (varying N), accuracy-vs-comm-overhead (varying N),
+       accuracy-vs-time (varying H).
+  3  Ablation (outputs -> exp3/): full CSA-SFL vs a "uniform aggregation" variant
+       and a "random one-time clustering" variant — accuracy-vs-training-time.
+      Usage:  python examples/parallelsfl_experiment.py --exp 1 2 3 --dataset mnist
 
-  ParallelSFL — cluster-based split FL: workers grouped into clusters, each with
-                a top worker holding the top submodel; adaptive per-cluster local
-                frequency tau_c (Eq. 17) + KL-clustering (Alg. 1).
-                (flsim.algorithms.parallel_sfl.ParallelSFL)
+All methods run on ONE coherent physical base (FDMA Shannon rate, DVFS compute
+energy, FLOPs/(f*q) compute time, MACs-based per-sample workload) so the
+comparison is meaningful:
+
+  CSA-SFL     — clustered semi-async split FL (the new method): devices grouped
+                by device-side GRADIENT similarity (cosine K-means, re-clustered
+                every H rounds); intra-cluster synchronous split co-training (E
+                iters) with a per-cluster server-side submodel on the PS;
+                inter-cluster SEMI-ASYNC buffered aggregation with data-size-and-
+                staleness-aware weights phi_n = |D_n|/(1+tau_n).
+                (flsim.algorithms.csa_sfl + flsim.core.csa_sfl_simulator)
+  ParallelSFL — cluster-based split FL: top submodel on a peer worker; adaptive
+                per-cluster local frequency tau_c (Eq. 17) + KL-clustering.
   FL          — synchronous FedAvg (full model on every device).
   SFLv2       — synchronous split FL, server side sequential (edge server holds
                 the top submodel for all workers).
@@ -51,12 +66,15 @@ import torch
 from flsim.algorithms.fedavg import FedAvg
 from flsim.algorithms.safsl import SAFSL
 from flsim.algorithms.parallel_sfl import ParallelSFL
+from flsim.algorithms.csa_sfl import CSASFL
 from flsim.allocators.equal_split import EqualSplitAllocator
 from flsim.channel.conversions import dbm_to_watts
 from flsim.core.evaluator import Evaluator
 from flsim.core.parallel_sfl_simulator import ParallelSFLSimulator
+from flsim.core.csa_sfl_simulator import CSASFLSimulator
 from flsim.core.split_async_simulator import SplitAsyncSimulator
 from flsim.core.split_client import SplitClient
+from flsim.experiments import reporting
 from flsim.experiments.async_base import AsyncExperiment
 from flsim.experiments.base import RunResult, _apply_config_overrides
 from flsim.experiments.split_base import SplitExperiment
@@ -73,10 +91,19 @@ from flsim.system.split_model import split_model
 BASE_CONFIG = os.path.join(os.path.dirname(__file__), "..", "flsim", "configs", "base.yaml")
 OUTPUT_DIR = "outputs/parallelsfl_experiment/"
 
-# ---- problem ----
-DATASET   = "mnist"
-MODEL     = "mnist_cnn"
-CUT_LAYER = 6            # MnistCNN features/classifier boundary (10 layers)
+# ---- problem (dataset-dependent; switch with --dataset / _configure_dataset) ----
+DATASET     = "mnist"
+MODEL       = "mnist_cnn"
+CUT_LAYER   = 6              # MnistCNN features/classifier boundary (10 layers)
+IMAGE_SIZE  = None           # None = native (mnist 28); 64 for the cifar10/resnet option
+INPUT_SHAPE = (2, 1, 28, 28) # a sample batch shape, for measuring model MACs (Phi)
+
+# dataset -> (model, cut_layer, image_size, input_shape). CSA-SFL/CIFAR uses a
+# light ResNet-18 @ 64 (cut at a residual boundary) so the Exp-2 sweep is tractable.
+DATASET_CFG = {
+    "mnist":   ("mnist_cnn", 6, None, (2, 1, 28, 28)),
+    "cifar10": ("resnet18",  5, 64,   (2, 3, 64, 64)),
+}
 
 # ---- federation / heterogeneity ----
 NUM_CLIENTS      = 50
@@ -111,7 +138,22 @@ MAX_GLOBAL_ROUNDS = 150
 EVALUATE_EVERY    = 5
 ACC_TARGETS       = [0.80, 0.85, 0.90, 0.95]
 
-METHOD_ORDER = ["FL", "SFLv2", "SAFSL", "ParallelSFL"]
+# ---- CSA-SFL (clustered semi-async split FL) ----
+N_CLUSTERS   = 5         # N — default number of clusters
+RECLUSTER_H  = 20        # H — re-cluster (gradient K-means) every H global rounds
+# CSA-SFL's global round trains ONE cluster (~K/N devices); to keep total
+# device-training work comparable to the round-based baselines (MAX_GLOBAL_ROUNDS
+# x K device-trainings), it runs T = MAX_GLOBAL_ROUNDS x N global rounds.
+def _csasfl_T(N):
+    return MAX_GLOBAL_ROUNDS * N
+
+# ---- Exp 2 sweep (non-IID delta=0.1, one parameter at a time) ----
+NONIID_DELTA = 0.1
+N_SWEEP      = [5, 7, 9, 11]                 # vary N (H fixed = RECLUSTER_H)
+H_SWEEP      = [5, 10, 20, 30, 40, 50]       # vary H (N fixed = N_FIXED)
+N_FIXED      = 5                             # N held fixed during the H sweep
+
+METHOD_ORDER = ["FL", "SFLv2", "SAFSL", "ParallelSFL", "CSA-SFL"]
 
 # Unified CSV schema every method is normalized to, so any of them can be
 # plotted / compared with the same code. Method-specific extras (staleness,
@@ -129,10 +171,9 @@ def _phi_flops_per_sample() -> float:
     model's quoted "FLOPs" is its MAC count), fixed for all clients. NOT 6*MACs
     (true FP+BP), which inflated the simulated time ~6×. (Equivalent to the
     framework default system.cycles_per_sample_mode="model_macs"; set explicitly
-    because this experiment wires its ParallelSFL simulator by hand.)"""
+    because this experiment wires its split simulators by hand.)"""
     m = create_model(MODEL, num_classes=_num_classes_for_dataset(DATASET))
-    x = torch.randn(2, 1, 28, 28)
-    return float(forward_macs(m, x))
+    return float(forward_macs(m, torch.randn(*INPUT_SHAPE)))
 
 
 PHI_FLOPS_PER_SAMPLE = _phi_flops_per_sample()
@@ -180,10 +221,41 @@ SHARED_OVERRIDES = {
 }
 
 
-class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
-    """Drives ParallelSFL + FL + SFLv2 + SAFSL, then the full metric set."""
+def _configure_dataset(name: str) -> None:
+    """Switch the whole experiment between datasets (mnist | cifar10) — updates
+    the model / cut layer / input size and re-measures the per-sample MACs (Phi),
+    patching SHARED_OVERRIDES in place. Call once before running any experiment."""
+    global DATASET, MODEL, CUT_LAYER, IMAGE_SIZE, INPUT_SHAPE, PHI_FLOPS_PER_SAMPLE
+    if name not in DATASET_CFG:
+        raise ValueError(f"--dataset must be one of {list(DATASET_CFG)}, got {name!r}")
+    MODEL, CUT_LAYER, IMAGE_SIZE, INPUT_SHAPE = DATASET_CFG[name]
+    DATASET = name
+    PHI_FLOPS_PER_SAMPLE = _phi_flops_per_sample()
+    SHARED_OVERRIDES.update({
+        "data.dataset":                 DATASET,
+        "data.model_name":              MODEL,
+        "learning.cut_layer":           CUT_LAYER,
+        "system.cycles_per_sample_min": PHI_FLOPS_PER_SAMPLE,
+        "system.cycles_per_sample_max": PHI_FLOPS_PER_SAMPLE,
+    })
+    if IMAGE_SIZE is not None:
+        SHARED_OVERRIDES["data.image_size"] = IMAGE_SIZE
+    print(f"[dataset] {DATASET} / {MODEL} @ cut={CUT_LAYER}, image_size={IMAGE_SIZE}, "
+          f"Phi(MACs)={PHI_FLOPS_PER_SAMPLE:.3e}")
 
-    def run(self):
+
+class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
+    """Drives three experiments (selectable via --exp):
+      1. Comparison: CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL.
+      2. N & H sweep for CSA-SFL (non-IID delta=0.1).
+      3. Ablation of CSA-SFL's two components (gradient clustering, weighted agg).
+    """
+
+    # ==================================================================
+    # Experiment 1 — the head-to-head comparison
+    # ==================================================================
+
+    def run_exp1(self):
         results = {}
 
         # 1. FL — synchronous FedAvg, all workers participate.
@@ -221,6 +293,12 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
         results["ParallelSFL"] = self._run_parallelsfl(
             run_name="psfl_parallelsfl", label="ParallelSFL",
             global_rounds=MAX_GLOBAL_ROUNDS, evaluate_every=EVALUATE_EVERY,
+        )
+
+        # 5. CSA-SFL — clustered semi-async split FL (the new method).
+        results["CSA-SFL"] = self._run_csasfl(
+            run_name="psfl_csasfl", label="CSA-SFL",
+            num_clusters=N_CLUSTERS, recluster_every=RECLUSTER_H,
         )
 
         self._plot_accuracy_vs_time(results)
@@ -389,6 +467,166 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
         result = RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=df)
         return self.finalize_run(result, run_name)   # auto unified CSV + standard plots
 
+    # ==================================================================
+    # CSA-SFL run builder (shared by Exp 1 / 2 / 3)
+    # ==================================================================
+
+    def _build_csasfl(self, config, algo):
+        """Wire a CSASFLSimulator on the SAME SplitCostModel base as SAFSL/SFLv2
+        (fair timing). Returns (simulator, test_ds)."""
+        set_seeds(config.experiment.seed)
+        rng = np.random.RandomState(config.experiment.seed)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        train_ds, test_ds = _load_dataset(config)
+        idx = _make_partitioner(config.data).partition(train_ds, config.data.num_clients, rng)
+        full = create_model(_model_name_for_dataset(config.data.dataset, getattr(config.data, "model_name", None)),
+                            num_classes=_num_classes_for_dataset(config.data.dataset, getattr(config.data, "num_classes", None)))
+        bottom, server = split_model(full, cut_layer=config.learning.cut_layer)
+        clients = [SplitClient(client_id=k, dataset=train_ds, indices=idx[k]) for k in range(config.data.num_clients)]
+        noise = dbm_to_watts(config.wireless.noise_psd_dbm_per_hz)
+        config._noise_psd_w_per_hz = noise
+        cost_model = SplitCostModel(
+            channel_model=_make_channel_model(config, noise), noise_psd_w_per_hz=noise,
+            kappa=config.system.switched_capacitance,
+            server_cpu_frequency_hz=float(config.split.server_cpu_frequency_hz),
+            q_device=float(config.split.q_device), q_server=float(config.split.q_server),
+            downlink_tx_power_w=getattr(config.wireless, "downlink_tx_power_w", None),
+            energy_scope=getattr(config.system, "energy_scope", "total"))
+        profiles = _make_profiles(config, [len(i) for i in idx], rng)
+        sim = CSASFLSimulator(clients, bottom, server, algo, Evaluator(test_dataset=test_ds),
+                              config, rng, device, profiles=profiles, cost_model=cost_model)
+        return sim, test_ds
+
+    def _run_csasfl(self, run_name, label, num_clusters=None, recluster_every=None,
+                    clustering="gradient", aggregation="weighted", extra_overrides=None,
+                    global_rounds=None, evaluate_every=None) -> RunResult:
+        N = int(num_clusters or N_CLUSTERS)
+        H = int(recluster_every or RECLUSTER_H)
+        T = int(global_rounds or _csasfl_T(N))
+        ee = int(evaluate_every or max(1, T // 30))     # ~30 eval points
+        print(f"\n{'='*60}\n[ParallelSFLComparison] Run: {label} "
+              f"(N={N}, H={H}, T={T}, clustering={clustering}, agg={aggregation})\n{'='*60}")
+        overrides = {**SHARED_OVERRIDES, "evaluation.evaluate_every": ee, **(extra_overrides or {})}
+        config = _apply_config_overrides(load_config(BASE_CONFIG), overrides)
+        algo = CSASFL(num_clusters=N, recluster_every=H, local_iters=LOCAL_ITERS,
+                      global_rounds=T, clustering=clustering, aggregation=aggregation)
+        sim, _ = self._build_csasfl(config, algo)
+        history = sim.run()
+
+        run_dir = os.path.join(self.output_dir, run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        csv_path = os.path.join(run_dir, f"{os.path.basename(run_name)}.csv")
+        cols = ["round", "train_loss", "test_accuracy", "test_loss", "simulated_time_s",
+                "round_latency_s", "avg_waiting_time_s", "staleness",
+                "traffic_bytes", "cumulative_traffic_bytes",
+                "total_energy_j", "cumulative_energy_j", "num_clusters", "completed_cluster_size"]
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in history:
+                w.writerow({
+                    "round": r.round,
+                    "train_loss": f"{r.train_loss:.6f}",
+                    "test_accuracy": f"{r.test_accuracy:.6f}" if r.test_accuracy is not None else "",
+                    "test_loss": f"{r.test_loss:.6f}" if r.test_loss is not None else "",
+                    "simulated_time_s": f"{r.simulated_time_s:.6f}",
+                    "round_latency_s": f"{r.round_latency_s:.6f}",
+                    "avg_waiting_time_s": f"{r.avg_waiting_time_s:.6f}",
+                    "staleness": f"{r.staleness:.1f}",
+                    "traffic_bytes": f"{r.traffic_bytes:.1f}",
+                    "cumulative_traffic_bytes": f"{r.cumulative_traffic_bytes:.1f}",
+                    "total_energy_j": f"{r.total_energy_j:.6e}",
+                    "cumulative_energy_j": f"{r.cumulative_energy_j:.6e}",
+                    "num_clusters": r.num_clusters,
+                    "completed_cluster_size": r.completed_cluster_size,
+                })
+        result = RunResult(name=run_name, label=label, config=config, csv_path=csv_path, df=pd.read_csv(csv_path))
+        return self.finalize_run(result, run_name)   # auto unified CSV + standard plots
+
+    # ==================================================================
+    # Experiment 2 — N & H sweep (CSA-SFL, non-IID delta=0.1)
+    # ==================================================================
+
+    def run_exp2(self):
+        noniid = {"data.partition": "dirichlet", "data.dirichlet_alpha": NONIID_DELTA}
+        # --- vary N (H fixed) ---
+        n_results = {}
+        for N in N_SWEEP:
+            n_results[f"N={N}"] = self._run_csasfl(
+                run_name=f"exp2/csasfl_N{N}", label=f"N={N}",
+                num_clusters=N, recluster_every=RECLUSTER_H, extra_overrides=noniid)
+        # --- vary H (N fixed) ---
+        h_results = {}
+        for H in H_SWEEP:
+            h_results[f"H={H}"] = self._run_csasfl(
+                run_name=f"exp2/csasfl_H{H}", label=f"H={H}",
+                num_clusters=N_FIXED, recluster_every=H, extra_overrides=noniid)
+
+        self._sweep_plot(n_results, "simulated_time_s", "exp2/acc_vs_time_N",
+                         "Test accuracy vs training time (varying N)", "Simulated time (s)")
+        self._sweep_plot(n_results, "cumulative_traffic_bytes", "exp2/acc_vs_comm_N",
+                         "Test accuracy vs communication overhead (varying N)",
+                         "Cumulative communication overhead (MB)", xscale=1e6)
+        self._sweep_plot(h_results, "simulated_time_s", "exp2/acc_vs_time_H",
+                         "Test accuracy vs training time (varying H)", "Simulated time (s)")
+        self._write_sweep_csv(n_results, "exp2/sweep_N.csv")
+        self._write_sweep_csv(h_results, "exp2/sweep_H.csv")
+        return {"N": n_results, "H": h_results}
+
+    # ==================================================================
+    # Experiment 3 — ablation (full CSA-SFL vs two 1-component-removed variants)
+    # ==================================================================
+
+    def run_exp3(self):
+        noniid = {"data.partition": "dirichlet", "data.dirichlet_alpha": NONIID_DELTA}
+        results = {}
+        results["CSA-SFL (full)"] = self._run_csasfl(
+            run_name="exp3/csasfl_full", label="CSA-SFL (full)",
+            clustering="gradient", aggregation="weighted", extra_overrides=noniid)
+        results["w/o weighted agg"] = self._run_csasfl(
+            run_name="exp3/csasfl_uniformagg", label="w/o weighted agg (uniform)",
+            clustering="gradient", aggregation="uniform", extra_overrides=noniid)
+        results["w/o grad clustering"] = self._run_csasfl(
+            run_name="exp3/csasfl_randomcluster", label="w/o grad clustering (random)",
+            clustering="random", aggregation="weighted", extra_overrides=noniid)
+
+        self._sweep_plot(results, "simulated_time_s", "exp3/ablation_acc_vs_time",
+                         "Ablation: test accuracy vs training time", "Simulated time (s)")
+        self._write_sweep_csv(results, "exp3/ablation.csv")
+        return results
+
+    # ------------------------------------------------------------------
+    # Sweep/ablation plotting + CSV (multi-line, one line per config)
+    # ------------------------------------------------------------------
+
+    def _sweep_plot(self, results, xcol, out_name, title, xlabel, xscale=1.0):
+        """One accuracy line per config (uses each run's unified df -> canonical cols)."""
+        fig, ax = plt.subplots(figsize=(7.5, 5))
+        for label, r in results.items():
+            df = reporting.normalize_df(r.df).dropna(subset=["test_accuracy"])
+            if df.empty or xcol not in df.columns:
+                continue
+            ax.plot(df[xcol] / xscale, df["test_accuracy"], marker="o", markersize=3,
+                    linewidth=1.4, label=label)
+        ax.set_xlabel(xlabel); ax.set_ylabel("Test accuracy")
+        ax.set_title(title); ax.grid(True, alpha=0.3); ax.legend()
+        path = os.path.join(self.output_dir, f"{out_name}.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
+        print(f"[ParallelSFLComparison] Saved {path}")
+
+    def _write_sweep_csv(self, results, out_name):
+        """Long-format CSV: every config's canonical rows stacked + a 'config' column."""
+        frames = []
+        for label, r in results.items():
+            d = reporting.normalize_df(r.df)
+            d.insert(0, "config", label)
+            frames.append(d)
+        path = os.path.join(self.output_dir, out_name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.concat(frames, ignore_index=True).to_csv(path, index=False)
+        print(f"[ParallelSFLComparison] Saved {path}")
+
     # ------------------------------------------------------------------
     # FL full-model traffic column (its CSV has time+energy but no traffic)
     # ------------------------------------------------------------------
@@ -534,4 +772,22 @@ class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
 
 
 if __name__ == "__main__":
-    ParallelSFLComparison(base_config=BASE_CONFIG, output_dir=OUTPUT_DIR).run()
+    import argparse
+    p = argparse.ArgumentParser(description="CSA-SFL experiments (comparison / N-H sweep / ablation).")
+    p.add_argument("--exp", nargs="+", type=int, default=[1], choices=[1, 2, 3],
+                   help="which experiment(s) to run: 1=comparison, 2=N/H sweep, 3=ablation. e.g. --exp 1 2 3")
+    p.add_argument("--dataset", default="mnist", choices=list(DATASET_CFG),
+                   help="mnist (MnistCNN) or cifar10 (ResNet-18 @ 64).")
+    args = p.parse_args()
+
+    _configure_dataset(args.dataset)
+    exp = ParallelSFLComparison(base_config=BASE_CONFIG, output_dir=OUTPUT_DIR)
+    if 1 in args.exp:
+        print("\n########## EXPERIMENT 1 — comparison ##########")
+        exp.run_exp1()
+    if 2 in args.exp:
+        print("\n########## EXPERIMENT 2 — N & H sweep ##########")
+        exp.run_exp2()
+    if 3 in args.exp:
+        print("\n########## EXPERIMENT 3 — ablation ##########")
+        exp.run_exp3()
