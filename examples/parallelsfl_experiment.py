@@ -3,7 +3,7 @@ examples/parallelsfl_experiment.py: CSA-SFL and baselines on MNIST/MnistCNN
 (or CIFAR-10/ResNet-18) under DATA and SYSTEM heterogeneity. THREE experiments,
 selected with `--exp` (any subset) and `--dataset {mnist|cifar10}`:
 
-  1  Comparison: CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL (Dirichlet 0.3).
+  1  Comparison: CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL (Dirichlet alpha).
   2  N & H sweep for CSA-SFL under non-IID delta=0.1 (outputs -> exp2/):
        accuracy-vs-time (varying N), accuracy-vs-comm-overhead (varying N),
        accuracy-vs-time (varying H).
@@ -98,16 +98,31 @@ CUT_LAYER   = 6              # MnistCNN features/classifier boundary (10 layers)
 IMAGE_SIZE  = None           # None = native (mnist 28); 64 for the cifar10/resnet option
 INPUT_SHAPE = (2, 1, 28, 28) # a sample batch shape, for measuring model MACs (Phi)
 
-# dataset -> (model, cut_layer, image_size, input_shape). CSA-SFL/CIFAR uses a
-# light ResNet-18 @ 64 (cut at a residual boundary) so the Exp-2 sweep is tractable.
+# Per-dataset configuration (model + everything that should differ between the
+# easy MNIST run and the harder CIFAR-10 run). CIFAR-10 uses a light ResNet-18
+# @ 64 (cut at a residual boundary) so the Exp-2 sweep stays tractable, MORE
+# global rounds (slower convergence), a higher LR (ResNet vs the tiny MnistCNN),
+# LOWER accuracy targets (non-IID split ResNet tops out well below MNIST), and a
+# wider / coarser H sweep (its round budget T = MAX_GLOBAL_ROUNDS x N is larger).
+# Outputs go to outputs/parallelsfl_experiment/<dataset>/ so the two never clash.
 DATASET_CFG = {
-    "mnist":   ("mnist_cnn", 6, None, (2, 1, 28, 28)),
-    "cifar10": ("resnet18",  5, 64,   (2, 3, 64, 64)),
+    "mnist": {
+        "model": "mnist_cnn", "cut_layer": 6, "image_size": None, "input_shape": (2, 1, 28, 28),
+        "max_rounds": 150, "learning_rate": 0.01,
+        "acc_targets": [0.80, 0.85, 0.90, 0.95],
+        "recluster_h": 20, "h_sweep": [5, 10, 20, 30, 40, 50],
+    },
+    "cifar10": {
+        "model": "resnet18", "cut_layer": 5, "image_size": 64, "input_shape": (2, 3, 64, 64),
+        "max_rounds": 300, "learning_rate": 0.05,
+        "acc_targets": [0.30, 0.40, 0.50, 0.60],
+        "recluster_h": 50, "h_sweep": [10, 25, 50, 100, 150, 200],
+    },
 }
 
 # ---- federation / heterogeneity ----
-NUM_CLIENTS      = 50
-DIRICHLET_ALPHA  = 0.3   # data non-IID level (smaller = more heterogeneous)
+NUM_CLIENTS      = 100
+DIRICHLET_ALPHA  = 0.1   # data non-IID level (smaller = more heterogeneous)
 
 # ---- local work (fair: baselines H == ParallelSFL tau_max) ----
 LOCAL_ITERS   = 5        # H mini-batch steps / round (baselines) = ParallelSFL tau_max
@@ -221,27 +236,42 @@ SHARED_OVERRIDES = {
 }
 
 
-def _configure_dataset(name: str) -> None:
-    """Switch the whole experiment between datasets (mnist | cifar10) — updates
-    the model / cut layer / input size and re-measures the per-sample MACs (Phi),
-    patching SHARED_OVERRIDES in place. Call once before running any experiment."""
+def _configure_dataset(name: str) -> str:
+    """Switch the whole experiment between datasets (mnist | cifar10) — sets the
+    model, cut layer, input size, learning rate, round budget, accuracy targets,
+    and the H sweep from DATASET_CFG, re-measures the per-sample MACs (Phi), and
+    patches SHARED_OVERRIDES in place. Returns the dataset-specific output dir.
+    Call once before running any experiment."""
     global DATASET, MODEL, CUT_LAYER, IMAGE_SIZE, INPUT_SHAPE, PHI_FLOPS_PER_SAMPLE
+    global MAX_GLOBAL_ROUNDS, LEARNING_RATE, ACC_TARGETS, RECLUSTER_H, H_SWEEP
     if name not in DATASET_CFG:
         raise ValueError(f"--dataset must be one of {list(DATASET_CFG)}, got {name!r}")
-    MODEL, CUT_LAYER, IMAGE_SIZE, INPUT_SHAPE = DATASET_CFG[name]
+    c = DATASET_CFG[name]
     DATASET = name
+    MODEL, CUT_LAYER, IMAGE_SIZE, INPUT_SHAPE = c["model"], c["cut_layer"], c["image_size"], c["input_shape"]
+    MAX_GLOBAL_ROUNDS = c["max_rounds"]
+    LEARNING_RATE     = c["learning_rate"]
+    ACC_TARGETS       = list(c["acc_targets"])
+    RECLUSTER_H       = c["recluster_h"]
+    H_SWEEP           = list(c["h_sweep"])
     PHI_FLOPS_PER_SAMPLE = _phi_flops_per_sample()
     SHARED_OVERRIDES.update({
         "data.dataset":                 DATASET,
         "data.model_name":              MODEL,
         "learning.cut_layer":           CUT_LAYER,
+        "learning.learning_rate":       LEARNING_RATE,
         "system.cycles_per_sample_min": PHI_FLOPS_PER_SAMPLE,
         "system.cycles_per_sample_max": PHI_FLOPS_PER_SAMPLE,
     })
     if IMAGE_SIZE is not None:
         SHARED_OVERRIDES["data.image_size"] = IMAGE_SIZE
+    else:
+        SHARED_OVERRIDES.pop("data.image_size", None)   # native size for mnist
+    out_dir = os.path.join(OUTPUT_DIR, name)            # separate folder per dataset
     print(f"[dataset] {DATASET} / {MODEL} @ cut={CUT_LAYER}, image_size={IMAGE_SIZE}, "
-          f"Phi(MACs)={PHI_FLOPS_PER_SAMPLE:.3e}")
+          f"Phi(MACs)={PHI_FLOPS_PER_SAMPLE:.3e} | rounds={MAX_GLOBAL_ROUNDS}, lr={LEARNING_RATE}, "
+          f"targets={ACC_TARGETS}, H_sweep={H_SWEEP} -> {out_dir}")
+    return out_dir
 
 
 class ParallelSFLComparison(SplitExperiment, AsyncExperiment):
@@ -780,8 +810,8 @@ if __name__ == "__main__":
                    help="mnist (MnistCNN) or cifar10 (ResNet-18 @ 64).")
     args = p.parse_args()
 
-    _configure_dataset(args.dataset)
-    exp = ParallelSFLComparison(base_config=BASE_CONFIG, output_dir=OUTPUT_DIR)
+    out_dir = _configure_dataset(args.dataset)   # sets per-dataset params + returns its folder
+    exp = ParallelSFLComparison(base_config=BASE_CONFIG, output_dir=out_dir)
     if 1 in args.exp:
         print("\n########## EXPERIMENT 1 — comparison ##########")
         exp.run_exp1()
