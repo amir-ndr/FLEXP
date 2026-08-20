@@ -125,6 +125,7 @@ def write_standard_outputs(df: pd.DataFrame, label: str, out_dir: str, prefix: s
     out_dir. Returns the normalized DataFrame.
     """
     os.makedirs(out_dir, exist_ok=True)
+    prefix = os.path.basename(prefix)   # never let a slashed prefix write into a missing subdir
     ndf = normalize_df(df)
     ndf.to_csv(os.path.join(out_dir, f"{prefix}_unified.csv"), index=False)
     standard_plots(ndf, label, out_dir, prefix)

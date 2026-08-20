@@ -323,8 +323,11 @@ class Experiment:
         object; its `.df` is kept as-is so downstream code sees the raw columns).
         """
         from flsim.experiments.reporting import write_standard_outputs
+        # run_name may contain subdirectories (e.g. "exp2/csasfl_N5"): the run
+        # dir keeps the full path, but the FILE prefix is the basename so the
+        # unified CSV / plots land IN the run dir (not a doubled subfolder).
         run_dir = os.path.join(self.output_dir, run_name)
-        write_standard_outputs(result.df, result.label, run_dir, run_name)
+        write_standard_outputs(result.df, result.label, run_dir, os.path.basename(run_name))
         return result
 
     # ------------------------------------------------------------------
