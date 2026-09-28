@@ -1,31 +1,30 @@
 #!/bin/bash
 # slurm/run_airsfl.slurm — submit examples/AirSFL/run_airsfl.py to a GPU node.
 #
-# AirSFL vs baselines (CIFAR-10, ResNet-18 GroupNorm). Environment variables:
-#   EXP        lr | main | snr | nr | nsweep                     (default lr)
-#   PARTITION  "iid", "dirichlet" or "iid dirichlet"             (default both)
-#   SEEDS      paired seeds, e.g. "11 22 33"                     (default 11)
-#   METHODS    optional subset, e.g. "airsfl" (to split a sweep over parallel jobs)
-# Experiments:
-#   lr      LR calibration on the noiseless reference -> RUN THIS FIRST, check
-#           examples/AirSFL/results/lr/chosen_lr.json, then submit the rest
-#   main    5 methods x {IID, Dirichlet-0.5} at 20 dB         (acc vs uplink time, bars)
-#   snr     3 analog methods x {-30,-20,-10,0,10} dB           (accuracy vs SNR)
-#   nr / nsweep  optional (antenna sweep / client-count sweep)
+# AirSFL vs baselines (CIFAR-10, ResNet-18 GroupNorm; two-server draft + roadmap).
+# Environment variables (all optional):
+#   EXP        one or more of: bench lr main snr nsweep cuts tau nr     (default "bench")
+#   PARTITION  "iid", "dirichlet" or "iid dirichlet"                      (default both)
+#   SEEDS      paired seeds, e.g. "11 22 33 44 55"                        (default 11)
+#   METHODS    subset, e.g. "airsfl" (to split a sweep over parallel jobs)
+#   EPOCHS     global-epoch equivalents per run                           (default 100)
+#   LR_EPOCHS  budget of each LR-calibration run                          (default 20)
+#   SNRS       SNR list for EXP=snr, e.g. "-20 -10 0 10 30"               (default "0 10 30")
+#   RESULTS    results root, e.g. examples/AirSFL/results_quick           (default .../results)
+#   TARGETS    validation targets for the figures, e.g. "0.6 0.7"         (default: 95% rule)
+#   EXTRA      any other run_airsfl.py flags, e.g. "--augment" or "--vmap-chunk 10"
+# Every run is resumable (finished CSVs are skipped): a job that hits --time can be
+# resubmitted with the same variables. Figures/tables are rebuilt at the end of each job.
 #
-# Usage:
-#   sbatch --export=ALL,EXP="lr" slurm/run_airsfl.slurm
-#   # after checking chosen_lr.json:
+# QUICK GPU TEST (1 seed, 50 epochs, separate folder):
+#   Q=examples/AirSFL/results_quick
+#   J=$(sbatch --parsable --export=ALL,EXP="bench lr",RESULTS=$Q slurm/run_airsfl.slurm)
 #   for P in iid dirichlet; do
-#     sbatch --export=ALL,EXP="main",PARTITION="$P",SEEDS="11 22 33" slurm/run_airsfl.slurm
-#     for M in airsfl sun_fdma_aircomp aircomp_fl; do
-#       sbatch --export=ALL,EXP="snr",PARTITION="$P",METHODS="$M",SEEDS="11 22 33" slurm/run_airsfl.slurm
-#     done
+#     sbatch --dependency=afterok:$J --export=ALL,EXP="main",PARTITION=$P,EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
 #   done
+#   sbatch --dependency=afterok:$J --export=ALL,EXP="snr",PARTITION=iid,SNRS="-20 -10 0 10 30",EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
 #
-# Every run is resumable: finished runs are skipped, so a job that hits --time
-# can simply be resubmitted with the same variables. Figures/tables are rebuilt
-# at the end of each job (examples/AirSFL/results/figures, .../tables).
+# FULL RUNS (5 seeds, 100 epochs) -- after the quick test is checked; see README.
 #
 # EDIT the two sections marked below for your cluster before submitting:
 #   1. #SBATCH directives (partition / gres / account names differ per site)
@@ -104,15 +103,21 @@ sys.exit(0 if ok else 1)
 # ---------------------------------------------------------------------------
 # 3. Run the experiment
 # ---------------------------------------------------------------------------
-EXP="${EXP:-lr}"
+EXP="${EXP:-bench}"
 PARTITION="${PARTITION:-iid dirichlet}"
 SEEDS="${SEEDS:-11}"
 ARGS=(--exp ${EXP} --partition ${PARTITION} --seeds ${SEEDS})
-if [[ -n "${METHODS:-}" ]]; then
-    ARGS+=(--methods ${METHODS})
-fi
+[[ -n "${METHODS:-}" ]]   && ARGS+=(--methods ${METHODS})
+[[ -n "${EPOCHS:-}" ]]    && ARGS+=(--epochs ${EPOCHS})
+[[ -n "${LR_EPOCHS:-}" ]] && ARGS+=(--lr-epochs ${LR_EPOCHS})
+[[ -n "${SNRS:-}" ]]      && ARGS+=(--snrs ${SNRS})
+[[ -n "${RESULTS:-}" ]]   && ARGS+=(--results ${RESULTS})
+[[ -n "${EXTRA:-}" ]]     && ARGS+=(${EXTRA})
+PLOT_ARGS=()
+[[ -n "${RESULTS:-}" ]]   && PLOT_ARGS+=(--results ${RESULTS})
+[[ -n "${TARGETS:-}" ]]   && PLOT_ARGS+=(--targets ${TARGETS})
 echo "AirSFL: ${ARGS[*]}"
 python examples/AirSFL/run_airsfl.py "${ARGS[@]}"
-python examples/AirSFL/plots.py
+python examples/AirSFL/plots.py "${PLOT_ARGS[@]}"
 
 echo "Job finished at $(date)"

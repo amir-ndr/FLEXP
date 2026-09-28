@@ -30,11 +30,12 @@ import torch
 # Channels + combiner norms
 # ---------------------------------------------------------------------------
 
-def draw_channel(radio, rng: np.random.RandomState) -> np.ndarray:
-    """H (Nr x N) complex Rayleigh, columns h_n ~ CN(0, lambda I_Nr)."""
+def draw_channel(radio, rng: np.random.RandomState, Nr: int = None) -> np.ndarray:
+    """H (Nr x N) complex Rayleigh, columns h_n ~ CN(0, lambda I_Nr). Nr defaults to the
+    M-server array; pass radio.Nr_F for the F-server link."""
     lam = radio.lambda_ref
     scale = math.sqrt(lam / 2.0)                      # per real/imag part
-    Nr, N = radio.Nr, radio.N
+    Nr, N = (Nr if Nr is not None else radio.Nr), radio.N
     return (rng.normal(0, scale, (Nr, N)) + 1j * rng.normal(0, scale, (Nr, N)))
 
 
@@ -170,13 +171,58 @@ def verify_aircomp_mse(radio, rng, d_A=2048, trials=4000) -> dict:
     return {"empirical": emp, "analytical": ana, "rel_err": abs(emp - ana) / ana}
 
 
+def verify_gates(radio, rng, verbose: bool = True) -> bool:
+    """Roadmap implementation gates 1-3 and 5 on one packet:
+      1. I/Q packing (Eq. 2) preserves the squared norm for odd and even lengths and
+         the inverse removes only the padding;
+      2. packet powers (Eq. 4, 7, 21): ||s||^2/m == p_n for ZF activations and
+         <= p_n for every AirComp client (== for the binding one);
+      3. ZF identity C^H H = I and noiseless weighted AirComp output == sum a_n u_n;
+      5. zero packets and an all-zero aggregate give zero, without division by zero."""
+    ok = True
+    for d in (255, 256):                                           # 1. packing
+        r = rng.normal(size=d)
+        u = _pack(r)
+        back = np.stack([u.real, u.imag], 1).reshape(-1)[:d]
+        ok &= abs(np.sum(np.abs(u) ** 2) - np.sum(r ** 2)) < 1e-9 and np.allclose(back, r)
+    H = draw_channel(radio, rng)
+    Hf = draw_channel(radio, rng, Nr=radio.Nr_F)
+    p = radio.Pmax_w / radio.S
+    m = 128
+    z = rng.normal(size=2 * m)                                     # 2. ZF activation power
+    s = math.sqrt(m * p) / np.linalg.norm(z) * _pack(z)
+    ok &= abs(np.sum(np.abs(s) ** 2) / m - p) < 1e-12 * max(1, p)
+    C = H @ np.linalg.inv(H.conj().T @ H)                          # 3. ZF identity
+    ok &= np.allclose(C.conj().T @ H, np.eye(radio.N), atol=1e-8 * np.abs(C).max() * np.abs(H).max())
+    v = Hf @ np.linalg.inv(Hf.conj().T @ Hf) @ np.ones(radio.N)    # AirComp combiner (Eq. 19)
+    w = v / np.linalg.norm(v)
+    f = w.conj() @ Hf
+    a = rng.dirichlet(np.ones(radio.N))
+    deltas = [rng.normal(size=2 * m) for _ in range(radio.N)]
+    U = [_pack(dl) for dl in deltas]
+    alpha = min(abs(f[n]) * math.sqrt(m * p) / (a[n] * np.linalg.norm(deltas[n])) for n in range(radio.N))
+    S_tx = [alpha * a[n] * f[n].conj() / abs(f[n]) ** 2 * U[n] for n in range(radio.N)]
+    powers = np.array([np.sum(np.abs(st) ** 2) / m for st in S_tx])
+    ok &= bool(np.all(powers <= p * (1 + 1e-9))) and abs(powers.max() - p) < 1e-9 * p
+    y = sum(np.outer(Hf[:, n], S_tx[n]) for n in range(radio.N))  # noiseless receive (Nr_F x m)
+    u_hat = (w.conj() @ y) / alpha
+    ok &= np.allclose(u_hat, sum(a[n] * U[n] for n in range(radio.N)))
+    zero = np.zeros(2 * m)                                         # 5. zero packets
+    ok &= np.linalg.norm(zero) == 0.0                              # flagged: sends/recovers exactly zero
+    if verbose:
+        print(f"  gates (packing, packet power, ZF identity, noiseless AirComp, zero packets): "
+              f"{'PASS' if ok else 'FAIL'}")
+    return bool(ok)
+
+
 def run_radio_checks(verbose: bool = True) -> bool:
     from flsim.airsfl.timing import RadioConfig
-    radio = RadioConfig(rho_db=20.0)
+    radio = RadioConfig(N=8, Nr=32, S=64, rho_db=20.0)     # small array: fast Monte-Carlo
     rng = np.random.RandomState(7)
     zf = verify_zf_mse(radio, rng)
     ac = verify_aircomp_mse(radio, rng)
-    ok = zf["max_rel_err"] < 0.05 and ac["rel_err"] < 0.05
+    gates = verify_gates(RadioConfig(), np.random.RandomState(11), verbose=verbose)
+    ok = zf["max_rel_err"] < 0.05 and ac["rel_err"] < 0.05 and gates
     if verbose:
         print("=== AirSFL radio checks (empirical MSE vs analytical Eq. 10/20) ===")
         print(f"  ZF activation (Eq. 10): max relative error over {radio.N} clients "

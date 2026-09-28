@@ -66,11 +66,22 @@ class CifarResNet18GN(nn.Module):
     def stages(self):
         return [self.layer1, self.layer2, self.layer3, self.layer4]
 
-    def forward(self, x):
+    def forward(self, x, cut=None, perturb=None):
+        """Full forward. If `perturb` is given, it is applied to the activation at the
+        end of residual stage `cut` (used to inject the ZF reconstruction error)."""
         x = self.stem(x)
-        for s in self.stages():
+        for i, s in enumerate(self.stages(), start=1):
             x = s(x)
+            if perturb is not None and i == cut:
+                x = perturb(x)
         return self.fc(self.pool(x).flatten(1))
+
+    def no_inplace(self):
+        """Disable in-place ReLU (identical numerics; required by torch.func transforms)."""
+        for mod in self.modules():
+            if isinstance(mod, nn.ReLU):
+                mod.inplace = False
+        return self
 
 
 def split_at_stage(model: CifarResNet18GN, stage: int):

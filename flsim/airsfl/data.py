@@ -4,7 +4,7 @@ flsim/airsfl/data.py: CIFAR-10 pipeline for the AirSFL study (roadmap Sec. 4).
   * Fixed stratified 45,000 / 5,000 train/validation split of the official
     training set (seed 2026); the official 10,000 test images are untouched.
   * Normalization statistics computed from the 45k TRAINING split only.
-  * Train-only augmentation: random crop (zero padding 4) + horizontal flip.
+  * Optional train-only augmentation: random crop (zero padding 4) + horizontal flip.
   * Partition: IID or label-Dirichlet(alpha), minimum `min_per_client` examples
     per client (redraw if violated); aggregation weights a_n = D_n / sum D.
 
@@ -24,15 +24,38 @@ import torch
 _DEFAULT_ROOT = os.path.expanduser("~/.flsim/data")
 
 
+def _read_cifar_batches(root: str):
+    """Read the standard python-pickle CIFAR-10 files (same arrays torchvision builds)."""
+    import pickle
+    base = os.path.join(root, "cifar-10-batches-py")
+
+    def load(names):
+        xs, ys = [], []
+        for nm in names:
+            with open(os.path.join(base, nm), "rb") as f:
+                d = pickle.load(f, encoding="latin1")
+            xs.append(np.asarray(d["data"], dtype=np.uint8).reshape(-1, 3, 32, 32))
+            ys.extend(d["labels"])
+        return np.concatenate(xs), ys
+    xtr, ytr = load([f"data_batch_{i}" for i in range(1, 6)])
+    xte, yte = load(["test_batch"])
+    return xtr, ytr, xte, yte
+
+
 def load_cifar10_tensors(root: str = _DEFAULT_ROOT, n_val: int = 5000, split_seed: int = 2026):
     """Returns dict of uint8 NCHW tensors + int64 labels and the train mean/std."""
-    import torchvision
-    tr = torchvision.datasets.CIFAR10(root=root, train=True, download=True)
-    te = torchvision.datasets.CIFAR10(root=root, train=False, download=True)
-    x_all = torch.from_numpy(tr.data).permute(0, 3, 1, 2).contiguous()      # uint8 N,3,32,32
-    y_all = torch.tensor(tr.targets, dtype=torch.long)
-    x_te = torch.from_numpy(te.data).permute(0, 3, 1, 2).contiguous()
-    y_te = torch.tensor(te.targets, dtype=torch.long)
+    try:
+        import torchvision
+        tr = torchvision.datasets.CIFAR10(root=root, train=True, download=True)
+        te = torchvision.datasets.CIFAR10(root=root, train=False, download=True)
+        xtr, ytr = tr.data.transpose(0, 3, 1, 2), tr.targets        # HWC -> CHW
+        xte, yte = te.data.transpose(0, 3, 1, 2), te.targets
+    except ImportError:                                              # no torchvision: read the pickles
+        xtr, ytr, xte, yte = _read_cifar_batches(root)
+    x_all = torch.from_numpy(np.ascontiguousarray(xtr))              # uint8 N,3,32,32
+    y_all = torch.tensor(ytr, dtype=torch.long)
+    x_te = torch.from_numpy(np.ascontiguousarray(xte))
+    y_te = torch.tensor(yte, dtype=torch.long)
 
     # stratified split: n_val/10 validation images per class
     rng = np.random.RandomState(split_seed)
@@ -55,10 +78,14 @@ def load_cifar10_tensors(root: str = _DEFAULT_ROOT, n_val: int = 5000, split_see
             "x_test": x_te, "y_test": y_te, "mean": mean, "std": std}
 
 
+PARTITION_REDRAWS = {}   # (scheme, N, alpha, seed) -> number of Dirichlet redraws (disclosed)
+
+
 def partition(labels: np.ndarray, num_clients: int, scheme: str = "iid", alpha: float = 0.5,
-              min_per_client: int = 100, seed: int = 0, max_tries: int = 200) -> list:
+              min_per_client: int = 16, seed: int = 0, max_tries: int = 200) -> list:
     """IID or label-Dirichlet(alpha) partition; redraw until every client has at
-    least min_per_client examples (roadmap Sec. 4)."""
+    least min_per_client examples (roadmap: at least one minibatch per client).
+    The number of redraws is stored in PARTITION_REDRAWS for disclosure."""
     rng = np.random.RandomState(seed)
     n = len(labels)
     if scheme == "iid":
@@ -67,7 +94,8 @@ def partition(labels: np.ndarray, num_clients: int, scheme: str = "iid", alpha: 
     if scheme != "dirichlet":
         raise ValueError(f"scheme must be 'iid' or 'dirichlet', got {scheme!r}")
     classes = np.unique(labels)
-    for _ in range(max_tries):
+    for tries in range(max_tries):
+        PARTITION_REDRAWS[(scheme, num_clients, alpha, seed)] = tries
         parts = [[] for _ in range(num_clients)]
         for c in classes:
             idx = np.where(labels == c)[0]
@@ -119,16 +147,19 @@ class ClientStream:
         return x, self.y[idx.to(self.device)]
 
     def _crop_flip(self, x: torch.Tensor) -> torch.Tensor:
+        """Random 32x32 crop of the zero-padded (4) image + horizontal flip, one gather."""
         B = x.shape[0]
         padded = torch.nn.functional.pad(x, (4, 4, 4, 4))                 # zero pad 4
         offs = torch.randint(0, 9, (B, 2), generator=self.gen)            # crop offsets 0..8
         flips = torch.rand(B, generator=self.gen) < 0.5
-        out = torch.empty_like(x)
-        for i in range(B):
-            r, c = int(offs[i, 0]), int(offs[i, 1])
-            img = padded[i, :, r:r + 32, c:c + 32]
-            out[i] = torch.flip(img, dims=[2]) if bool(flips[i]) else img
-        return out
+        ar = torch.arange(32)
+        rows = offs[:, 0:1] + ar                                          # B x 32
+        cols = offs[:, 1:2] + ar
+        cols = torch.where(flips[:, None], cols.flip(1), cols)            # flip = reversed columns
+        dev = x.device
+        bi = torch.arange(B, device=dev)[:, None, None, None]
+        ci = torch.arange(x.shape[1], device=dev)[None, :, None, None]
+        return padded[bi, ci, rows.to(dev)[:, None, :, None], cols.to(dev)[:, None, None, :]]
 
 
 def make_eval_tensors(x_u8: torch.Tensor, mean, std, device):
