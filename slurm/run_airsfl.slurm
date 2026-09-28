@@ -1,27 +1,31 @@
 #!/bin/bash
 # slurm/run_airsfl.slurm — submit examples/AirSFL/run_airsfl.py to a GPU node.
 #
-# AirSFL vs baselines (CIFAR-10, ResNet-18 GroupNorm). Pick the experiment with
-# EXP and the data partition(s) with PARTITION (default: both "iid dirichlet"):
-#   lr      LR calibration on the noiseless reference -> RUN THIS FIRST
-#   main    5 methods x {IID, Dirichlet-0.5} at 20 dB
-#   snr     analog methods x {0,10,30} dB
-#   nr      AirSFL x Nr {32,48,64,128} at 10 dB (+ digital SFL-V1 reference)
-#   nsweep  5 methods x N {20,40} at 20 dB (N=30 reused from main)
+# AirSFL vs baselines (CIFAR-10, ResNet-18 GroupNorm). Environment variables:
+#   EXP        lr | main | snr | nr | nsweep                     (default lr)
+#   PARTITION  "iid", "dirichlet" or "iid dirichlet"             (default both)
+#   SEEDS      paired seeds, e.g. "11 22 33"                     (default 11)
+#   METHODS    optional subset, e.g. "airsfl" (to split a sweep over parallel jobs)
+# Experiments:
+#   lr      LR calibration on the noiseless reference -> RUN THIS FIRST, check
+#           examples/AirSFL/results/lr/chosen_lr.json, then submit the rest
+#   main    5 methods x {IID, Dirichlet-0.5} at 20 dB         (acc vs uplink time, bars)
+#   snr     3 analog methods x {-30,-20,-10,0,10} dB           (accuracy vs SNR)
+#   nr / nsweep  optional (antenna sweep / client-count sweep)
 #
-# Usage (submit lr first; the rest wait for it via --dependency):
-#   LR=$(sbatch --parsable --export=ALL,EXP="lr" slurm/run_airsfl.slurm)
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="main",PARTITION="iid"         slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="main",PARTITION="dirichlet"   slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="snr",PARTITION="iid"          slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="snr",PARTITION="dirichlet"    slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="nr"                           slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="nsweep",PARTITION="iid"       slurm/run_airsfl.slurm
-#   sbatch --dependency=afterok:$LR --export=ALL,EXP="nsweep",PARTITION="dirichlet" slurm/run_airsfl.slurm
+# Usage:
+#   sbatch --export=ALL,EXP="lr" slurm/run_airsfl.slurm
+#   # after checking chosen_lr.json:
+#   for P in iid dirichlet; do
+#     sbatch --export=ALL,EXP="main",PARTITION="$P",SEEDS="11 22 33" slurm/run_airsfl.slurm
+#     for M in airsfl sun_fdma_aircomp aircomp_fl; do
+#       sbatch --export=ALL,EXP="snr",PARTITION="$P",METHODS="$M",SEEDS="11 22 33" slurm/run_airsfl.slurm
+#     done
+#   done
 #
 # Every run is resumable: finished runs are skipped, so a job that hits --time
-# can simply be resubmitted. Figures/tables are rebuilt at the end of each job
-# (examples/AirSFL/results/figures, .../tables).
+# can simply be resubmitted with the same variables. Figures/tables are rebuilt
+# at the end of each job (examples/AirSFL/results/figures, .../tables).
 #
 # EDIT the two sections marked below for your cluster before submitting:
 #   1. #SBATCH directives (partition / gres / account names differ per site)
@@ -102,8 +106,13 @@ sys.exit(0 if ok else 1)
 # ---------------------------------------------------------------------------
 EXP="${EXP:-lr}"
 PARTITION="${PARTITION:-iid dirichlet}"
-echo "AirSFL: --exp ${EXP} --partition ${PARTITION}"
-python examples/AirSFL/run_airsfl.py --exp ${EXP} --partition ${PARTITION}
+SEEDS="${SEEDS:-11}"
+ARGS=(--exp ${EXP} --partition ${PARTITION} --seeds ${SEEDS})
+if [[ -n "${METHODS:-}" ]]; then
+    ARGS+=(--methods ${METHODS})
+fi
+echo "AirSFL: ${ARGS[*]}"
+python examples/AirSFL/run_airsfl.py "${ARGS[@]}"
 python examples/AirSFL/plots.py
 
 echo "Job finished at $(date)"

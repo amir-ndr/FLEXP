@@ -85,6 +85,7 @@ class RunConfig:
     lr: float = 0.03
     lr_decay_fracs: tuple = (0.5, 0.75)
     lr_decay: float = 0.1
+    warmup_rounds: int = 0          # linear LR warmup (same schedule for every method)
     rounds: int = 100
     eval_every: int = 20
     noiseless: bool = False         # exact transport (analog noise switched off)
@@ -314,16 +315,18 @@ class AirSFLSimulator:
 
     def _lr_at(self, r: int) -> float:
         drops = sum(r >= int(f * self.cfg.rounds) for f in self.cfg.lr_decay_fracs)
-        return self.cfg.lr * (self.cfg.lr_decay ** drops)
+        warm = min(1.0, (r + 1) / self.cfg.warmup_rounds) if self.cfg.warmup_rounds > 0 else 1.0
+        return self.cfg.lr * warm * (self.cfg.lr_decay ** drops)
 
-    def _record(self, r: int, lr: float, train_loss: float, act_nsr: float, agg_nsr: float, t0: float):
+    def _record(self, r: int, lr: float, train_loss: float, act_nsr: float, agg_nsr: float, t0: float,
+                diverged: bool = False):
         rec = {
             "method": self.method, "label": METHOD_LABELS[self.method],
             "stage": self.stage if self.stage is not None else 0,
             "rho_db": self.radio.rho_db, "N": self.N, "Nr": self.radio.Nr, "S": self.radio.S,
-            "seed": self.cfg.seed, "noiseless": self.cfg.noiseless,
+            "seed": self.cfg.seed, "noiseless": self.cfg.noiseless, "base_lr": self.cfg.lr,
             "round": r, "epoch_equiv": r * self.N * self.cfg.tau * self.cfg.batch_size / self.n_train,
-            "lr": lr, "train_loss": train_loss,
+            "lr": lr, "train_loss": train_loss, "diverged": diverged,
             "uplink_s": r * self.ul_s, "downlink_s": r * self.dl_s,
             "twoway_s": r * (self.ul_s + self.dl_s), "source_mb": r * self.mb,
             "act_nsr_db": 10 * math.log10(act_nsr) if act_nsr > 0 else float("nan"),
@@ -358,6 +361,12 @@ class AirSFLSimulator:
                     x, y = self.streams[n].next_batch()
                     loss_sum += self._local_step(n, x, y, lr, E[:, :, n] if E is not None else None)
             self._aggregate()
+            if not bool(torch.isfinite(loss_sum)):
+                # training blew up (e.g. very low SNR): record the failure and stop; the
+                # run counts as "target not reached" and is not retried on resume
+                self._record(r + 1, lr, float("nan"), 0.0, 0.0, t0, diverged=True)
+                self.log(f"  rnd {r+1:5d} DIVERGED (non-finite training loss) -> stopping this run")
+                break
             if (r + 1) % cfg.eval_every == 0 or r + 1 == cfg.rounds:
                 act = float(self._act_noise_e / self._act_sig_e) if float(self._act_sig_e) > 0 else 0.0
                 agg = float(self._agg_noise_e / self._agg_sig_e) if float(self._agg_sig_e) > 0 else 0.0

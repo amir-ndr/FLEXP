@@ -13,9 +13,10 @@ rho=20 dB, cut after residual stage 3, tau=5, B=16, 50 global-epoch equivalents.
 
 Experiments (--exp, any subset; each run is resumable -- a finished CSV is skipped):
   lr      LR calibration on the noiseless reference (digital FedAvg), grid
-          {0.01, 0.03, 0.1} (roadmap Sec. 4); the chosen LR is then used by ALL methods.
+          {0.05, 0.1, 0.2, 0.4}, 10 epochs, 1-epoch warmup; the chosen LR is then used
+          by ALL methods (same schedule, same seeds).
   main    5 methods x {IID, Dirichlet(0.5)} at rho = 20 dB  -> accuracy vs uplink time.
-  snr     analog methods x rho in {0, 10, 30} dB (20 dB comes from `main`). Digital
+  snr     analog methods x rho in {-30, -20, -10, 0, 10} dB (20 dB comes from `main`). Digital
           methods' learning is SNR-independent (reliable transport): only their
           time axis changes, which plots.py recomputes analytically -- no re-run.
   nr      AirSFL x Nr in {32, 48, 64, 128} at rho = 10 dB (ZF conditioning / spatial load).
@@ -55,11 +56,17 @@ ANALOG_METHODS = ["airsfl", "sun_fdma_aircomp", "aircomp_fl"]
 
 ENV = dict(N=30, Nr=128, S=60, df_hz=15e3, Pmax_w=0.1, N0_dbm_per_hz=-167.0,
            eps_D=0.8, eps_U=0.8, eps_A=0.8, rho_db=20.0, Pdl_w=0.3)
-TRAIN = dict(stage=3, tau=5, batch_size=16, epochs=50, lr=0.03, dirichlet_alpha=0.5,
-             min_per_client=100, seed=11, evals_per_epoch=1)
-LR_GRID = [0.01, 0.03, 0.1]
+TRAIN = dict(stage=3, tau=5, batch_size=16, epochs=50, lr=0.1, dirichlet_alpha=0.5,
+             min_per_client=100, seed=11, evals_per_epoch=2, warmup_epochs=1.0)
+# v1 grid {0.01, 0.03, 0.1} left the model under-trained (57% final accuracy, accuracy
+# falling with N at fixed epochs): averaging N=30 clients' B=16 plain-SGD steps behaves
+# like one large-batch step, which tolerates a larger stepsize.
+LR_GRID = [0.05, 0.1, 0.2, 0.4]
 LR_CAL_EPOCHS = 10
-SNR_SWEEP = [0.0, 10.0, 30.0]
+# 20 dB comes from `main`. With Nr-N = 98 the ZF activation NSR is 1/(rho(Nr-N)):
+# -40 dB at 20 dB (no visible effect), -10 dB at -10 dB, 0 dB at -20 dB, +10 dB at -30 dB,
+# so the negative SNRs are where the airtime/accuracy trade-off becomes visible.
+SNR_SWEEP = [-30.0, -20.0, -10.0, 0.0, 10.0]
 NR_SWEEP = [32, 48, 64, 128]
 NR_SWEEP_SNR = 10.0
 N_SWEEP = [20, 40]      # client-count sweep at fixed Nr, S (N=30 comes from `main`);
@@ -118,14 +125,18 @@ def run_one(env: Env, exp: str, method: str, scheme: str, rho_db: float, Nr: int
     R = rounds_for(epochs, N, tau, B, env.n_train)
     if os.path.exists(csv_path):
         done = pd.read_csv(csv_path)
-        if len(done) and int(done["round"].max()) >= R:
+        # only CSVs written by the current schedule (they carry `base_lr`) count as done;
+        # older ones (no warmup, 1 eval/epoch) are re-run and overwritten
+        if len(done) and "base_lr" in done and (int(done["round"].max()) >= R or
+                                                done["diverged"].astype(bool).any()):
             print(f"[skip] {name} (complete)")
             return csv_path
     radio = RadioConfig(**{**ENV, "N": N, "Nr": Nr, "rho_db": rho_db})
     rounds_per_epoch = env.n_train / (N * tau * B)
     eval_every = max(1, int(round(rounds_per_epoch / TRAIN["evals_per_epoch"])))
+    warmup = int(round(rounds_per_epoch * TRAIN["warmup_epochs"]))
     cfg = RunConfig(method=method, stage=stage, tau=tau, batch_size=B, lr=lr, rounds=R,
-                    eval_every=eval_every, noiseless=noiseless, seed=seed)
+                    eval_every=eval_every, noiseless=noiseless, seed=seed, warmup_rounds=warmup)
     log_path = os.path.join(out_dir, name + ".log")
     with open(log_path, "w") as logf:
         def log(msg):
@@ -166,11 +177,17 @@ def exp_lr(env, args):
         p = run_one(env, "lr", "digital_fedavg", "iid", ENV["rho_db"], ENV["Nr"], lr,
                     args.lr_epochs, noiseless=True)
         df = pd.read_csv(p)
-        rows.append({"lr": lr, "final_val_acc": float(df["val_acc"].iloc[-1])})
-    best = max(rows, key=lambda r: r["final_val_acc"])
+        diverged = bool(df["diverged"].astype(bool).any())
+        acc = float("nan") if diverged else float(df["val_acc"].iloc[-1])
+        rows.append({"lr": lr, "final_val_acc": acc, "diverged": bool(diverged)})
+    ok = [r for r in rows if not math.isnan(r["final_val_acc"])]
+    best = max(ok, key=lambda r: r["final_val_acc"])
     with open(os.path.join(RESULTS, "lr", "chosen_lr.json"), "w") as f:
         json.dump({"lr": best["lr"], "grid": rows, "epochs": args.lr_epochs}, f, indent=2)
     print(f"[lr] grid {rows} -> chosen lr = {best['lr']}")
+    if best["lr"] in (min(LR_GRID), max(LR_GRID)):
+        print(f"[lr] WARNING: chosen lr {best['lr']} is at the edge of the grid {LR_GRID}; "
+              f"consider extending it before running the other experiments")
 
 
 def exp_main(env, args):
