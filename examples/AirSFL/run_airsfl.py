@@ -193,18 +193,31 @@ def exp_bench(env, args):
         return AirSFLSimulator(cfg, RadioConfig(**ENV), env.streams("iid", ENV["N"], TRAIN["batch_size"], 11),
                                env.weights("iid", ENV["N"], 11), small_eval, env.device, env.n_train,
                                log=lambda *a: None)
+    if env.device.type == "cuda":
+        free, total = torch.cuda.mem_get_info()
+        out["gpu_free_GB_at_start"] = free / 2 ** 30
+        if free < 0.9 * total:
+            print(f"[bench] WARNING: only {free / 2**30:.1f} of {total / 2**30:.1f} GB free -- another process "
+                  f"shares this GPU, so timings are pessimistic and vmap may run out of memory")
     saved = (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
     for fast in (False, True):                                 # deterministic vs fastest cuDNN algorithms
         torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = fast, not fast
         for engine in ("loop", "vmap"):
             key = engine + ("_fast_cudnn" if fast else "")
-            make(engine, 1).run()                              # warm-up (CUDA/cuDNN initialization)
-            sim = make(engine, rounds)
-            if env.device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-            t0 = time.time()
-            sim.run()
+            try:
+                make(engine, 1).run()                          # warm-up (CUDA/cuDNN initialization)
+                sim = make(engine, rounds)
+                if env.device.type == "cuda":
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
+                t0 = time.time()
+                sim.run()
+            except torch.cuda.OutOfMemoryError:
+                sim = None
+                torch.cuda.empty_cache()
+                out[key] = {"s_per_round": float("inf"), "error": "CUDA out of memory"}
+                print(f"[bench] {key:17s}: CUDA out of memory (skipped)")
+                continue
             if env.device.type == "cuda":
                 torch.cuda.synchronize()
             dt = (time.time() - t0) / rounds
@@ -216,9 +229,12 @@ def exp_bench(env, args):
             print(f"[bench] {key:17s}: {dt:.2f} s/round, peak GPU memory {mem:.2f} GB, "
                   f"~{out[key]['est_hours_per_100_epochs']:.2f} h per 100-epoch run")
     torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = saved
-    diff = vecs["vmap"] - vecs["loop"]
-    out["max_param_diff"] = float(diff.abs().max())
-    out["median_param_diff"] = float(diff.abs().median())
+    if "vmap" in vecs and "loop" in vecs:
+        diff = vecs["vmap"] - vecs["loop"]
+        out["max_param_diff"] = float(diff.abs().max())
+        out["median_param_diff"] = float(diff.abs().median())
+    else:
+        out["max_param_diff"] = out["median_param_diff"] = float("nan")
     best = min((k for k in out if isinstance(out[k], dict)), key=lambda k: out[k]["s_per_round"])
     out["fastest"] = best
     print(f"[bench] after {rounds} rounds: max|vmap - loop| = {out['max_param_diff']:.2e}, "
