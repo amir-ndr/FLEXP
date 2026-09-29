@@ -9,22 +9,26 @@
 #   METHODS    subset, e.g. "airsfl" (to split a sweep over parallel jobs)
 #   EPOCHS     global-epoch equivalents per run                           (default 100)
 #   LR_EPOCHS  budget of each LR-calibration run                          (default 20)
-#   SNRS       SNR list for EXP=snr, e.g. "-20 -10 0 10 30"               (default "0 10 30")
-#   RESULTS    results root, e.g. examples/AirSFL/results_quick           (default .../results)
-#   TARGETS    validation targets for the figures, e.g. "0.6 0.7"         (default: 95% rule)
-#   EXTRA      any other run_airsfl.py flags, e.g. "--augment" or "--vmap-chunk 10"
-# Every run is resumable (finished CSVs are skipped): a job that hits --time can be
-# resubmitted with the same variables. Figures/tables are rebuilt at the end of each job.
+#   SNRS       SNR list for EXP=snr                                       (default "-20 -10 0 10")
+#   RESULTS    results root, e.g. examples/AirSFL/results_quick_aug       (default .../results)
+#   TARGETS    validation targets for the figures, e.g. "0.75 0.8"        (default: 95% rule)
+#   EXTRA      any other run_airsfl.py flags, e.g. "--no-augment", "--fast-cudnn",
+#              "--engine vmap"
+# Every run is identified by a hash of its full configuration: a finished run with the
+# same configuration is skipped (resubmit a timed-out job with the same variables), any
+# changed setting produces a new run. Figures/tables are rebuilt at the end of each job.
 #
-# QUICK GPU TEST (1 seed, 50 epochs, separate folder):
-#   Q=examples/AirSFL/results_quick
-#   J=$(sbatch --parsable --export=ALL,EXP="bench lr",RESULTS=$Q slurm/run_airsfl.slurm)
+# QUICK GPU TEST (1 seed, 50 epochs, augmentation on, new folder):
+#   Q=examples/AirSFL/results_quick_aug
+#   J=$(sbatch --parsable --export=ALL,EXP="lr",RESULTS=$Q slurm/run_airsfl.slurm)
 #   for P in iid dirichlet; do
 #     sbatch --dependency=afterok:$J --export=ALL,EXP="main",PARTITION=$P,EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
+#     for M in airsfl sun_fdma_aircomp aircomp_fl; do
+#       sbatch --dependency=afterok:$J --export=ALL,EXP="snr",PARTITION=$P,METHODS=$M,EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
+#     done
 #   done
-#   sbatch --dependency=afterok:$J --export=ALL,EXP="snr",PARTITION=iid,SNRS="-20 -10 0 10 30",EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
 #
-# FULL RUNS (5 seeds, 100 epochs) -- after the quick test is checked; see README.
+# FULL RUNS (5 seeds) -- after the quick test is checked; see README.
 #
 # EDIT the two sections marked below for your cluster before submitting:
 #   1. #SBATCH directives (partition / gres / account names differ per site)

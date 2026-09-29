@@ -2,45 +2,47 @@
 examples/AirSFL/run_airsfl.py: AirSFL vs baselines on CIFAR-10 / ResNet-18 (GroupNorm),
 following the AirSFL WCNC draft (two servers, ideal downlinks) and its evaluation roadmap.
 
-One matched environment; all methods share data, init, model, minibatches, plain SGD,
-the LR schedule, tau, full participation, weights a_n, bandwidth, per-client power,
-the two server arrays and the channel statistics (paired seeded channel traces):
+One matched environment; all methods share data, init, model, minibatches, augmentation,
+plain SGD, the LR schedule, tau, full participation, weights a_n, bandwidth, per-client
+power, the two server arrays, the channel statistics and the client computing
+capabilities (paired per seed):
 
   AirSFL | Digital SFL-V1 | FDMA-AirComp SFL (Sun-inspired) | AirComp-FL | Digital FedAvg
 
-Default environment (roadmap Sec. 2-3): N=30 clients, M-server and F-server with 64
-antennas each, S=120 subcarriers x 15 kHz (W=1.8 MHz, 4 tones per client in OFDMA),
-Pmax=0.1 W, N0=-167 dBm/Hz, eps_D=eps_U=eps_A=0.6, rho=20 dB, cut after stage 2,
-tau=5, B=16, plain SGD with cosine decay to 1% (fixed within a round), 100 global-epoch
-equivalents, evaluation once per global-epoch equivalent, FP32 (TF32 disabled).
-Augmentation is off by default (--augment turns on crop+flip).
+Default environment: N=30 clients; M-server (activations, ZF) and F-server (model
+differences, AirComp) with 64 antennas each; S=120 subcarriers x 15 kHz (W=1.8 MHz, 4
+tones per client in OFDMA); Pmax=0.1 W; N0=-167 dBm/Hz; eps_D=eps_U=eps_A=0.6; rho=20 dB;
+cut after stage 2; tau=5; B=16; plain SGD with cosine decay to 1% (fixed within a round);
+evaluation once per global-epoch equivalent; FP32 (TF32 disabled); random crop + flip
+augmentation (--no-augment to disable). Computation: client f_i ~ U[1, 2] TFLOPS, M-server
+f_s = 20 TFLOPS (flsim.airsfl.compute). Every CSV row carries the uplink time, the
+computation time and the end-to-end training time (uplink + computation), cumulative
+and per phase, so any axis can be plotted later.
 
-Experiments (--exp, any subset; every run is resumable -- a finished CSV is skipped;
-every CSV keeps the full per-checkpoint record, so any figure can be redrawn later):
-  bench   time the two training engines on this device (s/round) and compare them
+Experiments (--exp, any subset). Every run is identified by a hash of its complete
+resolved configuration (saved as <run>.json next to <run>.csv): a finished run with the
+same configuration is skipped, any changed setting produces a new run.
+  bench   seconds per round of both training engines (x deterministic / fast cuDNN)
   lr      LR calibration on the error-free digital reference (FedAvg, IID); the chosen
-          initial LR is then used by ALL methods (transport-isolation experiment)
-  main    5 methods x {IID, Dirichlet-0.5} at 20 dB          (roadmap B, C; fig 1, 3, 4, 6)
-  snr     analog methods x SNR (default 0, 10, 30 dB; 20 dB from main)   (roadmap D; fig 2)
-          digital learning is SNR-independent (ideal decoding): only its time changes,
-          recomputed analytically in plots.py -- no re-run
-  nsweep  5 methods x N in {20, 40} (N=30 from main)            (roadmap A + time to target)
-  cuts    AirSFL + Sun-inspired x cuts {1, 3, 4} (2 from main)  (roadmap E; digital SFL-V1
-          learning is cut-independent -> reused, time recomputed)
-  tau     5 methods x tau in {1, 10} (5 from main)              (roadmap E)
-  nr      AirSFL x Nr_M = Nr_F in {32, 48, 128} (64 from main)  (roadmap F, antenna margin)
-
-Outputs: <results>/<exp>/<run>.csv (+ .log); then python examples/AirSFL/plots.py.
+          initial LR is then used by ALL methods (refused if calibrated under another setup)
+  main    5 methods x {IID, Dirichlet-0.5} at 20 dB
+  snr     analog methods x SNR (default -20, -10, 0, 10 dB; 20 dB from main). Digital
+          learning is SNR-independent (ideal decoding): only its time is recomputed in plots
+  nsweep  5 methods x N in {20, 40} (N=30 from main)
+  cuts    AirSFL + Sun-inspired x cuts {1, 3, 4} (2 from main; digital SFL-V1 learning is
+          cut-independent -> reused, times recomputed)
+  tau     5 methods x tau in {1, 10, 20, 50} (5 from main)
+  nr      AirSFL x M-server antennas Nr_M in {32, 40, 48}, F-server fixed at 64 (64 from main)
 
 Usage:
-  python examples/AirSFL/run_airsfl.py --exp bench
-  python examples/AirSFL/run_airsfl.py --exp lr
+  python examples/AirSFL/run_airsfl.py --exp bench lr
   python examples/AirSFL/run_airsfl.py --exp main --partition iid dirichlet --seeds 11 22 33 44 55
-  python examples/AirSFL/run_airsfl.py --exp snr --snrs -20 -10 0 10 30
+  python examples/AirSFL/run_airsfl.py --exp snr --snrs -20 -10 0 10
 """
 
 import argparse
-import copy
+import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -51,9 +53,10 @@ import numpy as np
 import pandas as pd
 import torch
 
+from flsim.airsfl.compute import ComputeConfig, compute_time_breakdown, split_flops
 from flsim.airsfl.data import (PARTITION_REDRAWS, ClientStream, load_cifar10_tensors, make_eval_tensors,
                                partition)
-from flsim.airsfl.simulator import SCHEMA, AirSFLSimulator, RunConfig
+from flsim.airsfl.simulator import PACKET_REAL, SCHEMA, AirSFLSimulator, RunConfig
 from flsim.airsfl.timing import RadioConfig, environment_summary
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -64,16 +67,17 @@ ANALOG_METHODS = ["airsfl", "sun_fdma_aircomp", "aircomp_fl"]
 
 ENV = dict(N=30, Nr=64, Nr_F=64, S=120, df_hz=15e3, Pmax_w=0.1, N0_dbm_per_hz=-167.0,
            eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0)
+COMPUTE = dict(client_tflops_lo=1.0, client_tflops_hi=2.0, server_tflops=20.0)
 TRAIN = dict(stage=2, tau=5, batch_size=16, epochs=100, lr=0.1, lr_schedule="cosine", lr_min_frac=0.01,
-             dirichlet_alpha=0.5, min_per_client=16, seed=11, evals_per_epoch=1.0, augment=False,
-             engine="loop", vmap_chunk=None)   # quick-test bench: loop 3.6 s/rnd vs vmap 4.3 s/rnd on the GPU
+             dirichlet_alpha=0.5, min_per_client=16, seed=11, evals_per_epoch=1.0, augment=True,
+             engine="loop", vmap_chunk=None)
 LR_GRID = [0.01, 0.03, 0.1, 0.3]       # roadmap {0.01, 0.03, 0.1} + 0.3 to detect a grid-edge optimum
 LR_CAL_EPOCHS = 20
-SNR_SWEEP = [0.0, 10.0, 30.0]          # 20 dB from main; add negatives with --snrs to probe low SNR
+SNR_SWEEP = [-20.0, -10.0, 0.0, 10.0]  # + 20 dB from main
 N_SWEEP = [20, 40]
 CUT_SWEEP = [1, 3, 4]
-TAU_SWEEP = [1, 10]
-NR_SWEEP = [32, 48, 128]
+TAU_SWEEP = [1, 10, 20, 50]            # stage-2 per-round crossover with AirComp-FL near tau = d_s/d_a ~ 20
+NR_SWEEP = [32, 40, 48]                # M-server antennas; F-server fixed
 TARGETS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]   # reached_XX columns (validation)
 
 
@@ -114,46 +118,70 @@ def rounds_for(epochs, N, tau, B, n_train):
     return int(math.ceil(epochs * n_train / (N * tau * B)))
 
 
-def run_name(method, scheme, N, Nr, stage, tau, rho, lr, seed):
-    return f"{method}_{scheme}_N{N}_Nr{Nr}_cut{stage}_tau{tau}_rho{rho:g}_lr{lr:g}_s{seed}"
+def run_manifest(env, method, scheme, radio, cfg, epochs):
+    """Everything that determines a run's learning trajectory. Implementation details that
+    only change float rounding (engine, cuDNN mode) and the computation-capability model
+    (which only rescales the time columns; plots.py can recompute it) are recorded in the
+    CSV but excluded from the identity."""
+    d = env.data
+    part_sizes = [len(p) for p in env.parts(scheme, radio.N, cfg.seed)]
+    return {
+        "schema": SCHEMA, "method": method, "partition": scheme,
+        "dirichlet_alpha": TRAIN["dirichlet_alpha"] if scheme == "dirichlet" else None,
+        "min_per_client": TRAIN["min_per_client"],
+        "partition_sizes_sha": hashlib.sha256(json.dumps(part_sizes).encode()).hexdigest()[:12],
+        "radio": dataclasses.asdict(radio),
+        "train": {k: v for k, v in dataclasses.asdict(cfg).items() if k not in ("engine", "vmap_chunk")},
+        "epochs_budget": float(epochs),
+        "data": {"augment": env.augment, "n_train": env.n_train, "split_seed": 2026,
+                 "val_n": int(env.eval_sets["val"][0].shape[0]), "test_n": int(env.eval_sets["test"][0].shape[0]),
+                 "mean": [round(float(v), 6) for v in d["mean"]]},
+        "packet_real": PACKET_REAL,
+    }
 
 
 def run_one(env: Env, exp: str, method: str, scheme: str, lr: float, epochs: float, seed: int,
-            rho=None, N=None, Nr=None, stage=None, tau=None, noiseless=False) -> str:
+            rho=None, N=None, Nr=None, Nr_F=None, stage=None, tau=None, noiseless=False) -> str:
     rho = ENV["rho_db"] if rho is None else float(rho)
     N = ENV["N"] if N is None else int(N)
     Nr = ENV["Nr"] if Nr is None else int(Nr)
+    Nr_F = ENV["Nr_F"] if Nr_F is None else int(Nr_F)
     stage = TRAIN["stage"] if stage is None else stage
     tau = TRAIN["tau"] if tau is None else int(tau)
     B = TRAIN["batch_size"]
-    name = run_name(method, scheme, N, Nr, stage, tau, rho, lr, seed)
-    out_dir = os.path.join(RESULTS, exp)
-    os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, name + ".csv")
     R = rounds_for(epochs, N, tau, B, env.n_train)
-    if os.path.exists(csv_path):
-        done = pd.read_csv(csv_path)
-        if len(done) and "schema" in done and int(done["schema"].iloc[0]) == SCHEMA and \
-                (int(done["round"].max()) >= R or done["diverged"].astype(bool).any()):
-            print(f"[skip] {name} (complete)")
-            return csv_path
-    radio = RadioConfig(**{**ENV, "N": N, "Nr": Nr, "Nr_F": Nr, "rho_db": rho})
+    radio = RadioConfig(**{**ENV, "N": N, "Nr": Nr, "Nr_F": Nr_F, "rho_db": rho, "batch_size": B})
     cfg = RunConfig(method=method, stage=stage, tau=tau, batch_size=B, lr=lr,
                     lr_schedule=TRAIN["lr_schedule"], lr_min_frac=TRAIN["lr_min_frac"], rounds=R,
                     evals_per_epoch=TRAIN["evals_per_epoch"], noiseless=noiseless, seed=seed,
                     engine=TRAIN["engine"], vmap_chunk=TRAIN["vmap_chunk"])
+    manifest = run_manifest(env, method, scheme, radio, cfg, epochs)
+    rid = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode()).hexdigest()[:10]
+    name = f"{method}_{scheme}_N{N}_Nr{Nr}-{Nr_F}_cut{stage}_tau{tau}_rho{rho:g}_lr{lr:g}_s{seed}_{rid}"
+    out_dir = os.path.join(RESULTS, exp)
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, name + ".csv")
+    if os.path.exists(csv_path):
+        done = pd.read_csv(csv_path)
+        if len(done) and (int(done["round"].max()) >= R or done["diverged"].astype(bool).any()):
+            print(f"[skip] {name} (same configuration, complete)")
+            return csv_path
+    with open(os.path.join(out_dir, name + ".json"), "w") as f:
+        json.dump({"run_id": rid, **manifest}, f, indent=1, sort_keys=True, default=str)
     with open(os.path.join(out_dir, name + ".log"), "w") as logf:
         def log(msg):
             print(msg, flush=True)
             logf.write(msg + "\n")
             logf.flush()
         sim = AirSFLSimulator(cfg, radio, env.streams(scheme, N, B, seed), env.weights(scheme, N, seed),
-                              env.eval_sets, env.device, env.n_train, log=log)
+                              env.eval_sets, env.device, env.n_train, log=log, compute=ComputeConfig(**COMPUTE))
         hist = sim.run()
     df = pd.DataFrame(hist)
+    df["run_id"] = rid
     df["partition"] = scheme
     df["exp"] = exp
     df["augment"] = env.augment
+    df["epochs_budget"] = float(epochs)
     df["dirichlet_alpha"] = TRAIN["dirichlet_alpha"] if scheme == "dirichlet" else np.nan
     df["partition_redraws"] = PARTITION_REDRAWS.get((scheme, N, TRAIN["dirichlet_alpha"], seed), 0)
     best = df["val_acc"].cummax()
@@ -164,14 +192,25 @@ def run_one(env: Env, exp: str, method: str, scheme: str, lr: float, epochs: flo
     return csv_path
 
 
-def chosen_lr() -> float:
-    """Initial LR picked by `--exp lr`; falls back to TRAIN['lr'] (with a warning)."""
+def _lr_setup(env):
+    """The setup an LR calibration is valid for."""
+    return {"augment": env.augment, "lr_schedule": TRAIN["lr_schedule"], "lr_min_frac": TRAIN["lr_min_frac"],
+            "schema": SCHEMA, "N": ENV["N"], "B": TRAIN["batch_size"], "tau": TRAIN["tau"]}
+
+
+def chosen_lr(env) -> float:
+    """Initial LR picked by `--exp lr`; refuses a calibration made under another setup."""
     path = os.path.join(RESULTS, "lr", "chosen_lr.json")
-    if os.path.exists(path):
-        with open(path) as f:
-            return float(json.load(f)["lr"])
-    print(f"[lr] WARNING: {path} not found -> using the default lr={TRAIN['lr']}")
-    return TRAIN["lr"]
+    if not os.path.exists(path):
+        raise SystemExit(f"[lr] {path} not found: run --exp lr first (or pass --lr)")
+    with open(path) as f:
+        cal = json.load(f)
+    mism = {k: (cal.get("setup", {}).get(k), v) for k, v in _lr_setup(env).items()
+            if cal.get("setup", {}).get(k) != v}
+    if mism:
+        raise SystemExit(f"[lr] {path} was calibrated under a different setup (stored, current): {mism}. "
+                         f"Rerun --exp lr in this results folder (or pass --lr).")
+    return float(cal["lr"])
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +218,8 @@ def chosen_lr() -> float:
 # ---------------------------------------------------------------------------
 
 def exp_bench(env, args):
-    """Seconds per round of both engines on this device (AirSFL, default environment),
-    and the parameter difference after the same rounds (float32 kernels differ slightly)."""
+    """Seconds per round of both engines x cuDNN mode on this device (AirSFL, default
+    environment), and the parameter difference after the same rounds."""
     rounds = 3
     out = {}
     vecs = {}
@@ -213,7 +252,6 @@ def exp_bench(env, args):
                 t0 = time.time()
                 sim.run()
             except torch.cuda.OutOfMemoryError:
-                sim = None
                 torch.cuda.empty_cache()
                 out[key] = {"s_per_round": float("inf"), "error": "CUDA out of memory"}
                 print(f"[bench] {key:17s}: CUDA out of memory (skipped)")
@@ -233,12 +271,9 @@ def exp_bench(env, args):
         diff = vecs["vmap"] - vecs["loop"]
         out["max_param_diff"] = float(diff.abs().max())
         out["median_param_diff"] = float(diff.abs().median())
-    else:
-        out["max_param_diff"] = out["median_param_diff"] = float("nan")
     best = min((k for k in out if isinstance(out[k], dict)), key=lambda k: out[k]["s_per_round"])
     out["fastest"] = best
-    print(f"[bench] after {rounds} rounds: max|vmap - loop| = {out['max_param_diff']:.2e}, "
-          f"median {out['median_param_diff']:.1e}; fastest setting: {best}")
+    print(f"[bench] fastest setting: {best}")
     os.makedirs(os.path.join(RESULTS, "bench"), exist_ok=True)
     with open(os.path.join(RESULTS, "bench", f"bench_{env.device.type}.json"), "w") as f:
         json.dump(out, f, indent=2)
@@ -255,19 +290,19 @@ def exp_lr(env, args):
     ok = [r for r in rows if not math.isnan(r["final_val_acc"])]
     best = max(ok, key=lambda r: r["final_val_acc"])
     with open(os.path.join(RESULTS, "lr", "chosen_lr.json"), "w") as f:
-        json.dump({"lr": best["lr"], "grid": rows, "epochs": args.lr_epochs, "schedule": TRAIN["lr_schedule"],
-                   "augment": env.augment}, f, indent=2)
+        json.dump({"lr": best["lr"], "grid": rows, "epochs": args.lr_epochs, "setup": _lr_setup(env),
+                   "augment": env.augment, "schedule": TRAIN["lr_schedule"]}, f, indent=2)
     print(f"[lr] grid {rows} -> chosen lr = {best['lr']}")
     if best["lr"] in (min(LR_GRID), max(LR_GRID)):
         print(f"[lr] WARNING: chosen lr {best['lr']} is at the edge of the grid {LR_GRID}")
 
 
-def _lr(args):
-    return args.lr if args.lr is not None else chosen_lr()
+def _lr(env, args):
+    return args.lr if args.lr is not None else chosen_lr(env)
 
 
 def exp_main(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for method in args.methods:
@@ -275,7 +310,7 @@ def exp_main(env, args):
 
 
 def exp_snr(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for rho in args.snrs:
@@ -284,7 +319,7 @@ def exp_snr(env, args):
 
 
 def exp_nsweep(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for N in args.ns:
@@ -293,7 +328,7 @@ def exp_nsweep(env, args):
 
 
 def exp_cuts(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for stage in args.cuts:
@@ -302,7 +337,7 @@ def exp_cuts(env, args):
 
 
 def exp_tau(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for tau in args.taus:
@@ -311,15 +346,29 @@ def exp_tau(env, args):
 
 
 def exp_nr(env, args):
-    lr = _lr(args)
+    lr = _lr(env, args)
     for seed in args.seeds:
         for scheme in args.partition:
             for Nr in args.nrs:
-                run_one(env, "nr", "airsfl", scheme, lr, args.epochs, seed, Nr=Nr)
+                run_one(env, "nr", "airsfl", scheme, lr, args.epochs, seed, Nr=Nr, Nr_F=args.nr_f)
 
 
 EXPERIMENTS = {"bench": exp_bench, "lr": exp_lr, "main": exp_main, "snr": exp_snr, "nsweep": exp_nsweep,
                "cuts": exp_cuts, "tau": exp_tau, "nr": exp_nr}
+
+
+def print_budget():
+    """Per-round uplink + computation budget of the default environment."""
+    radio = RadioConfig(**ENV)
+    environment_summary(radio, stage=TRAIN["stage"], tau=TRAIN["tau"])
+    lo, hi, fs = COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"], COMPUTE["server_tflops"]
+    print(f"  computation: client f_i ~ U[{lo}, {hi}] TFLOPS (slowest client paces each step), "
+          f"M-server {fs} TFLOPS shared by the {radio.N} suffix copies")
+    for m in METHODS:
+        fl = split_flops(TRAIN["stage"] if m in ("airsfl", "digital_sflv1", "sun_fdma_aircomp") else None)
+        c = compute_time_breakdown(m, fl, radio.N, TRAIN["batch_size"], TRAIN["tau"], lo * 1e12, fs * 1e12)
+        print(f"  {m:17s} compute {c['total']:.3f} s/round at f_min={lo} TFLOPS (client FP {c['client_fp']:.3f}, "
+              f"server FP {c['server_fp']:.3f}, server BP {c['server_bp']:.3f}, client BP {c['client_bp']:.3f})")
 
 
 def main():
@@ -331,13 +380,14 @@ def main():
     p.add_argument("--lr-epochs", type=float, default=LR_CAL_EPOCHS)
     p.add_argument("--lr", type=float, default=None, help="override the calibrated initial LR")
     p.add_argument("--seeds", nargs="+", type=int, default=[TRAIN["seed"]],
-                   help="paired seeds (roadmap: 11 22 33 44 55): partitions, init, data order, channels")
+                   help="paired seeds (roadmap: 11 22 33 44 55): partitions, init, data order, channels, f_i")
     p.add_argument("--snrs", nargs="+", type=float, default=SNR_SWEEP)
     p.add_argument("--ns", nargs="+", type=int, default=N_SWEEP)
     p.add_argument("--cuts", nargs="+", type=int, default=CUT_SWEEP)
     p.add_argument("--taus", nargs="+", type=int, default=TAU_SWEEP)
-    p.add_argument("--nrs", nargs="+", type=int, default=NR_SWEEP)
-    p.add_argument("--augment", action="store_true", help="random crop + flip (default off)")
+    p.add_argument("--nrs", nargs="+", type=int, default=NR_SWEEP, help="M-server antennas for --exp nr")
+    p.add_argument("--nr-f", type=int, default=ENV["Nr_F"], help="F-server antennas for --exp nr (fixed)")
+    p.add_argument("--no-augment", action="store_true", help="disable random crop + flip (default on)")
     p.add_argument("--engine", default=TRAIN["engine"], choices=["vmap", "loop"])
     p.add_argument("--vmap-chunk", type=int, default=None, help="clients per vmap chunk (GPU memory)")
     p.add_argument("--fast-cudnn", action="store_true",
@@ -357,12 +407,12 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = bool(args.fast_cudnn)
     torch.backends.cudnn.deterministic = not args.fast_cudnn
-    env = Env(torch.device(args.device), augment=args.augment)
+    env = Env(torch.device(args.device), augment=not args.no_augment)
     if args.eval_subset > 0:
         env.eval_sets = {k: (x[:args.eval_subset], y[:args.eval_subset]) for k, (x, y) in env.eval_sets.items()}
-    print(f"[env] device={args.device} | results={RESULTS} | {ENV} | {TRAIN} | epochs={args.epochs} | "
-          f"seeds={args.seeds} | n_train={env.n_train}")
-    environment_summary(RadioConfig(**ENV), stage=TRAIN["stage"], tau=TRAIN["tau"])
+    print(f"[env] device={args.device} | results={RESULTS} | {ENV} | {COMPUTE} | {TRAIN} | augment={env.augment} "
+          f"| epochs={args.epochs} | seeds={args.seeds} | n_train={env.n_train}")
+    print_budget()
     for e in args.exp:
         EXPERIMENTS[e](env, args)
 

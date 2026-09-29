@@ -41,8 +41,13 @@ i.i.d. Rayleigh across packets; zero packets carry no error. The M-link and F-li
 use SEPARATE, seeded channel/noise streams, so every analog-aggregation method
 sees the same F-link trace for a given seed (paired comparison).
 
-Metric: modeled uplink communication seconds (Eq. 25-26), accumulated per round
-and logged per phase (activation / labels / aggregation). Computation excluded.
+Metrics (every evaluation row carries both, cumulative and per round, per phase):
+  * modeled UPLINK communication seconds (Eq. 25-26): activation / labels / aggregation;
+  * modeled COMPUTATION seconds (flsim.airsfl.compute): client FP / server FP /
+    server BP / client BP (FL: client FP / BP of the whole model);
+  * end-to-end TRAINING time = uplink + computation (downlinks ideal, untimed).
+Radio streams are re-seeded from (seed, link, round, step), so a round's channel and
+noise draws do not depend on how much randomness earlier rounds consumed.
 """
 
 import copy
@@ -55,6 +60,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from flsim.airsfl.compute import ComputeConfig, client_draws, compute_time_breakdown, split_flops
 from flsim.airsfl.model import CifarResNet18GN
 from flsim.airsfl.timing import (_ALIASES, RadioConfig, digital_rates, source_equivalent_mb_per_round,
                                  uplink_time_breakdown)
@@ -67,7 +73,7 @@ except ImportError:                      # torch < 2.0
 
 PACKET_REAL = 256          # 128 complex payload symbols per coherent per-tone packet
 _CHUNK = 1024              # packets per channel-sampling chunk (memory bound)
-SCHEMA = 3                 # CSV schema version (plots ignore older files)
+SCHEMA = 4                 # CSV/semantics version (plots ignore older files; part of the run identity)
 
 METHOD_SPEC = {
     "airsfl":           {"split": True,  "zf_act": True,  "aircomp": True},
@@ -122,19 +128,21 @@ def _packet_lengths(d: int, K: int, device) -> torch.Tensor:
 
 class AirSFLSimulator:
     def __init__(self, cfg: RunConfig, radio: RadioConfig, streams: list, weights,
-                 eval_sets: dict, device, n_train: int, log=print):
+                 eval_sets: dict, device, n_train: int, log=print, compute: Optional[ComputeConfig] = None):
         m = _ALIASES.get(cfg.method.lower())
         if m not in METHOD_SPEC:
             raise ValueError(f"unknown method {cfg.method!r}")
         if len(streams) != radio.N:
             raise ValueError(f"{len(streams)} client streams but radio.N = {radio.N}")
-        if radio.N > radio.Nr:
-            raise ValueError(f"ZF needs N <= Nr at the M-server (got N={radio.N}, Nr={radio.Nr})")
-        if radio.N > radio.Nr_F:
-            raise ValueError(f"the baseline AirComp combiner needs N <= Nr_F (got N={radio.N}, Nr_F={radio.Nr_F})")
-        if radio.N > radio.S:
-            raise ValueError(f"digital OFDMA needs N <= S (got S={radio.S}, N={radio.N})")
         spec = METHOD_SPEC[m]
+        splits = spec["split"] and cfg.stage is not None
+        # receiver-specific feasibility (a check only applies to the method that uses that receiver)
+        if spec["zf_act"] and splits and radio.N > radio.Nr:
+            raise ValueError(f"ZF needs N <= Nr at the M-server (got N={radio.N}, Nr={radio.Nr})")
+        if spec["aircomp"] and radio.N > radio.Nr_F:
+            raise ValueError(f"the baseline AirComp combiner needs N <= Nr_F (got N={radio.N}, Nr_F={radio.Nr_F})")
+        if (splits or not spec["aircomp"]) and radio.N > radio.S:
+            raise ValueError(f"digital OFDMA (activations/labels/models) needs N <= S (got S={radio.S}, N={radio.N})")
         self.method, self.cfg, self.radio = m, cfg, radio
         self.device, self.log, self.n_train = device, log, n_train
         self.engine = cfg.engine
@@ -191,8 +199,27 @@ class AirSFLSimulator:
         self.ul_break = uplink_time_breakdown(m, self.dims, radio, cfg.tau, self.rates)
         self.ul_s = self.ul_break["total"]
         self.mb = source_equivalent_mb_per_round(m, self.dims, radio, cfg.tau)
+
+        # computation constants: FLOPs of each side of the cut, client capabilities
+        # (drawn per seed, identical for every method), shared M-server capability
+        self.compute = compute or ComputeConfig()
+        self.flops = split_flops(self.stage)
+        self.u_clients = client_draws(self.N, cfg.seed)
+        lo, hi = self.compute.client_tflops_lo, self.compute.client_tflops_hi
+        f_clients = (lo + (hi - lo) * self.u_clients) * 1e12
+        self.f_client_min, self.f_client_mean = float(f_clients.min()), float(f_clients.mean())
+        self.f_server = self.compute.server_tflops * 1e12
+        self.comp_break = compute_time_breakdown(m, self.flops, self.N, cfg.batch_size, cfg.tau,
+                                                 self.f_client_min, self.f_server)
+        self.comp_s = self.comp_break["total"]
+        self.e2e_s = self.ul_s + self.comp_s
         self.history = []
         self._reset_stats()
+
+    def _stream_seed(self, link: int, r: int, i: int = 0) -> int:
+        """Deterministic seed for radio link `link` (1 = M-link ZF, 2 = F-link AirComp) in
+        round r, step i: a round's draws never depend on earlier rounds' consumption."""
+        return int((int(self.cfg.seed) * 1_000_003 + link * 7_919_993 + r * 10_007 + i) % (2 ** 62))
 
     # ------------------------------------------------------------------
     # model halves (loop engine / dimension probe)
@@ -321,7 +348,9 @@ class AirSFLSimulator:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _aggregate(self):
+    def _aggregate(self, r: int = 0):
+        if self.aircomp:
+            self.gen_A.manual_seed(self._stream_seed(2, r))
         for idx, air in ((self.pref_idx, self.aircomp), (self.suf_idx, False)):
             if not idx:
                 continue
@@ -367,6 +396,7 @@ class AirSFLSimulator:
     @torch.no_grad()
     def evaluate(self) -> dict:
         M = self.global_model
+        M.eval()                                 # no-op for GroupNorm; defensive for future layers
         out = {}
         for name, (x, y) in self.eval_sets.items():
             correct, loss_sum = 0, 0.0
@@ -376,6 +406,8 @@ class AirSFLSimulator:
                 correct += int((logits.argmax(1) == y[s:s + 500]).sum())
             out[f"{name}_acc"] = correct / x.shape[0]
             out[f"{name}_loss"] = loss_sum / x.shape[0]
+            out[f"{name}_n"] = int(x.shape[0])
+        M.train()
         return out
 
     def _lr_at(self, r: int) -> float:
@@ -415,6 +447,16 @@ class AirSFLSimulator:
             "aggregation_ul_s": self.ul_break["aggregation"], "ul_s_per_round": self.ul_s,
             "uplink_s": r * self.ul_s, "cumulative_ul_s": r * self.ul_s,
             "mb_per_round": self.mb, "source_mb": r * self.mb,
+            # computation (per round, per phase) and end-to-end training time
+            "client_fp_s": self.comp_break["client_fp"], "client_bp_s": self.comp_break["client_bp"],
+            "server_fp_s": self.comp_break["server_fp"], "server_bp_s": self.comp_break["server_bp"],
+            "compute_s_per_round": self.comp_s, "e2e_s_per_round": self.e2e_s,
+            "cumulative_compute_s": r * self.comp_s, "training_time_s": r * self.e2e_s,
+            "flops_client_fp": self.flops["client_fp"], "flops_client_bp": self.flops["client_bp"],
+            "flops_server_fp": self.flops["server_fp"], "flops_server_bp": self.flops["server_bp"],
+            "u_client_min": float(self.u_clients.min()), "f_client_min_tflops": self.f_client_min / 1e12,
+            "f_client_mean_tflops": self.f_client_mean / 1e12, "f_server_tflops": self.f_server / 1e12,
+            "client_tflops_lo": self.compute.client_tflops_lo, "client_tflops_hi": self.compute.client_tflops_hi,
             "activation_mse": ane / self._act_coords if self._act_coords else float("nan"),
             "aggregation_mse": gne / self._agg_coords if self._agg_coords else float("nan"),
             "act_nsr_db": db(ane, ase), "agg_nsr_db": db(gne, gse),
@@ -433,6 +475,9 @@ class AirSFLSimulator:
                  f"tau={cfg.tau} B={cfg.batch_size} | rounds={cfg.rounds} | lr={cfg.lr:g} ({cfg.lr_schedule}) | "
                  f"UL {self.ul_s:.3f} s/rnd (act {self.ul_break['activation']:.3f}, labels "
                  f"{self.ul_break['labels']:.4f}, agg {self.ul_break['aggregation']:.3f}) | "
+                 f"compute {self.comp_s:.3f} s/rnd (client {self.comp_break['client_fp'] + self.comp_break['client_bp']:.3f}"
+                 f" @ f_min={self.f_client_min / 1e12:.2f} TFLOPS, server "
+                 f"{self.comp_break['server_fp'] + self.comp_break['server_bp']:.3f}) | "
                  f"engine={self.engine} | noiseless={cfg.noiseless}")
         self._record(0, self._lr_at(0), float("nan"), t0)
         spr = self.N * cfg.tau * cfg.batch_size
@@ -442,8 +487,11 @@ class AirSFLSimulator:
             lr = self._lr_at(r)                  # fixed within a round
             self._broadcast()
             loss_sum = torch.zeros((), device=self.device)
-            for _ in range(cfg.tau):
-                E = self._sample_zf_joint() if self.zf_act else None       # one per step, all clients
+            for i in range(cfg.tau):
+                E = None
+                if self.zf_act:                                            # one draw per step, all clients
+                    self.gen_U.manual_seed(self._stream_seed(1, r, i))
+                    E = self._sample_zf_joint()
                 batches = [s.next_batch() for s in self.streams]
                 if self.engine == "loop":
                     for n, (x, y) in enumerate(batches):
@@ -452,12 +500,14 @@ class AirSFLSimulator:
                     X = torch.stack([b[0] for b in batches])
                     Y = torch.stack([b[1] for b in batches])
                     loss_sum += self._step_vmap(X, Y, E, lr)
-            self._aggregate()
-            if not bool(torch.isfinite(loss_sum)):
+            self._aggregate(r)
+            params_ok = bool(torch.stack([torch.isfinite(p).all() for p in self.gparams]).all())
+            if not (bool(torch.isfinite(loss_sum)) and params_ok):
                 # training blew up (e.g. very low SNR): record the failure and stop; the run
                 # counts as "target not reached" and is not retried on resume
                 self._record(r + 1, lr, float("nan"), t0, diverged=True)
-                self.log(f"  rnd {r+1:5d} DIVERGED (non-finite training loss) -> stopping this run")
+                self.log(f"  rnd {r+1:5d} DIVERGED (non-finite {'loss' if params_ok else 'global model'}) "
+                         f"-> stopping this run")
                 break
             processed = (r + 1) * spr
             if processed >= next_eval or r + 1 == cfg.rounds:
@@ -466,7 +516,8 @@ class AirSFLSimulator:
                 rec = self._record(r + 1, lr, float(loss_sum) / (cfg.tau * self.N), t0)
                 self.log(f"  rnd {r+1:5d} ep {rec['epoch_equiv']:6.2f} | lr {lr:.4f} | loss {rec['train_loss']:.3f} | "
                          f"val {rec.get('val_acc', float('nan')):.4f} test {rec.get('test_acc', float('nan')):.4f} | "
-                         f"UL {rec['uplink_s']:.1f}s | actNSR {rec['act_nsr_db']:.1f}dB aggNSR {rec['agg_nsr_db']:.1f}dB "
+                         f"UL {rec['uplink_s']:.1f}s train {rec['training_time_s']:.1f}s | "
+                         f"actNSR {rec['act_nsr_db']:.1f}dB aggNSR {rec['agg_nsr_db']:.1f}dB "
                          f"| wall {rec['wall_s']:.0f}s ({rec['wall_s'] / (r + 1):.2f} s/rnd)")
         return self.history
 

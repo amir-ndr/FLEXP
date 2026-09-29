@@ -16,7 +16,11 @@ flsim/airsfl/checks.py: correctness checks for the AirSFL environment
         == the reference "loop" engine (relay back-prop), noiseless and noisy (gate 7);
      e. empirical ZF activation NSR ~= 1/(rho (Nr-N));
      f. zero activation packets / zero aggregates carry zero error;
+     h. recorded computation / training-time columns == the computation model;
+     i. radio draws depend only on (seed, link, round, step);
      g. vectorized crop+flip == per-image reference.
+  Computation model (flsim.airsfl.compute.verify_compute): FLOP counts vs closed form and
+  the framework counter, prefix + suffix == full model, N=1 limit, hand calculation.
 """
 
 import copy
@@ -26,6 +30,7 @@ import numpy as np
 import torch
 
 from flsim.airsfl import radio as R
+from flsim.airsfl.compute import compute_time_breakdown, split_flops, verify_compute
 from flsim.airsfl.data import ClientStream, load_cifar10_tensors, make_eval_tensors, partition
 from flsim.airsfl.model import CifarResNet18GN, check_profiled_dims
 from flsim.airsfl.simulator import AirSFLSimulator, RunConfig, _HAS_FUNC
@@ -224,6 +229,39 @@ def check_activation_nsr_and_zero(verbose=True) -> bool:
     return ok
 
 
+def check_time_columns_and_streams(verbose=True) -> bool:
+    """(h) Every recorded row: training time = round * (uplink + computation) per round, the
+    computation equals compute_time_breakdown(...) for the run's cut / N / b / tau / f_min /
+    f_s, and FL methods have no server computation. (i) A round's radio draws depend only on
+    (seed, link, round, step): re-seeding reproduces them regardless of earlier draws."""
+    radio, make_streams, weights, ev = _small_env()
+    ok = True
+    for method, stage in (("airsfl", 2), ("digital_sflv1", 1), ("aircomp_fl", None), ("digital_fedavg", None)):
+        sim = _run(method, stage, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=2)
+        c = compute_time_breakdown(sim.method, split_flops(sim.stage), sim.N, sim.cfg.batch_size, sim.cfg.tau,
+                                   sim.f_client_min, sim.f_server)
+        good = abs(c["total"] - sim.comp_s) < 1e-15 and (sim.stage is not None or c["server_fp"] == 0.0)
+        for h in sim.history:
+            good &= abs(h["training_time_s"] - h["round"] * (h["ul_s_per_round"] + h["compute_s_per_round"])) < 1e-9
+            good &= abs(h["cumulative_compute_s"] + h["uplink_s"] - h["training_time_s"]) < 1e-9
+        ok &= good
+        if verbose:
+            print(f"  (h) time columns [{method:14s} cut={stage}]: compute {sim.comp_s:.4g} s/round "
+                  f"(f_min={sim.f_client_min/1e12:.2f} TFLOPS), training = uplink + compute  {_OK(good)}")
+    sim = _run("airsfl", 2, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=1)
+    sim.gen_U.manual_seed(sim._stream_seed(1, 3, 2))
+    e1 = sim._sample_zf_joint()
+    sim._sample_zf_joint()                                    # consume more randomness
+    sim.gen_U.manual_seed(sim._stream_seed(1, 3, 2))
+    e2 = sim._sample_zf_joint()
+    seeds = {sim._stream_seed(l, r, i) for l in (1, 2) for r in range(200) for i in range(60)}
+    good = torch.equal(e1, e2) and len(seeds) == 2 * 200 * 60
+    ok &= good
+    if verbose:
+        print(f"  (i) radio draws depend only on (seed, link, round, step), no seed collisions: {_OK(good)}")
+    return ok
+
+
 def check_crop(verbose=True) -> bool:
     """Vectorized crop+flip == the per-image reference with the same random draws."""
     x = torch.rand(16, 3, 32, 32)
@@ -247,8 +285,9 @@ def run_all() -> bool:
     print("\n########## 1. TIMING ##########")
     ok = verify_reference_example()["ok"]
     ok &= verify_limit_cases()
-    print("\n########## 2. MODEL ##########")
+    print("\n########## 2. MODEL + COMPUTATION ##########")
     ok &= check_profiled_dims()["ok"]
+    ok &= verify_compute()
     print("\n########## 3. RADIO ##########")
     ok &= R.run_radio_checks()
     ok &= check_radio_scale_free()
@@ -256,6 +295,7 @@ def run_all() -> bool:
     ok &= check_relay_gradient()
     ok &= check_training_equivalences()
     ok &= check_activation_nsr_and_zero()
+    ok &= check_time_columns_and_streams()
     ok &= check_crop()
     print(f"\n==== ALL AIRSFL CHECKS: {_OK(ok)} ====")
     return ok
