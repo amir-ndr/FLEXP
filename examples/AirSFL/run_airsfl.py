@@ -66,7 +66,7 @@ ENV = dict(N=30, Nr=64, Nr_F=64, S=120, df_hz=15e3, Pmax_w=0.1, N0_dbm_per_hz=-1
            eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0)
 TRAIN = dict(stage=2, tau=5, batch_size=16, epochs=100, lr=0.1, lr_schedule="cosine", lr_min_frac=0.01,
              dirichlet_alpha=0.5, min_per_client=16, seed=11, evals_per_epoch=1.0, augment=False,
-             engine="vmap", vmap_chunk=None)
+             engine="loop", vmap_chunk=None)   # quick-test bench: loop 3.6 s/rnd vs vmap 4.3 s/rnd on the GPU
 LR_GRID = [0.01, 0.03, 0.1, 0.3]       # roadmap {0.01, 0.03, 0.1} + 0.3 to detect a grid-edge optimum
 LR_CAL_EPOCHS = 20
 SNR_SWEEP = [0.0, 10.0, 30.0]          # 20 dB from main; add negatives with --snrs to probe low SNR
@@ -193,29 +193,36 @@ def exp_bench(env, args):
         return AirSFLSimulator(cfg, RadioConfig(**ENV), env.streams("iid", ENV["N"], TRAIN["batch_size"], 11),
                                env.weights("iid", ENV["N"], 11), small_eval, env.device, env.n_train,
                                log=lambda *a: None)
-    for engine in ("vmap", "loop"):
-        make(engine, 1).run()                                  # warm-up (CUDA/cuDNN initialization)
-        sim = make(engine, rounds)
-        if env.device.type == "cuda":
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-        t0 = time.time()
-        sim.run()
-        if env.device.type == "cuda":
-            torch.cuda.synchronize()
-        dt = (time.time() - t0) / rounds
-        mem = torch.cuda.max_memory_allocated() / 2 ** 30 if env.device.type == "cuda" else float("nan")
-        out[engine] = {"s_per_round": dt, "peak_mem_GB": mem,
-                       "est_hours_per_100_epochs": dt * rounds_for(100, ENV["N"], TRAIN["tau"],
-                                                                   TRAIN["batch_size"], env.n_train) / 3600}
-        vecs[engine] = sim.global_vector()
-        print(f"[bench] {engine}: {dt:.2f} s/round, peak GPU memory {mem:.2f} GB, "
-              f"~{out[engine]['est_hours_per_100_epochs']:.2f} h per 100-epoch run")
+    saved = (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic)
+    for fast in (False, True):                                 # deterministic vs fastest cuDNN algorithms
+        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = fast, not fast
+        for engine in ("loop", "vmap"):
+            key = engine + ("_fast_cudnn" if fast else "")
+            make(engine, 1).run()                              # warm-up (CUDA/cuDNN initialization)
+            sim = make(engine, rounds)
+            if env.device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+            t0 = time.time()
+            sim.run()
+            if env.device.type == "cuda":
+                torch.cuda.synchronize()
+            dt = (time.time() - t0) / rounds
+            mem = torch.cuda.max_memory_allocated() / 2 ** 30 if env.device.type == "cuda" else float("nan")
+            out[key] = {"s_per_round": dt, "peak_mem_GB": mem,
+                        "est_hours_per_100_epochs": dt * rounds_for(100, ENV["N"], TRAIN["tau"],
+                                                                    TRAIN["batch_size"], env.n_train) / 3600}
+            vecs[key] = sim.global_vector()
+            print(f"[bench] {key:17s}: {dt:.2f} s/round, peak GPU memory {mem:.2f} GB, "
+                  f"~{out[key]['est_hours_per_100_epochs']:.2f} h per 100-epoch run")
+    torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = saved
     diff = vecs["vmap"] - vecs["loop"]
     out["max_param_diff"] = float(diff.abs().max())
     out["median_param_diff"] = float(diff.abs().median())
+    best = min((k for k in out if isinstance(out[k], dict)), key=lambda k: out[k]["s_per_round"])
+    out["fastest"] = best
     print(f"[bench] after {rounds} rounds: max|vmap - loop| = {out['max_param_diff']:.2e}, "
-          f"median {out['median_param_diff']:.1e}; speed-up {out['loop']['s_per_round'] / out['vmap']['s_per_round']:.1f}x")
+          f"median {out['median_param_diff']:.1e}; fastest setting: {best}")
     os.makedirs(os.path.join(RESULTS, "bench"), exist_ok=True)
     with open(os.path.join(RESULTS, "bench", f"bench_{env.device.type}.json"), "w") as f:
         json.dump(out, f, indent=2)

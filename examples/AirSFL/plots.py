@@ -508,9 +508,10 @@ def fig4_overhead(main):
         st = STYLE[m]
         ax.scatter([mb], [ul], s=160, color=st["color"], marker=st["marker"], edgecolor="k", zorder=5,
                    label=st["label"])
+        off = {"digital_sflv1": (12, 4), "sun_fdma_aircomp": (12, -22)}.get(m, (12, -4))   # avoid overlap
         ax.annotate(f"{st['label'].replace(' (proposed)', '')}\n{ul:.2f} s" if ul < 10 else
                     f"{st['label'].replace(' (proposed)', '')}\n{ul:.0f} s",
-                    (mb, ul), textcoords="offset points", xytext=(12, -4), fontsize=8.5)
+                    (mb, ul), textcoords="offset points", xytext=off, fontsize=8.5)
     sfl_mb = source_equivalent_mb_per_round("airsfl", dims, r, TAU0)
     fl_mb = source_equivalent_mb_per_round("aircomp_fl", dims, r, TAU0)
     ax.axvline(sfl_mb, color="k", ls=":", lw=1)
@@ -548,6 +549,9 @@ def fig4_overhead(main):
     axb.set_title("(b) Uplink source volume to reach the target (not airtime)")
     if any_bar:
         axb.legend(fontsize=8)
+    elif not schemes:
+        axb.text(0.5, 0.5, "needs the `main` runs", ha="center", va="center", transform=axb.transAxes,
+                 fontsize=10, color="0.4")
     fig.tight_layout()
     _save(fig, "fig4_comm_overhead")
 
