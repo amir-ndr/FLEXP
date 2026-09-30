@@ -104,7 +104,7 @@ PRESETS = [
     ("edge GPU [AdaptSFL]: clients U[1,2] TFLOPS, server 20 TFLOPS", (1.0, 2.0, 20.0)),
     ("IoT CPU [Sun et al.]: 16 FLOP/cycle x U[0.1,2] GHz, server 320 GFLOPS", (0.0016, 0.032, 0.32)),
 ]
-PART_NAME = {"iid": "IID", "dirichlet": "Non-IID (Dir-0.5)"}
+PART_NAME = {"iid": "IID", "dirichlet": "Non-IID (Dirichlet)"}   # alpha filled in from the data (main)
 # families side by side: analog, hybrid (ZF / OFDMA activations), digital SFL (ZF / OFDMA), FedAvg
 ALL_METHODS = ["airsfl", "aircomp_fl", "hybrid_zf_aircomp", "sun_fdma_aircomp", "digital_sflv1_zf",
                "digital_sflv1", "digital_fedavg"]
@@ -133,6 +133,14 @@ def _read(exp):
             continue                                    # older experiment generation: ignore
         dfs.append(d)
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+def _keep_alpha(df, alpha):
+    """Drop Dirichlet runs of another concentration (IID rows have no alpha and are kept)."""
+    if df.empty or alpha is None or "dirichlet_alpha" not in df:
+        return df
+    a = pd.to_numeric(df["dirichlet_alpha"], errors="coerce")
+    return df[(df.partition != "dirichlet") | np.isclose(a.fillna(-1.0), alpha)]
 
 
 def _filter(df, skip=()):
@@ -443,6 +451,17 @@ def _schemes(df):
     return [s for s in ("iid", "dirichlet") if not df.empty and s in set(df.partition)]
 
 
+def _fig_legend(fig, axes, ncol=5):
+    """One legend for the whole figure, below the panels (never covers a curve)."""
+    handles = {}
+    for ax in np.ravel(axes):
+        for h, lab in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(lab, h)
+    if handles:
+        fig.legend(handles.values(), handles.keys(), loc="upper center", bbox_to_anchor=(0.5, 0.0),
+                   ncol=min(ncol, len(handles)), fontsize=8.5, frameon=False)
+
+
 def _mark_target(ax, run, A, st, xcol):
     """Marker at the first checkpoint whose VALIDATION accuracy reached A (y = test acc there)."""
     t, k = time_to_target(run, A, xcol) if A is not None else (None, None)
@@ -478,12 +497,13 @@ def fig1_and_table(main):
                 _plot_curve(ax, ef, STYLE["airsfl_errfree"], xcol, lw=1.4)
             if A is not None:
                 ax.plot([], [], ls="", marker="o", mfc="w", mec="k", ms=8,
-                        label=f"first checkpoint with validation acc >= {100*A:.0f}%")
+                        label="marker: first checkpoint whose validation accuracy reaches the target")
             ax.set_xscale("log")
             ax.set_xlabel(xlab)
             ax.set_ylabel("Test accuracy (%)")
-            ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}")
-        axes[0][0].legend(loc="lower right", fontsize=8)
+            ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}"
+                         + (f" (target {100 * A:.0f}%)" if A is not None else ""))
+        _fig_legend(fig, axes, ncol=4)
         fig.suptitle(f"Accuracy vs {xlab.split(' (')[0].lower()} ({env})", y=1.02, fontsize=11)
         _save(fig, fname)
 
@@ -640,6 +660,8 @@ def fig2_snr(main, snr):
                              "digital learning is SNR-independent; ZF variants = their OFDMA twins", fontsize=10.5)
         for j, axis in ((1, "uplink"), (2, "training")):
             axes[i][j].set_yscale("log")
+            lo_y, hi_y = axes[i][j].get_ylim()
+            axes[i][j].set_ylim(lo_y, hi_y * 10)       # headroom: the "not reached" x never sits on a data point
             axes[i][j].set_xlabel("Reference SNR rho (dB)")
             axes[i][j].set_ylabel(f"{'Uplink' if axis == 'uplink' else 'Training'} time to target (s)")
             axes[i][j].set_title(f"{PART_NAME[scheme]}: {axis} time to {100*A:.0f}% val. acc.\n"
@@ -674,7 +696,7 @@ def fig2_snr(main, snr):
         ax.set_xlabel(AXES["uplink"][1])
         ax.set_ylabel("Test accuracy (%)")
         ax.set_title(f"SNR sweep — {PART_NAME[scheme]}")
-        ax.legend(fontsize=7.5, loc="lower right")
+    _fig_legend(fig, axes, ncol=4)
     fig.suptitle("AirSFL: airtime is SNR-independent, distortion is not; digital: accuracy fixed, "
                  "rate falls at low SNR", y=1.02, fontsize=11)
     _save(fig, "fig2b_airsfl_snr_curves")
@@ -804,12 +826,16 @@ def fig_sweep_curves(main, snr, pl):
                           axis, SWEEP_CURVES["xscale"])
     if not pl.empty:
         spreads = [0.0] + sorted(set(float(x) for x in pl.path_gain_spread_db))
-        for axis in SWEEP_CURVES["axes"]:
-            _sweep_curves(f"fig11b_curves_all_spreads_{axis}",
-                          "Learning curves at every path-gain spread (20 dB median client; digital uploads wait for "
-                          "the weakest client)", schemes, [(f"spread {s:g} dB", s) for s in spreads],
-                          lambda sc, m, s: ef(sc) if m == "airsfl_errfree" else _spread_runs(main, snr, pl, sc, m, s),
-                          axis, SWEEP_CURVES["xscale"])
+        pl_rhos = sorted(set(float(r) for r in pl.rho_db))
+        for rho in pl_rhos:                     # one figure per median SNR of the pathloss runs
+            tag = f"_rho{rho:g}" if len(pl_rhos) > 1 else ""
+            for axis in SWEEP_CURVES["axes"]:
+                _sweep_curves(f"fig11b_curves_all_spreads_{axis}{tag}",
+                              f"Learning curves at every path-gain spread ({rho:g} dB median client; digital uploads "
+                              f"wait for the weakest client)", schemes, [(f"spread {s:g} dB", s) for s in spreads],
+                              lambda sc, m, s, rho=rho: ef(sc) if m == "airsfl_errfree"
+                              else _spread_runs(main, snr, pl, sc, m, s, rho),
+                              axis, SWEEP_CURVES["xscale"])
 
 
 def fig11_path_gains(main, snr, pl):
@@ -866,12 +892,18 @@ def fig11_path_gains(main, snr, pl):
                 axes[i][j].set_ylabel(ylab)
                 if j:
                     axes[i][j].set_yscale("log")
+            lo_a, hi_a = axes[i][0].get_ylim()           # at least 6 points of range: seed noise stays small
+            if hi_a - lo_a < 6:
+                mid = 0.5 * (lo_a + hi_a)
+                axes[i][0].set_ylim(mid - 3, mid + 3)
+            lo_y, hi_y = axes[i][1].get_ylim()
+            axes[i][1].set_ylim(lo_y, hi_y * 10)         # headroom for the "not reached" x
             axes[i][0].set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB: final accuracy", fontsize=10.5)
             axes[i][1].set_title(f"uplink time to {100 * A:.0f}% val. acc. (x at the top = not reached)"
                                  if A else "uplink time to target", fontsize=10.5)
             axes[i][2].set_title("per-round uplink time (digital: paced by the weakest client)", fontsize=10.5)
-        axes[0][0].legend(fontsize=8)
         fig.tight_layout()
+        _fig_legend(fig, axes, ncol=4)
         _save(fig, "fig11_path_gains" + (f"_rho{rho:g}" if len(set(pl.rho_db)) > 1 else ""))
     if rows:
         _write_table(pd.DataFrame(rows), "table_pathloss")
@@ -914,11 +946,11 @@ def fig1e_linear_time(main, snr):
             ax.set_xlabel(AXES["uplink"][1])
             ax.set_ylabel("Test accuracy (%)")
             ax.set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB", fontsize=10.5)
-    axes[0][0].legend(fontsize=7.5, loc="lower right")
     fig.suptitle("Accuracy vs uplink time, linear axis (same equal-period schedule for all methods: curves differ "
                  "by airtime per round and, at low SNR, by analog distortion; dotted = epoch budget used up)",
                  y=1.01, fontsize=10.5)
     fig.tight_layout()
+    _fig_legend(fig, axes, ncol=4)
     _save(fig, "fig1e_acc_vs_uplink_time_linear")
 
 
@@ -1481,8 +1513,9 @@ def fig10_compute_regimes(main):
         ax.set_xscale("log")
         ax.set_xlabel("Training time: uplink + computation (s)")
         ax.set_ylabel("Test accuracy (%)")
-        ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}")
-    axes[0][0].legend(loc="lower right", fontsize=8)
+        ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}"
+                     + (f" (target {100 * A:.0f}%)" if A is not None else ""))
+    _fig_legend(fig, axes, ncol=4)
     fig.suptitle(f"Accuracy vs training time at {ENV0['rho_db']:g} dB, {name}", y=1.02, fontsize=11)
     _save(fig, "fig1d_acc_vs_training_time_iot")
 
@@ -1520,6 +1553,8 @@ def main():
                    help="time-axis scale of the sweep learning curves")
     p.add_argument("--path-gain-spread", type=float, default=0.0,
                    help="load main/snr/... runs trained with this path-gain spread (dB; 0 = equal gains)")
+    p.add_argument("--dirichlet-alpha", type=float, default=None,
+                   help="Dirichlet concentration of the non-IID runs to load (default: the one in `main`)")
     p.add_argument("--snr", nargs="+", type=float, default=[20.0],
                    help="operating SNR(s) of the main-point figures (fig1/1b/1c/1d, 3/3b/3c, 4, 6, 8, 10, table_main). "
                         "20 = the nominal set (all figures); any other swept SNR is rebuilt from the CSVs into "
@@ -1553,6 +1588,17 @@ def main():
         print(f"[plots] WARNING: `main` holds epoch budgets {budgets}; using {FILTER['epochs_budget']} "
               f"(choose with --epochs)")
     d = {e: _filter(df, skip(e)) for e, df in d.items()}
+    m0 = d["main"]
+    dir_alphas = (pd.to_numeric(m0.loc[m0.partition == "dirichlet", "dirichlet_alpha"], errors="coerce").dropna()
+                  if not m0.empty and "dirichlet_alpha" in m0 else pd.Series(dtype=float))
+    alpha = a.dirichlet_alpha if a.dirichlet_alpha is not None else (
+        float(dir_alphas.round(6).mode().iloc[0]) if len(dir_alphas) else None)
+    if len(set(dir_alphas.round(6))) > 1 and a.dirichlet_alpha is None:
+        print(f"[plots] WARNING: `main` holds Dirichlet alphas {sorted(set(dir_alphas.round(6)))}; using {alpha:g} "
+              f"(choose with --dirichlet-alpha)")
+    if alpha is not None:
+        d = {e: _keep_alpha(df, alpha) for e, df in d.items()}
+        PART_NAME["dirichlet"] = f"Non-IID (Dir-{alpha:g})"
     if recompute:
         d = {e: _apply_compute(df) for e, df in d.items()}
     d = {e: _derive_zf(df) for e, df in d.items()}

@@ -95,7 +95,7 @@ of Nr·N of array/power gain per tone) — the gain of analog transmission itsel
 | `flsim/airsfl/compute.py` | FLOP profile per cut, computation time per phase | closed-form MACs, framework counter, prefix+suffix = full, N=1 limit, hand calculation |
 | `flsim/airsfl/model.py` | ResNet-18: 3x3 stem, no max-pool, GroupNorm-32, cuts after stages 1-4 | roadmap d_c / d_s / d_a |
 | `flsim/airsfl/radio.py` | dimensional ZF / AirComp physics | gates (packing, power, C^H H = I, noiseless AirComp, zero packets); MC MSE vs Eq. 10 / 23 |
-| `flsim/airsfl/data.py` | 45k/5k split, IID / Dirichlet(0.5), matched per-client streams, crop+flip | vectorized crop == reference |
+| `flsim/airsfl/data.py` | 45k/5k split, IID / Dirichlet(α) (default α = 0.1), matched per-client streams, crop+flip | vectorized crop == reference |
 | `flsim/airsfl/simulator.py` | training for all methods (the 5 trained ones + the 2 ZF digital baselines); joint ZF error per packet; AirComp error; radio streams seeded by (seed, link, round, step); two engines | `python -m flsim.airsfl.checks` (incl. ZF baselines == parents' learning, bitwise) |
 
 **Engines.** `vmap` (default) trains all clients in parallel (torch.func) with fast cuDNN
@@ -131,7 +131,7 @@ reported as k/n seeds; speed-ups are paired per seed.
 |---|---|---|
 | `bench` | seconds/round of both engines × cuDNN mode | — |
 | `lr` | FedAvg (error-free), IID, LR grid, 20 epochs | — |
-| `main` | 5 methods × {IID, Dir-0.5} at 20 dB | fig1, 1b, 1c, 4b, 6, 8, table_main |
+| `main` | 5 methods × {IID, Dir-α} at 20 dB (α = 0.1, `--dirichlet-alpha`) | fig1, 1b, 1c, 4b, 6, 8, table_main |
 | `snr` | 3 analog methods × {−20, −10, 0, 10} dB | fig2, 2b, 2c, table_snr, table_budget |
 | `nsweep` | 5 methods × N=20, 40 | fig7 |
 | `cuts` | AirSFL + Sun × cuts 1, 3, 4 | fig9 |

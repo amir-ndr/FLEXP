@@ -31,7 +31,7 @@ same configuration is skipped, any changed setting produces a new run.
   bench   seconds per round of both training engines (x deterministic / fast cuDNN)
   lr      LR calibration on the error-free digital reference (FedAvg, IID); the chosen
           initial LR is then used by ALL methods (refused if calibrated under another setup)
-  main    5 methods x {IID, Dirichlet-0.5} at 20 dB
+  main    5 methods x {IID, Dirichlet-alpha (default 0.1, --dirichlet-alpha)} at 20 dB
   snr     analog methods x SNR (default -20, -10, 0, 10 dB; 20 dB from main). Digital
           learning is SNR-independent (ideal decoding): only its time is recomputed in plots
   nsweep  5 methods x N in {20, 40} (N=30 from main)
@@ -80,7 +80,7 @@ ENV = dict(N=30, Nr=64, Nr_F=64, S=120, df_hz=15e3, Pmax_w=0.1, N0_dbm_per_hz=-1
            eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0)
 COMPUTE = dict(client_tflops_lo=1.0, client_tflops_hi=2.0, server_tflops=20.0)
 TRAIN = dict(stage=2, tau=5, batch_size=16, epochs=100, lr=0.1, lr_schedule="cosine", lr_min_frac=0.01,
-             dirichlet_alpha=0.5, min_per_client=16, seed=11, evals_per_epoch=1.0, eval_rounds=(),
+             dirichlet_alpha=0.1, min_per_client=16, seed=11, evals_per_epoch=1.0, eval_rounds=(),
              augment=False, engine="vmap", vmap_chunk=None)
 EARLY_EVALS = (1, 2, 4, 8, 16)         # --early-evals: extra checkpoints before the first per-epoch one
 # augment=False: with plain SGD and a 50-100 epoch budget the model is still in the under-fitting
@@ -453,6 +453,12 @@ def main():
     p.add_argument("--deterministic", action="store_true",
                    help="deterministic cuDNN algorithms (bitwise-reproducible reruns, slower)")
     p.add_argument("--fast-cudnn", action="store_true", help="(default; kept for old commands)")
+    p.add_argument("--dirichlet-alpha", type=float, default=TRAIN["dirichlet_alpha"],
+                   help="label-Dirichlet concentration of the non-IID partition (default 0.1; the draft's 0.5 is "
+                        "milder). IID runs do not depend on it")
+    p.add_argument("--evals-per-epoch", type=float, default=TRAIN["evals_per_epoch"],
+                   help="evaluations per global-epoch equivalent (default 1 = every ~19 rounds at N=30; 4 = every "
+                        "~5 rounds). One evaluation (5k val + 10k test images) costs about 1.5-2 training rounds")
     p.add_argument("--early-evals", action="store_true",
                    help=f"also evaluate after rounds {EARLY_EVALS} (real accuracies of slow methods inside small "
                         f"time budgets; training is unchanged, the runs get their own identity)")
@@ -467,6 +473,8 @@ def main():
         RESULTS = os.path.abspath(args.results)
     TRAIN["engine"], TRAIN["vmap_chunk"] = args.engine, args.vmap_chunk
     TRAIN["eval_rounds"] = EARLY_EVALS if args.early_evals else ()
+    TRAIN["evals_per_epoch"] = float(args.evals_per_epoch)
+    TRAIN["dirichlet_alpha"] = float(args.dirichlet_alpha)
     PATH_GAIN["spread_db"] = float(args.path_gain_spread)
     # FP32 everywhere (roadmap): no TF32 tensor-core shortcuts on Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = False
