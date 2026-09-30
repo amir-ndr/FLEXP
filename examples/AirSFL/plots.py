@@ -28,6 +28,17 @@ SFL (reliable digital links either way; same AirComp stream), so they are derive
 runs with the uplink time recomputed at the ZF rate (flsim.airsfl.timing; verified against
 real runs in flsim.airsfl.checks). --methods selects which methods are drawn.
 
+Digital payload (--digital-q, default 16 = FP16): the methods that upload tensors digitally
+(digital SFL-V1, the hybrid, digital FedAvg and their ZF variants) are drawn from their runs
+with that payload (FP16: really rounded uploads, timed with q = 16 bits) -- FP16 -> figures/,
+tables/; FP32 (--digital-q 32) -> figures_q32/, tables_q32/; --digital-q 16 32 draws both.
+FP16 runs come from each experiment's folder and, for main / snr, also from fp16/ (--exp fp16).
+AirSFL and AirComp-FL upload only labels digitally: the same runs serve both payloads. In both
+sets the exact FP32 digital SFL-V1 is the error-free reference and the FP32 FedAvg the
+reference of the target rule (the drawn runs if the FP32 ones are absent). A point whose
+payload runs are missing is listed and left out -- never filled with the other payload's
+learning. Source-equivalent MB are counted at the drawn payload precision.
+
 Only CSVs of the current schema with the calibrated initial LR and augmentation setting
 (results/lr/chosen_lr.json, or --lr / --augment) and one epoch budget are loaded.
 
@@ -51,6 +62,7 @@ Figures -> <results>/figures/, tables -> <results>/tables/:
   fig9_cut_tau                time to target vs cut and vs tau (if run)
   fig10_compute_regimes       time to target: uplink only / edge-GPU / IoT-CPU (Sun et al.) devices
   fig11_path_gains            unequal path gains (exp `pathloss`): accuracy, time to target, s/round vs spread
+  fig12_digital_transport     digital baselines: access (OFDMA / ZF) x payload (FP32 / FP16)
   fig2d_curves_all_snr_<axis>, fig11b_curves_all_spreads_<axis>
                               learning curves of all methods at every SNR / path-gain spread (--sweep-curves)
   fig1d_acc_vs_training_time_iot  accuracy vs training time with IoT-CPU devices
@@ -96,6 +108,8 @@ STYLE = {
     "digital_sflv1":     dict(label="Digital SFL-V1 (OFDMA)", color="#1f77b4", marker="s", lw=1.8, ls="-"),
     "digital_fedavg":    dict(label="Digital FedAvg (OFDMA)", color="#7f7f7f", marker="v", lw=1.6, ls="--"),
     "airsfl_errfree":    dict(label="AirSFL, error-free (upper bound)", color="#d62728", marker="*", lw=1.6, ls=":"),
+    # sensitivity variant (fig12 / table_digital_transport; drawn elsewhere only via --methods)
+    "digital_fedavg_zf":   dict(label="Digital FedAvg (ZF)", color="#bcbd22", marker="1", lw=1.4, ls="-."),
 }
 # computation presets, all recomputed from the stored FLOP counts and client draws (no retraining):
 # (client TFLOPS lo, hi, M-server TFLOPS)
@@ -108,11 +122,18 @@ PART_NAME = {"iid": "IID", "dirichlet": "Non-IID (Dirichlet)"}   # alpha filled 
 # families side by side: analog, hybrid (ZF / OFDMA activations), digital SFL (ZF / OFDMA), FedAvg
 ALL_METHODS = ["airsfl", "aircomp_fl", "hybrid_zf_aircomp", "sun_fdma_aircomp", "digital_sflv1_zf",
                "digital_sflv1", "digital_fedavg"]
+EXTRA_METHODS = ["digital_fedavg_zf"]
 ORDER = list(ALL_METHODS)             # methods drawn (plots.py --methods)
-# multi-user ZF digital baselines, derived from the parent runs (identical learning, ZF timing)
-DERIVED = {"digital_sflv1_zf": "digital_sflv1", "hybrid_zf_aircomp": "sun_fdma_aircomp"}
-DIGITAL = ("digital_sflv1", "digital_fedavg", "digital_sflv1_zf")   # learning independent of the SNR
-ENV0 = dict(N=30, Nr=64, Nr_F=64, S=120, eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0, batch_size=16)
+# digital baselines derived from their parent runs (identical learning, multi-user ZF timing:
+# all tones, concurrent streams separated by ZF)
+DERIVED = {"digital_sflv1_zf": "digital_sflv1", "hybrid_zf_aircomp": "sun_fdma_aircomp",
+           "digital_fedavg_zf": "digital_fedavg"}
+DIGITAL = ("digital_sflv1", "digital_fedavg", "digital_sflv1_zf", "digital_fedavg_zf")   # SNR-independent learning
+# ENV0["q_bits"] = digital payload of the drawn set (--digital-q; set per set in main)
+ENV0 = dict(N=30, Nr=64, Nr_F=64, S=120, eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0, batch_size=16, q_bits=16)
+FP16_PARENTS = ("digital_sflv1", "sun_fdma_aircomp", "digital_fedavg")   # trained methods with digital payloads
+PAYLOAD_METHODS = FP16_PARENTS + tuple(DERIVED)       # drawn from their runs with the chosen payload
+REFS = ("errfree_ref", "target_ref")                  # FP32 digital SFL-V1 / FedAvg kept as references
 TAU0, CUT0, B0 = 5, 2, 16
 AXES = {"uplink": ("uplink_s", "Accumulated uplink communication time (s)"),
         "training": ("training_time_s", "Training time: uplink + computation (s)")}
@@ -158,8 +179,10 @@ _RATE_CACHE = {}
 
 
 def _rates(radio):
-    # digital rates depend on the gains only through the weakest client (Eq. 12)
-    key = (radio.N, radio.Nr, radio.Nr_F, radio.S, radio.eps_D, radio.rho_db, radio.g_min_db)
+    # digital rates depend on the gains through the weakest client (Eq. 12); the payload
+    # precision q enters only the times
+    gains = tuple(sorted(radio.gains_db)) if radio.unequal_gains else None
+    key = (radio.N, radio.Nr, radio.Nr_F, radio.S, radio.eps_D, radio.rho_db, gains)
     if key not in _RATE_CACHE:
         _RATE_CACHE[key] = digital_rates(radio)
     return _RATE_CACHE[key]
@@ -175,11 +198,17 @@ def _gains_of(r0):
     return tuple(json.loads(g)) if isinstance(g, str) and g.strip() else None
 
 
+def _q_of(r0):
+    """Digital payload bits a run was trained / timed with (32 for older CSVs)."""
+    q = r0.get("q_bits") if hasattr(r0, "get") else None
+    return 32 if q is None or (isinstance(q, float) and math.isnan(q)) else int(q)
+
+
 def _radio_of(run, **ov):
     r0 = run.iloc[0]
     kw = dict(N=int(r0.N), Nr=int(r0.Nr), Nr_F=int(r0.Nr_F), S=int(r0.S), eps_D=float(r0.eps_D),
               eps_U=float(r0.eps_U), eps_A=float(r0.eps_A), rho_db=float(r0.rho_db), batch_size=int(r0.B),
-              gains_db=_gains_of(r0))
+              gains_db=_gains_of(r0), q_bits=_q_of(r0))
     kw.update(ov)
     return RadioConfig(**kw)
 
@@ -227,22 +256,128 @@ def _retime(method, run, dims=None, stage=None, **ov):
     return out
 
 
-def _derive_zf(df):
-    """Add the digital multi-user ZF baselines to a set of runs. Their learning is exactly that
-    of the parent run (the digital links are reliable either way, and the hybrid shares the
-    parent's AirComp stream), so every parent run is copied and only its uplink time is
-    recomputed at the ZF rate for that run's own N, antennas, SNR, cut and tau
-    (flsim.airsfl.checks runs both and verifies this)."""
+def _derive(df):
+    """Add the derived digital baselines (multi-user ZF) to a set of runs. Their learning
+    is exactly that of the parent run (the digital links are reliable either way, and the hybrids
+    share the parent's AirComp stream), so every parent run is copied and only its uplink time is
+    recomputed for that run's own N, antennas, SNR, gains, payload precision, cut and tau
+    (flsim.airsfl.checks trains both and verifies this)."""
     if df.empty:
         return df
     out = [df]
-    for zf, parent in DERIVED.items():
+    for der_m, parent in DERIVED.items():
         src = df[df.method == parent]
-        if src.empty or (df.method == zf).any():
+        if src.empty or (df.method == der_m).any():
             continue
-        der = _per_run(src, lambda g: _retime(zf, g))
-        out.append(der.assign(method=zf, label=STYLE[zf]["label"], run_id=der.run_id.astype(str) + "|zf"))
+        der = _per_run(src, lambda g: _retime(der_m, g))
+        out.append(der.assign(method=der_m, label=STYLE[der_m]["label"],
+                              run_id=der.run_id.astype(str) + "|" + der_m))
     return pd.concat(out, ignore_index=True)
+
+
+_derive_zf = _derive                     # former name
+
+
+def _q_col(df):
+    """Digital payload bits of every row (32 for CSVs written before the column existed)."""
+    if "q_bits" not in df:
+        return pd.Series(32, index=df.index)
+    return pd.to_numeric(df["q_bits"], errors="coerce").fillna(32).astype(int)
+
+
+def _select_payload(d, q):
+    """The data sets drawn with a q-bit digital payload. Methods that upload tensors digitally
+    (PAYLOAD_METHODS) keep only their q-bit runs: for q = 16 those in each experiment's folder
+    plus, for main / snr, the runs of --exp fp16 (20 dB -> main, other SNRs -> snr); a run found
+    in two folders (same run_id) counts once. AirSFL / AirComp-FL keep their runs (trained with
+    the FP32 identity; their training and timing do not depend on q). Each experiment's FP32
+    digital SFL-V1 / FedAvg runs are added as "errfree_ref" / "target_ref" -- the exact
+    error-free reference and the reference of the target rule -- so both payload sets share
+    the same targets and the same upper bound."""
+    fp = d.get("fp16", pd.DataFrame())
+    out = {}
+    for e, df in d.items():
+        if e == "fp16" or df.empty:
+            if e != "fp16":
+                out[e] = df
+            continue
+        qc = _q_col(df)
+        pay = df.method.isin(PAYLOAD_METHODS)
+        other = df[~pay]
+        oq = _q_col(other)
+        # an analog method trained with q = 16 (older runner) duplicates its q = 32 run: keep one
+        other = other[(oq == 32) | ~other.method.isin(set(other.method[oq == 32]))]
+        parts = [df[pay & (qc == q)], other]
+        if q == 16 and not fp.empty and e in ("main", "snr"):
+            f = fp[fp.method.isin(PAYLOAD_METHODS) & (_q_col(fp) == 16)]
+            parts.append(f[f.rho_db == 20.0] if e == "main" else f[f.rho_db != 20.0])
+        exact = df[qc == 32]
+        for m, ref in (("digital_sflv1", "errfree_ref"), ("digital_fedavg", "target_ref")):
+            r = exact[exact.method == m]
+            if not r.empty:
+                parts.append(r.assign(method=ref, run_id=r.run_id.astype(str) + "|" + ref))
+        parts = [x for x in parts if not x.empty]
+        sel = pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0]
+        out[e] = sel.drop_duplicates(subset=["run_id", "round"]).reset_index(drop=True)
+    return out
+
+
+_KEY = ["method", "partition", "seed", "rho_db", "N", "Nr", "cut", "tau", "path_gain_spread_db"]
+
+
+def _report_missing(d, sel, q):
+    """List the trained digital-payload runs that exist with another payload but not with q:
+    those points are left out of the q-bit figures (never replaced by the other payload)."""
+    groups = {}
+    for e, df in d.items():
+        if e == "fp16" or df.empty:
+            continue
+        cols = [c for c in _KEY if c in df]
+        keys = lambda x: set(map(tuple, x[cols].drop_duplicates().itertuples(index=False, name=None)))
+        have = sel[e][sel[e].method.isin(FP16_PARENTS)] if not sel[e].empty else sel[e]
+        want = df[df.method.isin(FP16_PARENTS) & (_q_col(df) != q)]
+        for k in sorted(keys(want) - (keys(have) if not have.empty else set())):
+            r = dict(zip(cols, k))
+            groups.setdefault((e, r["method"]), []).append(
+                f"{r['partition']} s{int(r['seed'])} {float(r['rho_db']):g} dB N={int(r['N'])}"
+                + (f" spread {float(r['path_gain_spread_db']):g} dB" if float(r.get("path_gain_spread_db", 0) or 0)
+                   else ""))
+    if not groups:
+        print(f"[plots] FP{q} digital payload: every digital-payload run has its FP{q} version")
+    else:
+        print(f"[plots] FP{q} digital payload: these runs exist only with another payload, so they are LEFT OUT of "
+              f"the FP{q} figures (train them with run_airsfl.py --digital-q {q}; finished runs are skipped):")
+        for (e, m), pts in sorted(groups.items()):
+            print(f"    {e:9s} {m:17s} {len(pts):3d} run(s): " + "; ".join(pts[:6]) + (" ..." if len(pts) > 6 else ""))
+    main = sel.get("main", pd.DataFrame())
+    if q == 32 or main.empty:
+        return                                  # FP32 set: a missing FP32 run is already listed above
+    seeds = lambda m: set(zip(main.partition[main.method == m], main.seed[main.method == m].astype(int)))
+    for ref, src, what in (("errfree_ref", "digital_sflv1", "error-free curve"),
+                           ("target_ref", "digital_fedavg", "target rule")):
+        gap = sorted(seeds("airsfl") - seeds(ref))
+        if gap:
+            print(f"[plots] FP32 {src} run (main) missing for {gap}: the {what} uses the other seeds "
+                  f"(train it with run_airsfl.py --digital-q 32)")
+
+
+def _payload_of(m, run):
+    """Digital payload of a method's uploads as recorded by its run."""
+    if m in PAYLOAD_METHODS:
+        return f"FP{_q_of(run.iloc[0])}"
+    return "labels only" if m in SPLIT_METHODS else "none"
+
+
+def _pl():
+    return f"digital FP{ENV0['q_bits']}"
+
+
+def _mb_per_round(run):
+    """Source-equivalent uplink MB per round of a run, counted at the drawn digital payload
+    precision (the CSV column mb_per_round is the FP32 reference)."""
+    r0 = run.iloc[0]
+    dims = {"d_c": int(r0.d_c), "d_s": int(r0.d_s), "d_a": int(r0.d_a)}
+    return source_equivalent_mb_per_round(r0.method, dims, _radio_of(run), int(r0.tau), q_ref=ENV0["q_bits"])
 
 
 def _with_compute(run, preset):
@@ -266,8 +401,10 @@ def _airsfl_error_free(main, scheme):
     """Noise-free AirSFL = digital SFL-V1's learning trajectory (bitwise identical, see checks)
     placed on AirSFL's per-round uplink time: the error-free upper bound. The computation per
     round of the two is identical for a seed (same cut, same client draws), so each seed keeps
-    its own. `main` holds one operating SNR (20 dB, or the one chosen with --snr)."""
-    dig = main[(main.partition == scheme) & (main.method == "digital_sflv1")]
+    its own. `main` holds one operating SNR (20 dB, or the one chosen with --snr). The exact FP32
+    digital SFL-V1 runs ("errfree_ref", _select_payload) are used whatever the drawn payload."""
+    ref = "errfree_ref" if (main.method == "errfree_ref").any() else "digital_sflv1"
+    dig = main[(main.partition == scheme) & (main.method == ref)]
     air = main[(main.partition == scheme) & (main.method == "airsfl")]
     if dig.empty or air.empty:
         return pd.DataFrame()
@@ -278,11 +415,13 @@ def _airsfl_error_free(main, scheme):
 def _main_at(main, snr, rho):
     """The operating-point data set at SNR rho, from the CSVs: analog methods from the SNR sweep
     at rho (ZF hybrid derived from its runs), digital methods (SNR-independent learning)
-    retimed at rho. rho = 20 dB is `main` itself."""
+    retimed at rho, plus the error-free / target references. rho = 20 dB is `main` itself."""
     if rho == 20.0:
         return main
     frames = [r for scheme in _schemes(main) for m in ALL_METHODS
               for r in [_snr_runs(main, snr, scheme, m, rho)] if not r.empty]
+    frames.append(main[main.method.isin(REFS)])
+    frames = [f for f in frames if not f.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -323,7 +462,8 @@ def _seed_txt(n):
 
 
 def rule_target(df, scheme):
-    ref = df[(df.partition == scheme) & (df.method == "digital_fedavg")]
+    m = "target_ref" if (df.method == "target_ref").any() else "digital_fedavg"   # the FP32 FedAvg if present
+    ref = df[(df.partition == scheme) & (df.method == m)]
     if ref.empty:
         return None
     return math.floor(100 * 0.95 * float(_curve(ref)["val_acc"].iloc[-1])) / 100.0
@@ -479,7 +619,7 @@ def fig1_and_table(main):
     if not schemes:
         return
     ns = _nseeds(main)
-    env = f"N=30, Nr=64 (M & F), W=1.8 MHz, {ENV0['rho_db']:g} dB, cut 2, tau=5; {_seed_txt(ns)}"
+    env = f"N=30, Nr=64 (M & F), W=1.8 MHz, {ENV0['rho_db']:g} dB, cut 2, tau=5, {_pl()}; {_seed_txt(ns)}"
     for axis, fname in (("uplink", "fig1_acc_vs_uplink_time"), ("training", "fig1c_acc_vs_training_time")):
         xcol, xlab = AXES[axis]
         fig, axes = plt.subplots(1, len(schemes), figsize=(6.3 * len(schemes), 4.7), squeeze=False)
@@ -537,20 +677,22 @@ def fig1_and_table(main):
                 sr = paired_speedup(st_tr["digital_sflv1"], st_tr[m]) if "digital_sflv1" in st_tr else (np.nan,) * 4
                 xu = paired_speedup(st_ul[m], st_ul["airsfl"]) if "airsfl" in st_ul else (np.nan,) * 4
                 xr = paired_speedup(st_tr[m], st_tr["airsfl"]) if "airsfl" in st_tr else (np.nan,) * 4
+                mb = _mb_per_round(dm)
                 rows.append({"partition": PART_NAME[scheme], "method": STYLE[m]["label"],
+                             "digital payload": _payload_of(m, dm),
                              "SNR (dB)": float(r0.rho_db), "seeds": st_ul[m]["n"],
                              "UL s/round": float(r0.ul_s_per_round), "act s/round": float(r0.activation_ul_s),
                              "labels s/round": float(r0.labels_ul_s), "agg s/round": float(r0.aggregation_ul_s),
                              "compute s/round": float(r0.compute_s_per_round),
                              "client FP+BP s/round": float(r0.client_fp_s + r0.client_bp_s),
                              "server FP+BP s/round": float(r0.server_fp_s + r0.server_bp_s),
-                             "training s/round": float(r0.e2e_s_per_round), "MB/round": float(r0.mb_per_round),
+                             "training s/round": float(r0.e2e_s_per_round), f"MB/round (FP{ENV0['q_bits']})": mb,
                              "final test acc (%)": acc, "acc min": amin, "acc max": amax,
                              "target val acc (%)": 100 * A, "reached": f"{st_ul[m]['hit']}/{st_ul[m]['n']}",
                              "rounds to target": st_ul[m]["k"], "epochs to target": st_ul[m]["epochs"],
                              "UL time to target (s)": st_ul[m]["t"],
                              "training time to target (s)": st_tr[m]["t"],
-                             "MB to target": st_ul[m]["k"] * float(r0.mb_per_round),
+                             f"MB to target (FP{ENV0['q_bits']})": st_ul[m]["k"] * mb,
                              "UL time / AirSFL (paired)": xu[0], "training time / AirSFL (paired)": xr[0],
                              "UL speed-up vs SFL-V1 (paired)": su[0], "training speed-up vs SFL-V1 (paired)": sr[0]})
     if rows:
@@ -621,7 +763,8 @@ def fig2_snr(main, snr):
                 agg = run[run["round"] >= 1]["agg_nsr_db"].mean() if m in ("airsfl", "sun_fdma_aircomp",
                                                                           "hybrid_zf_aircomp", "aircomp_fl") \
                     else np.nan
-                rows.append({"partition": PART_NAME[scheme], "method": st["label"], "SNR (dB)": rho,
+                rows.append({"partition": PART_NAME[scheme], "method": st["label"],
+                             "digital payload": _payload_of(m, run), "SNR (dB)": rho,
                              "UL s/round": float(run.ul_s_per_round.iloc[0]),
                              "training s/round": float(run.e2e_s_per_round.iloc[0]),
                              "seeds": su["n"], "final test acc (%)": a, "acc min": amin, "acc max": amax,
@@ -657,7 +800,8 @@ def fig2_snr(main, snr):
         axes[i][0].set_xlabel("Reference SNR rho (dB)")
         axes[i][0].set_ylabel("Final test accuracy (%)")
         axes[i][0].set_title(f"{PART_NAME[scheme]}: final accuracy vs SNR (bars = seed min-max)\n"
-                             "digital learning is SNR-independent; ZF variants = their OFDMA twins", fontsize=10.5)
+                             f"digital (FP{ENV0['q_bits']}) learning is SNR-independent; ZF variants = their OFDMA twins",
+                             fontsize=10.5)
         for j, axis in ((1, "uplink"), (2, "training")):
             axes[i][j].set_yscale("log")
             lo_y, hi_y = axes[i][j].get_ylim()
@@ -697,7 +841,7 @@ def fig2_snr(main, snr):
         ax.set_ylabel("Test accuracy (%)")
         ax.set_title(f"SNR sweep — {PART_NAME[scheme]}")
     _fig_legend(fig, axes, ncol=4)
-    fig.suptitle("AirSFL: airtime is SNR-independent, distortion is not; digital: accuracy fixed, "
+    fig.suptitle(f"AirSFL: airtime is SNR-independent, distortion is not; digital (FP{ENV0['q_bits']}): accuracy fixed, "
                  "rate falls at low SNR", y=1.02, fontsize=11)
     _save(fig, "fig2b_airsfl_snr_curves")
 
@@ -820,7 +964,8 @@ def fig_sweep_curves(main, snr, pl):
     if len(rhos) > 1:
         for axis in SWEEP_CURVES["axes"]:
             _sweep_curves(f"fig2d_curves_all_snr_{axis}",
-                          "Learning curves at every SNR (digital learning is SNR-independent, its rate is not)",
+                          f"Learning curves at every SNR ({_pl()}; digital learning is SNR-independent, its rate "
+                          f"is not)",
                           schemes, [(f"rho = {r:g} dB", r) for r in rhos],
                           lambda s, m, r: ef(s) if m == "airsfl_errfree" else _snr_runs(main, snr, s, m, r),
                           axis, SWEEP_CURVES["xscale"])
@@ -831,8 +976,8 @@ def fig_sweep_curves(main, snr, pl):
             tag = f"_rho{rho:g}" if len(pl_rhos) > 1 else ""
             for axis in SWEEP_CURVES["axes"]:
                 _sweep_curves(f"fig11b_curves_all_spreads_{axis}{tag}",
-                              f"Learning curves at every path-gain spread ({rho:g} dB median client; digital uploads "
-                              f"wait for the weakest client)", schemes, [(f"spread {s:g} dB", s) for s in spreads],
+                              f"Learning curves at every path-gain spread ({rho:g} dB median client, {_pl()}; digital "
+                              f"uploads wait for the weakest client)", schemes, [(f"spread {s:g} dB", s) for s in spreads],
                               lambda sc, m, s, rho=rho: ef(sc) if m == "airsfl_errfree"
                               else _spread_runs(main, snr, pl, sc, m, s, rho),
                               axis, SWEEP_CURVES["xscale"])
@@ -901,7 +1046,7 @@ def fig11_path_gains(main, snr, pl):
             axes[i][0].set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB: final accuracy", fontsize=10.5)
             axes[i][1].set_title(f"uplink time to {100 * A:.0f}% val. acc. (x at the top = not reached)"
                                  if A else "uplink time to target", fontsize=10.5)
-            axes[i][2].set_title("per-round uplink time (digital: paced by the weakest client)", fontsize=10.5)
+            axes[i][2].set_title(f"per-round uplink time ({_pl()}: paced by the weakest client)", fontsize=10.5)
         fig.tight_layout()
         _fig_legend(fig, axes, ncol=4)
         _save(fig, "fig11_path_gains" + (f"_rho{rho:g}" if len(set(pl.rho_db)) > 1 else ""))
@@ -946,8 +1091,8 @@ def fig1e_linear_time(main, snr):
             ax.set_xlabel(AXES["uplink"][1])
             ax.set_ylabel("Test accuracy (%)")
             ax.set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB", fontsize=10.5)
-    fig.suptitle("Accuracy vs uplink time, linear axis (same equal-period schedule for all methods: curves differ "
-                 "by airtime per round and, at low SNR, by analog distortion; dotted = epoch budget used up)",
+    fig.suptitle(f"Accuracy vs uplink time, linear axis, {_pl()} (same equal-period schedule for all methods: curves "
+                 "differ by airtime per round and, at low SNR, by analog distortion; dotted = epoch budget used up)",
                  y=1.01, fontsize=10.5)
     fig.tight_layout()
     _fig_legend(fig, axes, ncol=4)
@@ -1030,7 +1175,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     ax.set_title("All methods (log scale; FL has no activation phase)")
     ax.legend(fontsize=7, ncol=2, loc="upper left")
     fig.suptitle(f"Per-round uplink airtime by phase (cut {stage}, tau={tau}, Nr=64 at both servers, W=1.8 MHz, "
-                 f"{ENV0['rho_db']:g} dB, eps=0.6):\nanalog time is independent of N; digital OFDMA time grows ~N (S/N tones "
+                 f"{ENV0['rho_db']:g} dB, eps=0.6, {_pl()}):\nanalog time is independent of N; digital OFDMA time grows ~N (S/N tones "
                  f"per client), digital ZF only through the ZF gain Nr-N+1", y=1.02, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig3_uplink_breakdown")
@@ -1052,7 +1197,8 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
                          "compute s/round (f_min=lo)": c["total"], "training s/round": b["total"] + c["total"],
                          "d_c": dims_all[s]["d_c"], "d_s": dims_all[s]["d_s"], "d_a": dims_all[s]["d_a"],
                          "tau*d_a < d_s": tau * dims_all[s]["d_a"] < dims_all[s]["d_s"],
-                         "MB/round": source_equivalent_mb_per_round(m, dims_all[s], r, tau)})
+                         f"MB/round (FP{r.q_bits})": source_equivalent_mb_per_round(m, dims_all[s], r, tau,
+                                                                                    q_ref=r.q_bits)})
         ax.bar(np.arange(4) + (j - (len(ORDER) - 1) / 2) * wb, vals, width=wb, color=STYLE[m]["color"],
                edgecolor="k", lw=0.4, label=STYLE[m]["label"])
     ax.set_yscale("log")
@@ -1061,7 +1207,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     ax.set_xticklabels([f"cut {s}{' (default)' if s == stage else ''}\nd_a={dims_all[s]['d_a']/1e6:.2f}M\n"
                         f"d_c={dims_all[s]['d_c']/1e6:.2f}M" for s in (1, 2, 3, 4)], fontsize=9)
     ax.set_ylabel("Uplink seconds per round")
-    ax.set_title(f"Per-round uplink time vs cut (N=30, {ENV0['rho_db']:g} dB): with equal analog efficiencies and\n"
+    ax.set_title(f"Per-round uplink time vs cut (N=30, {ENV0['rho_db']:g} dB, {_pl()}): with equal analog efficiencies and\n"
                  "negligible labels, AirSFL < AirComp-FL when tau*d_a < d_s", fontsize=10.5)
     ax.legend(fontsize=8, ncol=4, loc="upper center")
     _save(fig, "fig3b_uplink_vs_cut")
@@ -1094,8 +1240,8 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     ax1.set_xticks(x)
     ax1.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
     ax1.set_ylabel("Seconds per round")
-    ax1.set_title(f"(a) Per-round time (cut 2, N=30, {ENV0['rho_db']:g} dB, slowest client 1 TFLOPS, M-server 20 TFLOPS)",
-                  fontsize=10)
+    ax1.set_title(f"(a) Per-round time (cut 2, N=30, {ENV0['rho_db']:g} dB, {_pl()}, slowest client 1 TFLOPS, "
+                  f"M-server 20 TFLOPS)", fontsize=10)
     ax1.legend(fontsize=8, loc="upper left")
     left = np.zeros(len(ORDER))
     for name, col in parts:
@@ -1122,7 +1268,7 @@ def fig4_overhead(main):
     dims = profiled_dims(B0)[CUT0]
     fig, (ax, axb) = plt.subplots(1, 2, figsize=(14, 5.2))
     for m in ORDER:
-        mb = source_equivalent_mb_per_round(m, dims, r, TAU0)
+        mb = source_equivalent_mb_per_round(m, dims, r, TAU0, q_ref=r.q_bits)
         ul = uplink_time_per_round(m, dims, r, TAU0, _rates(r))
         st = STYLE[m]
         ax.scatter([mb], [ul], s=130, color=st["color"], marker=st["marker"], edgecolor="k", zorder=5,
@@ -1133,8 +1279,8 @@ def fig4_overhead(main):
                     xytext=(-10, 2) if left else (10, -6 if m.startswith("hybrid") or m.startswith("sun") else -3),
                     ha="right" if left else "left", fontsize=8.5, color=st["color"], fontweight="bold")
     ax.legend(fontsize=7.5, loc="upper center", ncol=2)
-    sfl_mb = source_equivalent_mb_per_round("airsfl", dims, r, TAU0)
-    fl_mb = source_equivalent_mb_per_round("aircomp_fl", dims, r, TAU0)
+    sfl_mb = source_equivalent_mb_per_round("airsfl", dims, r, TAU0, q_ref=r.q_bits)
+    fl_mb = source_equivalent_mb_per_round("aircomp_fl", dims, r, TAU0, q_ref=r.q_bits)
     ax.axvline(sfl_mb, color="k", ls=":", lw=1)
     t_air = uplink_time_per_round("airsfl", dims, r, TAU0, _rates(r))
     n_sfl = sum(m in SPLIT_METHODS for m in ORDER)
@@ -1148,9 +1294,9 @@ def fig4_overhead(main):
     ax.set_yscale("log")
     ax.set_ylim(0.1, 3e4)                                  # headroom for the legend
     ax.set_xlim(0, fl_mb * 1.3)
-    ax.set_xlabel("Source-equivalent uplink volume per round (MB)")
+    ax.set_xlabel(f"Source-equivalent uplink volume per round (MB, {r.q_bits}-bit values)")
     ax.set_ylabel("Uplink airtime per round (s)")
-    ax.set_title(f"(a) Bytes vs airtime per round (cut {CUT0}, {ENV0['rho_db']:g} dB)")
+    ax.set_title(f"(a) Bytes vs airtime per round (cut {CUT0}, {ENV0['rho_db']:g} dB, {_pl()})")
     x = np.arange(len(ORDER))
     any_bar = False
     schemes = _schemes(main)
@@ -1160,7 +1306,7 @@ def fig4_overhead(main):
         vals = []
         for m in ORDER:
             dm = main[(main.partition == scheme) & (main.method == m)]
-            vals.append(ttt(dm, A)["k"] * float(dm.mb_per_round.iloc[0]) / 1e3 if not dm.empty else np.nan)
+            vals.append(ttt(dm, A)["k"] * _mb_per_round(dm) / 1e3 if not dm.empty else np.nan)
         xs = x + (si - (len(schemes) - 1) / 2) * width
         axb.bar(xs, vals, width=width, color=["#1f77b4", "#ff7f0e"][si], alpha=0.85, label=PART_NAME[scheme])
         for xi, v in zip(xs, vals):
@@ -1170,7 +1316,7 @@ def fig4_overhead(main):
                 any_bar = True
     axb.set_xticks(x)
     axb.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
-    axb.set_ylabel("Source-equivalent GB to target")
+    axb.set_ylabel(f"Source-equivalent GB to target ({ENV0['q_bits']}-bit values)")
     axb.set_title("(b) Uplink source volume to reach the target (not airtime)")
     if any_bar:
         axb.legend(fontsize=8)
@@ -1204,7 +1350,7 @@ def fig5_nr(main, nr):
         for m in ("digital_sflv1_zf", "digital_sflv1"):
             ref = main[(main.partition == scheme) & (main.method == m)] if not main.empty else main
             if m in ORDER and not ref.empty:
-                _plot_curve(ax, ref, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']} (Nr=64)")
+                _plot_curve(ax, ref, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']} (Nr=64, FP{ENV0['q_bits']})")
         ax.set_xscale("log")
         ax.set_xlabel(AXES["uplink"][1])
         ax.set_ylabel("Test accuracy (%)")
@@ -1255,7 +1401,7 @@ def fig6_time_to_target(main):
             ax.set_title(f"{PART_NAME[scheme]}: {axis} time to {100*A:.0f}% validation accuracy" if A
                          else PART_NAME[scheme], fontsize=10.5)
     ns = _nseeds(main)
-    fig.suptitle(f"Time to the target accuracy at {ENV0['rho_db']:g} dB ({_seed_txt(ns)}; labels: time, method time / AirSFL time "
+    fig.suptitle(f"Time to the target accuracy at {ENV0['rho_db']:g} dB, {_pl()} ({_seed_txt(ns)}; labels: time, method time / AirSFL time "
                  f"paired per seed, (k/n) seeds that reached it)", y=1.01, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig6_time_to_target")
@@ -1319,7 +1465,7 @@ def fig7_nsweep(main, nsweep):
             ax.set_ylabel(f"{axis.capitalize()} time to target (s)")
             ax.set_title(f"{PART_NAME[scheme]}: {axis} time to {100*A:.0f}%  (× = not reached)", fontsize=10.5)
     axes[0][0].legend(fontsize=7.5, ncol=2, loc="upper left")
-    fig.suptitle("Client count at fixed Nr=64 and W=1.8 MHz: time to a common target", y=1.01, fontsize=11)
+    fig.suptitle(f"Client count at fixed Nr=64 and W=1.8 MHz ({_pl()}): time to a common target", y=1.01, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig7_nsweep")
     if rows:
@@ -1365,7 +1511,7 @@ def fig8_efficiency(main, eps_list=(0.4, 0.6, 0.7)):
         ax.set_title(f"{PART_NAME[scheme]}: uplink time to {100*A:.0f}% (digital eps_D=0.6 unless ideal)"
                      if A else PART_NAME[scheme], fontsize=10.5)
         ax.legend(fontsize=7.5)
-    fig.suptitle(f"Efficiency sensitivity at {ENV0['rho_db']:g} dB: declared overhead factors (same training runs, "
+    fig.suptitle(f"Efficiency sensitivity at {ENV0['rho_db']:g} dB, {_pl()}: declared overhead factors (same training runs, "
                  f"time recomputed)",
                  y=1.02, fontsize=11)
     fig.tight_layout()
@@ -1490,7 +1636,7 @@ def fig10_compute_regimes(main):
                      f"(labels: method time / AirSFL time)" if A else PART_NAME[scheme], fontsize=10.5)
         ax.legend(fontsize=7.5, loc="upper left")
         ax.set_ylim(top=ax.get_ylim()[1] * 30)
-    fig.suptitle(f"How much computation changes the comparison at {ENV0['rho_db']:g} dB (same training runs; "
+    fig.suptitle(f"How much computation changes the comparison at {ENV0['rho_db']:g} dB, {_pl()} (same training runs; "
                  f"downlinks ideal)",
                  y=1.02, fontsize=11)
     fig.tight_layout()
@@ -1516,8 +1662,112 @@ def fig10_compute_regimes(main):
         ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}"
                      + (f" (target {100 * A:.0f}%)" if A is not None else ""))
     _fig_legend(fig, axes, ncol=4)
-    fig.suptitle(f"Accuracy vs training time at {ENV0['rho_db']:g} dB, {name}", y=1.02, fontsize=11)
+    fig.suptitle(f"Accuracy vs training time at {ENV0['rho_db']:g} dB, {_pl()}, {name}", y=1.02, fontsize=11)
     _save(fig, "fig1d_acc_vs_training_time_iot")
+
+
+# ---------------------------------------------------------------------------
+# Figure 12 + table_digital_transport: sensitivity of the digital baselines to the transport
+# ---------------------------------------------------------------------------
+
+TRANSPORT_FAMILIES = [
+    ("Digital SFL-V1", {"OFDMA": "digital_sflv1", "ZF": "digital_sflv1_zf"}),
+    ("Hybrid SFL (digital act. + AirComp)", {"OFDMA": "sun_fdma_aircomp", "ZF": "hybrid_zf_aircomp"}),
+    ("Digital FedAvg", {"OFDMA": "digital_fedavg", "ZF": "digital_fedavg_zf"}),
+]
+ACCESS_STYLE = {"OFDMA": ("#1f77b4", "S/N tones each, concurrent (paper)"),
+                "ZF": ("#17becf", "all tones, concurrent, ZF separation")}
+
+
+def fig12_digital_transport(sets):
+    """Sensitivity of the digital baselines to their transport at the nominal SNR: access scheme
+    (OFDMA = the paper's; multi-user ZF) x payload precision (FP16 = the default, trained with
+    really rounded uploads; FP32). sets = {q: main data set drawn with q-bit payloads}. (a)
+    uplink seconds per round (analytic), then the uplink time to the primary target per
+    partition, each payload from its own runs. AirSFL (the same runs for both payloads) is the
+    dashed line; labels = method / AirSFL (paired per seed)."""
+    main = sets[ENV0["q_bits"]]
+    schemes = _schemes(main)
+    dims = profiled_dims(B0)[CUT0]
+    radios = {q: _radio(q_bits=q) for q in (32, 16)}
+    t_air = uplink_time_per_round("airsfl", dims, radios[32], TAU0, _rates(radios[32]))
+    combos = [(acc, q) for acc in ACCESS_STYLE for q in (32, 16)]
+    w = 0.8 / len(combos)
+    fig, axes = plt.subplots(1, 1 + len(schemes), figsize=(6.4 * (1 + len(schemes)), 5.4), squeeze=False)
+    axes = axes[0]
+    rows = []
+
+    def draw(ax, fi, ci, val, lab_ratio):
+        acc, q = combos[ci]
+        col = ACCESS_STYLE[acc][0]
+        x = fi + (ci - (len(combos) - 1) / 2) * w
+        if np.isnan(val):
+            ax.text(x, 0.02, "no\nrun", ha="center", fontsize=6, color=col, transform=ax.get_xaxis_transform())
+            return
+        ax.bar(x, val, width=w, color=col, alpha=1.0 if q == 32 else 0.55, hatch=None if q == 32 else "//",
+               edgecolor="k", lw=0.4)
+        if not np.isnan(lab_ratio):
+            ax.text(x, val * 1.15, _ratio_txt(lab_ratio), ha="center", va="bottom", fontsize=6.5, rotation=90)
+
+    # (a) per-round uplink time, analytic
+    for fi, (fam, ms) in enumerate(TRANSPORT_FAMILIES):
+        for ci, (acc, q) in enumerate(combos):
+            t = uplink_time_per_round(ms[acc], dims, radios[q], TAU0, _rates(radios[q]))
+            draw(axes[0], fi, ci, t, t / t_air)
+            rows.append({"partition": "analytic (per round)", "family": fam, "access": acc, "payload": f"FP{q}",
+                         "method": ms[acc], "UL s/round": t, "UL s/round / AirSFL": t / t_air})
+    axes[0].axhline(t_air, color=STYLE["airsfl"]["color"], ls="--", lw=1.5)
+    axes[0].set_title(f"(a) uplink seconds per round (cut {CUT0}, N=30, 20 dB); AirSFL = {t_air:.2f} s",
+                      fontsize=10.5)
+    axes[0].set_ylabel("Uplink seconds per round")
+    # (b, c) uplink time to the primary target (learning from the runs of each payload)
+    for pi, scheme in enumerate(schemes):
+        ax = axes[1 + pi]
+        A = primary_target(main, scheme)
+        air = ttt(main[(main.partition == scheme) & (main.method == "airsfl")], A, "uplink_s")
+        for fi, (fam, ms) in enumerate(TRANSPORT_FAMILIES):
+            for ci, (acc, q) in enumerate(combos):
+                src = sets.get(q, pd.DataFrame())
+                dm = src[(src.partition == scheme) & (src.method == ms[acc])] if not src.empty else src
+                if dm.empty:
+                    draw(ax, fi, ci, np.nan, np.nan)
+                    rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"FP{q}",
+                                 "method": ms[acc], "note": f"no FP{q} run"})
+                    continue
+                s = ttt(dm, A, "uplink_s")
+                ratio = paired_speedup(s, air)[0] if air["hit"] > 0 and s["hit"] > 0 else np.nan
+                draw(ax, fi, ci, s["t"] if s["hit"] > 0 else np.nan, ratio)
+                acc_m, lo, hi = final_acc(dm)
+                rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"FP{q}",
+                             "method": ms[acc], "seeds": s["n"], "UL s/round": float(dm.ul_s_per_round.iloc[0]),
+                             "UL s/round / AirSFL": float(dm.ul_s_per_round.iloc[0]) / t_air,
+                             "final test acc (%)": acc_m, "target val acc (%)": 100 * A if A else np.nan,
+                             "reached": f"{s['hit']}/{s['n']}", "UL time to target (s)": s["t"],
+                             "UL time / AirSFL (paired)": ratio,
+                             "training time to target (s)": ttt(dm, A, "training_time_s")["t"]})
+        if air["hit"] > 0:
+            ax.axhline(air["t"], color=STYLE["airsfl"]["color"], ls="--", lw=1.5)
+        ax.set_title(f"({'bc'[pi]}) {PART_NAME[scheme]}: uplink time to {100 * A:.0f}% val. acc."
+                     + (f"; AirSFL = {air['t']:.3g} s" if air["hit"] > 0 else "") if A else PART_NAME[scheme],
+                     fontsize=10.5)
+        ax.set_ylabel("Uplink time to target (s)")
+    for ax in axes:
+        ax.set_yscale("log")
+        ax.set_ylim(top=ax.get_ylim()[1] * 20)
+        ax.set_xticks(range(len(TRANSPORT_FAMILIES)))
+        ax.set_xticklabels([f for f, _ in TRANSPORT_FAMILIES], fontsize=9)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=ACCESS_STYLE[a][0], ec="k", lw=0.4) for a in ACCESS_STYLE] + \
+        [plt.Rectangle((0, 0), 1, 1, fc="white", ec="k", lw=0.4),
+         plt.Rectangle((0, 0), 1, 1, fc="white", ec="k", lw=0.4, hatch="//"),
+         plt.Line2D([], [], color=STYLE["airsfl"]["color"], ls="--", lw=1.5)]
+    labels = [f"{a}: {ACCESS_STYLE[a][1]}" for a in ACCESS_STYLE] + \
+        ["FP32 payload", "FP16 payload (default; rounded uploads)", "AirSFL"]
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=5, fontsize=8.5, frameon=False)
+    fig.suptitle("Digital-transport sensitivity at 20 dB: access scheme x payload precision "
+                 "(bar labels = method / AirSFL)", y=1.02, fontsize=11)
+    fig.tight_layout()
+    _save(fig, "fig12_digital_transport")
+    _write_table(pd.DataFrame(rows), "table_digital_transport")
 
 
 def main():
@@ -1537,9 +1787,13 @@ def main():
     p.add_argument("--server-tflops", type=float, default=None, help="recompute with this M-server TFLOPS")
     p.add_argument("--budget-uplink", type=float, default=None, help="fig2c budget on the uplink axis (s)")
     p.add_argument("--budget-training", type=float, default=None, help="fig2c budget on the training axis (s)")
-    p.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS,
-                   help="methods to draw (default all; the ZF baselines are derived from the digital_sflv1 / "
-                        "sun_fdma_aircomp runs)")
+    p.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS + EXTRA_METHODS,
+                   help="methods to draw (default: the 7 main ones; the ZF variants are derived from the "
+                        "digital_sflv1 / sun_fdma_aircomp / digital_fedavg runs; the FedAvg-ZF variant appears in "
+                        "fig12 regardless)")
+    p.add_argument("--digital-q", nargs="+", type=int, default=[16], choices=[16, 32],
+                   help="digital payload(s) of the drawn figure sets: 16 = the FP16 runs (default) -> figures/, "
+                        "tables/; 32 = the FP32 runs -> figures_q32/, tables_q32/ (--digital-q 16 32: both)")
     p.add_argument("--budget-mult", nargs="+", type=float, default=[1.0],
                    help="fig2c: budgets = base budget x each value, e.g. 1 3 10 (base = AirSFL's full run)")
     p.add_argument("--linear-snrs", nargs="+", type=float, default=None,
@@ -1568,7 +1822,7 @@ def main():
         RESULTS = os.path.abspath(a.results)
         FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
     TARGETS = a.targets
-    ORDER[:] = [m for m in ALL_METHODS if m in a.methods]
+    ORDER[:] = [m for m in ALL_METHODS + EXTRA_METHODS if m in a.methods]
     BUDGETS["uplink"], BUDGETS["training"] = a.budget_uplink, a.budget_training
     cal_path = os.path.join(RESULTS, "lr", "chosen_lr.json")
     cal = json.load(open(cal_path)) if os.path.exists(cal_path) else {}
@@ -1580,7 +1834,7 @@ def main():
     if a.server_tflops:
         COMPUTE["server_tflops"] = a.server_tflops
     skip = lambda e: ("path_gain_spread_db",) if e == "pathloss" else ()     # the spread is its sweep variable
-    d = {e: _filter(_read(e), skip(e)) for e in ("main", "snr", "nr", "nsweep", "cuts", "tau", "pathloss")}
+    d = {e: _filter(_read(e), skip(e)) for e in ("main", "snr", "nr", "nsweep", "cuts", "tau", "pathloss", "fp16")}
     budgets = sorted(set(d["main"].epochs_budget)) if not d["main"].empty else []
     FILTER["epochs_budget"] = a.epochs if a.epochs is not None else (
         float(d["main"].groupby("epochs_budget").run_id.nunique().idxmax()) if budgets else None)
@@ -1601,47 +1855,58 @@ def main():
         PART_NAME["dirichlet"] = f"Non-IID (Dir-{alpha:g})"
     if recompute:
         d = {e: _apply_compute(df) for e, df in d.items()}
-    d = {e: _derive_zf(df) for e, df in d.items()}
+    d = {e: _derive(df) for e, df in d.items()}
     print(f"[plots] results={RESULTS} | filter {FILTER} | compute {COMPUTE} "
           f"({'recomputed' if recompute else 'as stored'}) | targets = "
           f"{TARGETS or 'rule (95% of the error-free reference)'} | methods {ORDER}")
-    fig_dir, tab_dir = FIG, TAB
-    for rho in a.snr:
-        if rho == 20.0:                      # nominal point: every figure, sweeps included
-            ENV0["rho_db"], FIG, TAB = 20.0, fig_dir, tab_dir
+    sets = {q: _select_payload(d, q) for q in (16, 32)}     # both: fig12 compares the payloads
+    for q in a.digital_q:
+        ENV0["q_bits"] = q
+        x = sets[q]
+        tag = "" if q == 16 else f"_q{q}"                   # FP16 (default) -> figures/, FP32 -> figures_q32/
+        _report_missing(d, x, q)
+        if not x["main"].empty and not (x["main"].method == "errfree_ref").any():
+            print(f"[plots] FP{q} set: no FP32 digital SFL-V1 run -> the error-free curve and the target rule use "
+                  f"the drawn digital runs")
+        for rho in a.snr:
+            FIG = os.path.join(RESULTS, f"figures{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
+            TAB = os.path.join(RESULTS, f"tables{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
+            print(f"[plots] digital payload FP{q}, {rho:g} dB -> {FIG}, {TAB}")
+            if rho == 20.0:                  # nominal point: every figure, sweeps included
+                ENV0["rho_db"] = 20.0
+                fig3_breakdown()
+                fig4_overhead(x["main"])
+                fig1_and_table(x["main"])
+                fig2_snr(x["main"], x["snr"])
+                fig1e_linear_time(x["main"], x["snr"])
+                fig11_path_gains(x["main"], x["snr"], x["pathloss"])
+                fig_sweep_curves(x["main"], x["snr"], x["pathloss"])
+                fig5_nr(x["main"], x["nr"])
+                fig6_time_to_target(x["main"])
+                fig7_nsweep(x["main"], x["nsweep"])
+                fig8_efficiency(x["main"])
+                fig9_cut_tau(x["main"], x["cuts"], x["tau"])
+                fig10_compute_regimes(x["main"])
+                fig12_digital_transport({qq: sets[qq]["main"] for qq in (32, 16)})
+                continue
+            # another operating SNR: the main-point figures rebuilt from the CSVs (analog methods from
+            # the SNR sweep at rho, digital methods retimed at rho) into figures_snr<rho>/, tables_snr<rho>/.
+            # The N / cut / tau / antenna sweeps exist only at 20 dB and are not redrawn.
+            if x["snr"].empty or not np.isclose(x["snr"].rho_db.astype(float), rho).any():
+                print(f"[plots] --snr {rho:g}: no SNR-sweep runs at {rho:g} dB in {RESULTS}/snr -> skipped")
+                continue
+            main_rho = _main_at(x["main"], x["snr"], rho)
+            ENV0["rho_db"] = rho
+            print(f"[plots]   methods present at {rho:g} dB: "
+                  f"{sorted(set(main_rho.method)) if not main_rho.empty else []}")
             fig3_breakdown()
-            fig4_overhead(d["main"])
-            fig1_and_table(d["main"])
-            fig2_snr(d["main"], d["snr"])
-            fig1e_linear_time(d["main"], d["snr"])
-            fig11_path_gains(d["main"], d["snr"], d["pathloss"])
-            fig_sweep_curves(d["main"], d["snr"], d["pathloss"])
-            fig5_nr(d["main"], d["nr"])
-            fig6_time_to_target(d["main"])
-            fig7_nsweep(d["main"], d["nsweep"])
-            fig8_efficiency(d["main"])
-            fig9_cut_tau(d["main"], d["cuts"], d["tau"])
-            fig10_compute_regimes(d["main"])
-            continue
-        # another operating SNR: the main-point figures rebuilt from the CSVs (analog methods from
-        # the SNR sweep at rho, digital methods retimed at rho) into figures_snr<rho>/, tables_snr<rho>/.
-        # The N / cut / tau / antenna sweeps exist only at 20 dB and are not redrawn.
-        if d["snr"].empty or not np.isclose(d["snr"].rho_db.astype(float), rho).any():
-            print(f"[plots] --snr {rho:g}: no SNR-sweep runs at {rho:g} dB in {RESULTS}/snr -> skipped")
-            continue
-        main_rho = _main_at(d["main"], d["snr"], rho)
-        ENV0["rho_db"] = rho
-        FIG = os.path.join(RESULTS, f"figures_snr{rho:g}")
-        TAB = os.path.join(RESULTS, f"tables_snr{rho:g}")
-        print(f"[plots] operating SNR {rho:g} dB -> {FIG}, {TAB} "
-              f"(methods present: {sorted(set(main_rho.method)) if not main_rho.empty else []})")
-        fig3_breakdown()
-        fig4_overhead(main_rho)
-        fig1_and_table(main_rho)
-        fig6_time_to_target(main_rho)
-        fig8_efficiency(main_rho)
-        fig10_compute_regimes(main_rho)
-    ENV0["rho_db"], FIG, TAB = 20.0, fig_dir, tab_dir
+            fig4_overhead(main_rho)
+            fig1_and_table(main_rho)
+            fig6_time_to_target(main_rho)
+            fig8_efficiency(main_rho)
+            fig10_compute_regimes(main_rho)
+    ENV0["rho_db"], ENV0["q_bits"] = 20.0, 16
+    FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
 
 
 if __name__ == "__main__":

@@ -15,9 +15,14 @@ differences. Both downlinks (cut derivatives, prefix broadcast) are ideal.
   digital_fedavg      no      -                              digital OFDMA, full model (exact)
   digital_sflv1_zf    yes     digital multi-user ZF (rel.)   digital multi-user ZF (exact)
   hybrid_zf_aircomp   yes     digital multi-user ZF (rel.)   analog AirComp (+ Eq. 23 error)
-The two ZF digital rows learn exactly like digital_sflv1 / sun_fdma_aircomp (reliable
-digital links either way; identical AirComp stream); only their uplink time differs, so
-the experiments derive them from those runs instead of training them again.
+  digital_fedavg_zf   no      -                              digital multi-user ZF, full model
+The ZF digital rows learn exactly like their OFDMA parents (reliable digital links either
+way; identical AirComp stream); only their uplink time differs, so the experiments derive
+them from those runs instead of training them again.
+Digital payload precision: radio.q_bits = 16 (FP16, the experiments' default) or 32 (FP32).
+With 16 the digitally uploaded tensors are really rounded (_fp16_transport: per-256-value
+block scaling + IEEE half) -- activations of the digital-activation split methods and model
+differences of the digitally aggregated ones; analog uploads and labels are untouched.
 
 All methods share data, init, model, minibatches, (optional) augmentation, plain
 SGD, the LR schedule, tau, participation, weights a_n = D_n/sum D, bandwidth,
@@ -86,16 +91,18 @@ _CHUNK = 1024              # packets per channel-sampling chunk (memory bound)
 SCHEMA = 4                 # CSV/semantics version (plots ignore older files; part of the run identity)
 
 METHOD_SPEC = {   # digital: how the reliable digital uplinks share the band ("ofdma" | "zf")
-    "airsfl":            {"split": True,  "zf_act": True,  "aircomp": True,  "digital": None},
-    "digital_sflv1":     {"split": True,  "zf_act": False, "aircomp": False, "digital": "ofdma"},
-    "sun_fdma_aircomp":  {"split": True,  "zf_act": False, "aircomp": True,  "digital": "ofdma"},
-    "aircomp_fl":        {"split": False, "zf_act": False, "aircomp": True,  "digital": None},
-    "digital_fedavg":    {"split": False, "zf_act": False, "aircomp": False, "digital": "ofdma"},
-    # multi-user ZF digital baselines: same learning as digital_sflv1 / sun_fdma_aircomp (the
-    # digital links are reliable either way), only the uplink time differs. plots.py derives
-    # them from those runs; they are listed here so a run of them is possible and checkable.
-    "digital_sflv1_zf":  {"split": True,  "zf_act": False, "aircomp": False, "digital": "zf"},
-    "hybrid_zf_aircomp": {"split": True,  "zf_act": False, "aircomp": True,  "digital": "zf"},
+    "airsfl":              {"split": True,  "zf_act": True,  "aircomp": True,  "digital": None},
+    "digital_sflv1":       {"split": True,  "zf_act": False, "aircomp": False, "digital": "ofdma"},
+    "sun_fdma_aircomp":    {"split": True,  "zf_act": False, "aircomp": True,  "digital": "ofdma"},
+    "aircomp_fl":          {"split": False, "zf_act": False, "aircomp": True,  "digital": None},
+    "digital_fedavg":      {"split": False, "zf_act": False, "aircomp": False, "digital": "ofdma"},
+    # multi-user ZF digital baselines: same learning as their OFDMA parents (the digital
+    # links are reliable either way, same AirComp stream for the hybrids), only the uplink time
+    # differs. plots.py derives them from the parent runs; they are listed here so a run of them
+    # is possible and checkable (flsim.airsfl.checks trains both and compares).
+    "digital_sflv1_zf":    {"split": True,  "zf_act": False, "aircomp": False, "digital": "zf"},
+    "hybrid_zf_aircomp":   {"split": True,  "zf_act": False, "aircomp": True,  "digital": "zf"},
+    "digital_fedavg_zf":   {"split": False, "zf_act": False, "aircomp": False, "digital": "zf"},
 }
 
 METHOD_LABELS = {
@@ -106,6 +113,7 @@ METHOD_LABELS = {
     "digital_fedavg": "Digital FedAvg",
     "digital_sflv1_zf": "Digital SFL-V1 (ZF)",
     "hybrid_zf_aircomp": "Hybrid ZF-AirComp SFL",
+    "digital_fedavg_zf": "Digital FedAvg (ZF)",
 }
 
 
@@ -145,6 +153,22 @@ def _packet_lengths(d: int, K: int, device) -> torch.Tensor:
     return lens
 
 
+def _fp16_transport(x: torch.Tensor) -> torch.Tensor:
+    """Reliable FP16 digital transport of a real tensor, as the receiver decodes it: per block of
+    PACKET_REAL values the block's largest magnitude s travels as side information (like the
+    analog packet norms, covered by the efficiency eps) and the values x / s as IEEE half
+    precision. Scaling avoids FP16 overflow and the underflow of small model differences late in
+    training (plain FP16 flushes |x| < 6e-8 and loses precision below 6e-5); the error of every
+    value is at most 2^-11 s (2^-25 s in the subnormal range); an all-zero block stays zero."""
+    flat = x.reshape(-1)
+    d = flat.numel()
+    K = -(-d // PACKET_REAL)
+    blk = F.pad(flat, (0, K * PACKET_REAL - d)).reshape(K, PACKET_REAL)
+    s = blk.abs().amax(dim=1, keepdim=True)
+    s = torch.where(s > 0, s, torch.ones_like(s))
+    return ((blk / s).half().to(x.dtype) * s).reshape(-1)[:d].reshape(x.shape)
+
+
 class AirSFLSimulator:
     def __init__(self, cfg: RunConfig, radio: RadioConfig, streams: list, weights,
                  eval_sets: dict, device, n_train: int, log=print, compute: Optional[ComputeConfig] = None):
@@ -177,6 +201,13 @@ class AirSFLSimulator:
         self.stage = cfg.stage if self.split else None
         self.zf_act = spec["zf_act"] and self.split and not cfg.noiseless
         self.aircomp = spec["aircomp"] and not cfg.noiseless
+        # FP16 digital payload (radio.q_bits == 16; draft: "a 16-bit transport check must actually
+        # round transmitted tensors"): the tensors a method uploads DIGITALLY are rounded -- the
+        # activations of the digital-activation split methods and the model differences of the
+        # digitally aggregated methods. Analog uploads, labels and the ideal downlinks are not.
+        # Rounding is part of the transport format, so `noiseless` does not switch it off.
+        self.fp16_act = radio.q_bits == 16 and self.split and not spec["zf_act"]
+        self.fp16_agg = radio.q_bits == 16 and not spec["aircomp"]
         self.streams, self.eval_sets = streams, eval_sets
         self.N = radio.N
         self.a = torch.tensor(np.asarray(weights, dtype=np.float64), dtype=torch.float32, device=device)
@@ -336,6 +367,12 @@ class AirSFLSimulator:
                 self._act_sig_e += zt.pow(2).sum()
                 self._act_coords += zt.numel()
                 zt = zt + noise
+            elif self.fp16_act:                  # digital FP16 activation upload: the M-server sees fp16(z)
+                zq = _fp16_transport(zt)
+                self._act_noise_e += (zq - zt).pow(2).sum()
+                self._act_sig_e += zt.pow(2).sum()
+                self._act_coords += zt.numel()
+                zt = zq
             relay = zt.requires_grad_(True)
             loss = F.cross_entropy(self._suffix(M, relay), y)
             loss.backward()                      # suffix gradient (15) and cut derivative q (14)
@@ -363,8 +400,27 @@ class AirSFLSimulator:
         logits = functional_call(self.fmodel, params, (x,), {"cut": self.stage, "perturb": perturb})
         return F.cross_entropy(logits, y), (stats["ne"], stats["se"])
 
+    def _loss_fp16(self, params, x, y):
+        stats = {}
+
+        def perturb(z):                          # digital FP16 activation upload (detached rounding error)
+            zd = z.detach()
+            e = _fp16_transport(zd) - zd
+            stats["ne"], stats["se"] = e.pow(2).sum(), zd.pow(2).sum()
+            return z + e                         # identity Jacobian: the prefix receives the cut derivative
+
+        logits = functional_call(self.fmodel, params, (x,), {"cut": self.stage, "perturb": perturb})
+        return F.cross_entropy(logits, y), (stats["ne"], stats["se"])
+
     def _step_vmap(self, X, Y, Er, lr: float):
-        if Er is None:
+        if Er is None and self.fp16_act:
+            fn = vmap(grad_and_value(self._loss_fp16, has_aux=True), in_dims=(0, 0, 0),
+                      chunk_size=self.cfg.vmap_chunk)
+            g, (loss, (ne, se)) = fn(self.stacked, X, Y)
+            self._act_noise_e += ne.sum()
+            self._act_sig_e += se.sum()
+            self._act_coords += self.dims["d_a"] * self.N
+        elif Er is None:
             fn = vmap(grad_and_value(self._loss_clean), in_dims=(0, 0, 0), chunk_size=self.cfg.vmap_chunk)
             g, loss = fn(self.stacked, X, Y)
         else:
@@ -387,20 +443,30 @@ class AirSFLSimulator:
     def _aggregate(self, r: int = 0):
         if self.aircomp:
             self.gen_A.manual_seed(self._stream_seed(2, r))
-        for idx, air in ((self.pref_idx, self.aircomp), (self.suf_idx, False)):
+        # prefix (FL: whole model) goes up to the F-server -- AirComp, or digital (FP16-rounded when
+        # q = 16); the suffix copies are averaged locally at the M-server (no uplink, never rounded)
+        for idx, air, rnd in ((self.pref_idx, self.aircomp, self.fp16_agg), (self.suf_idx, False, False)):
             if not idx:
                 continue
             g = torch.cat([self.gparams[i].reshape(-1) for i in idx])
             d = g.numel()
             K = math.ceil(d / PACKET_REAL)
             agg = torch.zeros_like(g)
+            exact = torch.zeros_like(g) if rnd else None
             maxterm = torch.zeros(K, dtype=torch.float32, device=g.device) if air else None
             for n in range(self.N):
                 delta = torch.cat([self.cparams[n][i].reshape(-1) for i in idx]) - g   # Eq. 18
+                if rnd:                                                     # digital FP16 model-difference upload
+                    exact.add_(delta, alpha=float(self.a[n]))
+                    delta = _fp16_transport(delta)
                 agg.add_(delta, alpha=float(self.a[n]))
                 if air:
                     pk = F.pad(delta, (0, K * PACKET_REAL - d)).view(K, PACKET_REAL)
                     maxterm = torch.maximum(maxterm, (self.a[n] ** 2) * pk.pow(2).sum(dim=1))
+            if rnd:
+                self._agg_noise_e += (agg - exact).pow(2).sum()
+                self._agg_sig_e += exact.pow(2).sum()
+                self._agg_coords += d
             if air:
                 noise = self._aircomp_noise(maxterm, d)
                 self._agg_noise_e += noise.pow(2).sum()
@@ -475,6 +541,7 @@ class AirSFLSimulator:
             "cut": self.stage if self.stage is not None else 0, "tau": self.cfg.tau, "B": self.cfg.batch_size,
             "rho_db": self.radio.rho_db, "N": self.N, "Nr": self.radio.Nr, "Nr_F": self.radio.Nr_F,
             "S": self.radio.S, "eps_D": self.radio.eps_D, "eps_U": self.radio.eps_U, "eps_A": self.radio.eps_A,
+            "q_bits": self.radio.q_bits,
             "gain_range_db": (max(self.radio.gains_db) - min(self.radio.gains_db)) if self.unequal else 0.0,
             "gain_min_db": self.radio.g_min_db,
             "path_gains_db": json.dumps(list(self.radio.gains_db)) if self.unequal else "",
@@ -511,7 +578,8 @@ class AirSFLSimulator:
         cfg, t0 = self.cfg, time.time()
         self.log(f"[AirSFL] {METHOD_LABELS[self.method]} | cut={self.stage} | rho={self.radio.rho_db:g} dB"
                  + (f" (path gains {min(self.radio.gains_db):.1f}..{max(self.radio.gains_db):.1f} dB)"
-                    if self.unequal else "") + " | "
+                    if self.unequal else "")
+                 + (" | digital payload FP16 (rounded)" if self.fp16_act or self.fp16_agg else "") + " | "
                  f"N={self.N} Nr_M={self.radio.Nr} Nr_F={self.radio.Nr_F} S={self.radio.S} | "
                  f"tau={cfg.tau} B={cfg.batch_size} | rounds={cfg.rounds} | lr={cfg.lr:g} ({cfg.lr_schedule}) | "
                  f"UL {self.ul_s:.3f} s/rnd (act {self.ul_break['activation']:.3f}, labels "

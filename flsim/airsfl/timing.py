@@ -22,7 +22,8 @@ combining and before OFDMA bandwidth division: rho = Pmax*lambda_ref/(N0*W).
 
   DIGITAL OFDMA -- client n gets S_n = S/N disjoint tones and concentrates its
   power Pmax on them; maximum-ratio reception over the receiving server's array;
-  q = 32 bits per real value (Eq. 11-12):
+  q bits per real value (radio.q_bits: 16 = FP16, the experiments' default; 32 = FP32)
+  (Eq. 11-12):
         Rbar_n = eps_D * df * S_n * c_D,   c_D = E[log2(1 + rho * N * X)],
         X = sum_{a=1..Nr}|g_a|^2 ~ Gamma(Nr, 1),     D(D) = max_n q*D / Rbar_n.
   (per-tone SNR = Pmax*lambda*X/(S_n N0 df) = rho*(S/S_n)*X = rho*N*X). The
@@ -31,7 +32,7 @@ combining and before OFDMA bandwidth division: rho = Pmax*lambda_ref/(N0*W).
   the two rates are identical: R_A,n = R_U,n, paper Sec. III-C).
 
   DIGITAL MULTI-USER ZF (stronger digital baselines, not OMA) -- every client sends its
-  own coded FP32 stream on ALL S tones with Pmax/S per tone (like the analog stages);
+  own coded stream (q bits per value) on ALL S tones with Pmax/S per tone (like the analog stages);
   the receiving server separates the N streams with the same ZF filter AirSFL uses and
   decodes each one. Post-ZF SNR = rho*Y, Y = 1/[(H~^H H~)^-1]_nn ~ Gamma(Nr-N+1, 1):
         Rbar_ZF = eps_D * df * S * c_ZF,   c_ZF = E[log2(1 + rho * Y)],   Z(D) = q*D / Rbar_ZF.
@@ -55,6 +56,7 @@ params, d_s suffix params, d = d_c + d_s, tau local steps, ell_y label time):
   Digital FedAvg          D_A(d)
   Digital SFL-V1 (ZF)     tau*[Z_U(d_a) + ell_y] + Z_A(d_c)      (ell_y at the ZF rate)
   Hybrid ZF-AirComp       tau*[Z_U(d_a) + ell_y] + A_A(d_c)
+  Digital FedAvg (ZF)     Z_A(d)
 
 Formula regression: verify_reference_example() reproduces the earlier roadmap's
 analytical example (N=8, Nr=32, S=64, eps=0.8, stage-3 cut) exactly.
@@ -92,6 +94,10 @@ class RadioConfig:
     gains_db: Optional[tuple] = None   # per-client long-term path gains lambda_n / lambda_ref in dB, the
                                        # same to both servers (draft: h ~ CN(0, lambda_n I)); None = equal
                                        # gains. rho refers to lambda_ref (see path_gain_offsets_db)
+    q_bits: int = 32                   # bits per real value of every reliable DIGITAL payload (activations,
+                                       # model differences): 32 = FP32, 16 = FP16 (the experiments' default,
+                                       # run_airsfl.py --digital-q; the simulator then really rounds those
+                                       # tensors); labels and analog stages are unaffected
 
     def __post_init__(self):
         if self.Nr_F is None:
@@ -100,6 +106,9 @@ class RadioConfig:
             self.gains_db = tuple(float(g) for g in self.gains_db)
             if len(self.gains_db) != self.N:
                 raise ValueError(f"{len(self.gains_db)} path gains for N={self.N} clients")
+        self.q_bits = int(self.q_bits)
+        if self.q_bits not in (16, 32):
+            raise ValueError(f"q_bits must be 32 (FP32) or 16 (FP16), got {self.q_bits}")
 
     @property
     def g_lin(self) -> np.ndarray:
@@ -227,9 +236,9 @@ def analog_time_s(D: int, eps_X: float, radio: RadioConfig) -> float:
     return symbols / (eps_X * radio.df_hz)
 
 
-def digital_time_s(D: int, rate_bps: float) -> float:
-    """D(D) = q*D / Rbar_n (Eq. 12; equal links -> the max over n is any n)."""
-    return Q_BITS * D / rate_bps
+def digital_time_s(D: int, rate_bps: float, q: int = Q_BITS) -> float:
+    """D(D) = q*D / Rbar_n (Eq. 12; equal links -> the max over n is any n); q bits per value."""
+    return q * D / rate_bps
 
 
 def label_time_s(radio: RadioConfig, rate_bps: float) -> float:
@@ -242,8 +251,9 @@ def label_time_s(radio: RadioConfig, rate_bps: float) -> float:
 # ---------------------------------------------------------------------------
 
 METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp", "aircomp_fl", "digital_fedavg",
-           "digital_sflv1_zf", "hybrid_zf_aircomp")
+           "digital_sflv1_zf", "hybrid_zf_aircomp", "digital_fedavg_zf")
 SPLIT_METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp", "digital_sflv1_zf", "hybrid_zf_aircomp")
+ZF_METHODS = ("digital_sflv1_zf", "hybrid_zf_aircomp", "digital_fedavg_zf")          # digital multi-user ZF
 
 _ALIASES = {
     "airsfl": "airsfl",
@@ -253,6 +263,7 @@ _ALIASES = {
     "digital_fedavg": "digital_fedavg", "fedavg": "digital_fedavg", "fl": "digital_fedavg",
     "digital_sflv1_zf": "digital_sflv1_zf", "sflv1_zf": "digital_sflv1_zf",
     "hybrid_zf_aircomp": "hybrid_zf_aircomp", "zf_aircomp": "hybrid_zf_aircomp",
+    "digital_fedavg_zf": "digital_fedavg_zf",
 }
 
 
@@ -266,17 +277,18 @@ def uplink_time_breakdown(method: str, dims: dict, radio: RadioConfig, tau: int,
         raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
     d_c, d_s, d_a = int(dims["d_c"]), int(dims["d_s"]), int(dims["d_a"])
     rates = rates if rates is not None else digital_rates(radio)
+    q = radio.q_bits                                        # digital payload bits per value (32 or 16)
     AU = lambda D: analog_time_s(D, radio.eps_U, radio)
     AA = lambda D: analog_time_s(D, radio.eps_A, radio)
-    DU = lambda D: digital_time_s(D, rates["U"])
-    DA = lambda D: digital_time_s(D, rates["A"])
-    ZU = lambda D: digital_time_s(D, rates["U_zf"])        # digital multi-user ZF (all tones)
-    ZA = lambda D: digital_time_s(D, rates["A_zf"])
+    DU = lambda D: digital_time_s(D, rates["U"], q)         # OFDMA (S/N tones per client, concurrent)
+    DA = lambda D: digital_time_s(D, rates["A"], q)
+    ZU = lambda D: digital_time_s(D, rates["U_zf"], q)      # digital multi-user ZF (all tones, concurrent)
+    ZA = lambda D: digital_time_s(D, rates["A_zf"], q)
     # labels go up only when the M-server computes the loss, i.e. when there IS a split
     # (d_a > 0); in the no-split limit the SFL rows reduce exactly to the FL rows. They use
-    # the method's digital activation link (OFDMA, or ZF for the ZF baselines).
-    zf = m in ("digital_sflv1_zf", "hybrid_zf_aircomp")
-    lab = tau * label_time_s(radio, rates["U_zf" if zf else "U"]) if d_a > 0 else 0.0
+    # the method's digital activation link (OFDMA or ZF); label bits do not depend on q.
+    link = "U_zf" if m in ZF_METHODS else "U"
+    lab = tau * label_time_s(radio, rates[link]) if d_a > 0 else 0.0
     act = agg = 0.0
     if m == "airsfl":
         act, agg = tau * AU(d_a), AA(d_c)
@@ -292,6 +304,8 @@ def uplink_time_breakdown(method: str, dims: dict, radio: RadioConfig, tau: int,
         lab, agg = 0.0, AA(d_c + d_s)
     elif m == "digital_fedavg":
         lab, agg = 0.0, DA(d_c + d_s)
+    elif m == "digital_fedavg_zf":
+        lab, agg = 0.0, ZA(d_c + d_s)
     return {"activation": act, "labels": lab, "aggregation": agg, "total": act + lab + agg}
 
 
@@ -305,18 +319,19 @@ def uplink_time_per_round(method: str, dims: dict, radio: RadioConfig, tau: int,
 # Source-equivalent volume (roadmap: "do not turn concurrency into fake MB")
 # ---------------------------------------------------------------------------
 
-def source_equivalent_mb_per_round(method: str, dims: dict, radio: RadioConfig, tau: int) -> float:
-    """Uplink source-equivalent MB per round (q_ref = 32):
-        SFL (all three): N*[q(tau*d_a + d_c) + tau*B*ceil(log2 J)] / 8e6
-        FL  (both):      N*q*d / 8e6
-    The three matched SFL variants have IDENTICAL volume -- AirSFL saves AIRTIME,
-    not source bytes."""
+def source_equivalent_mb_per_round(method: str, dims: dict, radio: RadioConfig, tau: int,
+                                   q_ref: int = Q_BITS) -> float:
+    """Uplink source-equivalent MB per round at q_ref bits per value (default 32; the CSVs
+    record this FP32 reference, the figures use the drawn digital payload's q):
+        SFL (all):  N*[q_ref(tau*d_a + d_c) + tau*B*ceil(log2 J)] / 8e6
+        FL  (all):  N*q_ref*d / 8e6
+    The matched SFL variants have IDENTICAL volume -- AirSFL saves AIRTIME, not source bytes."""
     m = _ALIASES.get(method.lower())
     d_c, d_s, d_a = int(dims["d_c"]), int(dims["d_s"]), int(dims["d_a"])
     label_bits = radio.batch_size * math.ceil(math.log2(radio.num_classes)) if d_a > 0 else 0
     if m in SPLIT_METHODS:
-        return radio.N * (Q_BITS * (tau * d_a + d_c) + tau * label_bits) / 8e6
-    return radio.N * Q_BITS * (d_c + d_s) / 8e6
+        return radio.N * (q_ref * (tau * d_a + d_c) + tau * label_bits) / 8e6
+    return radio.N * q_ref * (d_c + d_s) / 8e6
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +398,7 @@ def verify_limit_cases(verbose: bool = True) -> bool:
     checks["HybridZF(no split) == AirComp-FL"] = (ul("hybrid_zf_aircomp", nosplit), ul("aircomp_fl", nosplit))
     checks["SFLV1-ZF(no split) == q d / R_ZF"] = (ul("digital_sflv1_zf", nosplit),
                                                   Q_BITS * nosplit["d_c"] / rates["A_zf"])
+    checks["SFLV1-ZF(no split) == FedAvg-ZF"] = (ul("digital_sflv1_zf", nosplit), ul("digital_fedavg_zf", nosplit))
     for stage, dims in profiled_dims(radio.batch_size).items():
         bh = uplink_time_breakdown("hybrid_zf_aircomp", dims, radio, 5, rates)
         bz = uplink_time_breakdown("digital_sflv1_zf", dims, radio, 5, rates)
@@ -493,6 +509,40 @@ def verify_path_gains(verbose: bool = True) -> bool:
     return ok
 
 
+def verify_fp16(verbose: bool = True) -> bool:
+    """FP16 digital payload (q = 16, the default of the experiments):
+      (1) every digital phase of every method is exactly half its FP32 value, while the labels
+          (integer class indices) and the analog phases are unchanged;
+      (2) the same holds with unequal path gains (the digital links are paced by the weakest
+          client for either q)."""
+    ok = True
+    lines = []
+    dims = profiled_dims(16)[2]
+    for name, gains in (("equal gains", None), ("20 dB spread", path_gain_offsets_db(RadioConfig().N, 20.0, 11))):
+        r32, r16 = RadioConfig(gains_db=gains), RadioConfig(gains_db=gains, q_bits=16)
+        rates = digital_rates(r32)
+        good = True
+        for m in METHODS:
+            b32 = uplink_time_breakdown(m, dims, r32, 5, rates)
+            b16 = uplink_time_breakdown(m, dims, r16, 5, rates)
+            analog = m in ("airsfl", "aircomp_fl")
+            for ph in ("activation", "aggregation"):
+                digital_phase = not analog and not (ph == "aggregation" and "aircomp" in m)
+                want = b32[ph] / 2 if digital_phase else b32[ph]
+                good &= abs(b16[ph] - want) <= 1e-12 * max(1.0, want)
+            good &= b16["labels"] == b32["labels"]
+        ok &= good
+        t32 = uplink_time_per_round("digital_sflv1", dims, r32, 5, rates)
+        t16 = uplink_time_per_round("digital_sflv1", dims, r16, 5, rates)
+        lines.append(f"  {name}: digital phases halved, labels and analog phases unchanged for all "
+                     f"{len(METHODS)} methods (SFL-V1 {t32:.1f} -> {t16:.1f} s per round)  {'OK' if good else 'BAD'}")
+    if verbose:
+        print("=== FP16 digital payload (timing) ===")
+        print("\n".join(lines))
+        print(f"  FP16_TIMING: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def environment_summary(radio: Optional[RadioConfig] = None, stage: int = 2, tau: int = 5) -> None:
     """Print the per-round uplink budget of the default environment."""
     radio = radio or RadioConfig()
@@ -522,5 +572,7 @@ if __name__ == "__main__":
     verify_zf()
     print()
     verify_path_gains()
+    print()
+    verify_fp16()
     print()
     environment_summary()

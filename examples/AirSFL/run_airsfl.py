@@ -17,7 +17,10 @@ Default environment: N=30 clients; M-server (activations, ZF) and F-server (mode
 differences, AirComp) with 64 antennas each; S=120 subcarriers x 15 kHz (W=1.8 MHz, 4
 tones per client in OFDMA); Pmax=0.1 W; N0=-167 dBm/Hz; eps_D=eps_U=eps_A=0.6; rho=20 dB;
 cut after stage 2; tau=5; B=16; plain SGD with cosine decay to 1% (fixed within a round);
-evaluation once per global-epoch equivalent; FP32 (TF32 disabled); no augmentation (--augment
+digital payload FP16 (--digital-q 16: the tensors digital SFL-V1, the hybrid and digital FedAvg
+upload are really rounded to FP16 and timed with q = 16 bits; --digital-q 32 for FP32; AirSFL and
+AirComp-FL upload nothing digitally but labels and are unaffected); evaluation once per
+global-epoch equivalent; FP32 arithmetic (TF32 disabled); no augmentation (--augment
 enables crop+flip); parallel "vmap" engine with fast cuDNN (--engine loop / --deterministic
 to change; an out-of-memory run restarts on the loop engine). Computation: client
 f_i ~ U[1, 2] TFLOPS, M-server f_s = 20 TFLOPS (flsim.airsfl.compute); plots.py also shows
@@ -27,9 +30,10 @@ and per phase, so any axis can be plotted later.
 
 Experiments (--exp, any subset). Every run is identified by a hash of its complete
 resolved configuration (saved as <run>.json next to <run>.csv): a finished run with the
-same configuration is skipped, any changed setting produces a new run.
+same configuration is skipped (also when it finished under another experiment: it is then
+copied, e.g. FP16 runs of --exp fp16 into main/), any changed setting produces a new run.
   bench   seconds per round of both training engines (x deterministic / fast cuDNN)
-  lr      LR calibration on the error-free digital reference (FedAvg, IID); the chosen
+  lr      LR calibration on the error-free digital reference (FedAvg, IID, FP32); the chosen
           initial LR is then used by ALL methods (refused if calibrated under another setup)
   main    5 methods x {IID, Dirichlet-alpha (default 0.1, --dirichlet-alpha)} at 20 dB
   snr     analog methods x SNR (default -20, -10, 0, 10 dB; 20 dB from main). Digital
@@ -43,6 +47,12 @@ same configuration is skipped, any changed setting produces a new run.
           reference (rho = median client; 0 dB from main); --pathloss-snrs adds SNR points.
           Digital learning is gain-independent: plots.py retimes the main runs at the weakest
           client's rate. --path-gain-spread X applies unequal gains to every run of a call.
+  fp16    FP16 digital payload (really rounded, q = 16): digital SFL-V1 + digital FedAvg at 20 dB,
+          hybrid FDMA-AirComp at 20 dB and every --snrs value (its learning depends on the SNR).
+          FP16 is now the default payload of every experiment, so main / snr already contain these
+          runs (finished fp16 runs are reused there); kept for older job scripts.
+The FP32 runs of the digital-payload methods (--digital-q 32) are the exact error-free reference,
+the reference of the target rule and the FP32 rows of plots.py's payload-sensitivity figure.
 
 Usage:
   python examples/AirSFL/run_airsfl.py --exp bench lr
@@ -52,10 +62,12 @@ Usage:
 
 import argparse
 import dataclasses
+import glob
 import hashlib
 import json
 import math
 import os
+import shutil
 import sys
 import time
 
@@ -75,6 +87,10 @@ RESULTS = os.path.join(HERE, "results")
 
 METHODS = ["airsfl", "digital_sflv1", "sun_fdma_aircomp", "aircomp_fl", "digital_fedavg"]   # trained
 ANALOG_METHODS = ["airsfl", "sun_fdma_aircomp", "aircomp_fl"]
+# the methods that upload tensors digitally (activations and/or model differences): --digital-q
+# applies to them; AirSFL / AirComp-FL upload only labels digitally and always keep q = 32 in their
+# identity (their training and timing do not depend on q, so their runs are shared by both payloads)
+FP16_METHODS = ["digital_sflv1", "sun_fdma_aircomp", "digital_fedavg"]
 
 ENV = dict(N=30, Nr=64, Nr_F=64, S=120, df_hz=15e3, Pmax_w=0.1, N0_dbm_per_hz=-167.0,
            eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0)
@@ -96,6 +112,7 @@ TAU_SWEEP = [1, 10, 20, 50]            # stage-2 per-round crossover with AirCom
 NR_SWEEP = [32, 40, 48]                # M-server antennas; F-server fixed
 SPREAD_SWEEP = [10.0, 20.0, 30.0, 40.0]   # path-gain spreads (dB) for --exp pathloss (0 = main)
 PATH_GAIN = {"spread_db": 0.0}         # --path-gain-spread: unequal path gains for every experiment
+DIGITAL_Q = {"q_bits": 16}             # --digital-q: payload bits of FP16_METHODS (16 FP16 default, 32 FP32)
 TARGETS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]   # reached_XX columns (validation)
 
 
@@ -148,8 +165,9 @@ def run_manifest(env, method, scheme, radio, cfg, epochs):
         "dirichlet_alpha": TRAIN["dirichlet_alpha"] if scheme == "dirichlet" else None,
         "min_per_client": TRAIN["min_per_client"],
         "partition_sizes_sha": hashlib.sha256(json.dumps(part_sizes).encode()).hexdigest()[:12],
-        # path gains enter the identity only when set (equal-gain runs keep their hash)
-        "radio": {k: v for k, v in dataclasses.asdict(radio).items() if not (k == "gains_db" and v is None)},
+        # path gains / FP16 payloads enter the identity only when set (equal-gain FP32 runs keep their hash)
+        "radio": {k: v for k, v in dataclasses.asdict(radio).items()
+                  if not ((k == "gains_db" and v is None) or (k == "q_bits" and v == 32))},
         # extra evaluation rounds enter the identity only when used (runs without them keep their hash)
         "train": {k: v for k, v in dataclasses.asdict(cfg).items()
                   if k not in ("engine", "vmap_chunk") and not (k == "eval_rounds" and not v)},
@@ -162,7 +180,8 @@ def run_manifest(env, method, scheme, radio, cfg, epochs):
 
 
 def run_one(env: Env, exp: str, method: str, scheme: str, lr: float, epochs: float, seed: int,
-            rho=None, N=None, Nr=None, Nr_F=None, stage=None, tau=None, noiseless=False, spread=None) -> str:
+            rho=None, N=None, Nr=None, Nr_F=None, stage=None, tau=None, noiseless=False, spread=None,
+            q_bits=None) -> str:
     rho = ENV["rho_db"] if rho is None else float(rho)
     N = ENV["N"] if N is None else int(N)
     Nr = ENV["Nr"] if Nr is None else int(Nr)
@@ -170,10 +189,13 @@ def run_one(env: Env, exp: str, method: str, scheme: str, lr: float, epochs: flo
     stage = TRAIN["stage"] if stage is None else stage
     tau = TRAIN["tau"] if tau is None else int(tau)
     spread = PATH_GAIN["spread_db"] if spread is None else float(spread)
+    if q_bits is None:
+        q_bits = DIGITAL_Q["q_bits"] if method in FP16_METHODS else 32
+    q_bits = int(q_bits)
     B = TRAIN["batch_size"]
     R = rounds_for(epochs, N, tau, B, env.n_train)
     radio = RadioConfig(**{**ENV, "N": N, "Nr": Nr, "Nr_F": Nr_F, "rho_db": rho, "batch_size": B,
-                           "gains_db": path_gain_offsets_db(N, spread, seed)})
+                           "gains_db": path_gain_offsets_db(N, spread, seed), "q_bits": q_bits})
     cfg = RunConfig(method=method, stage=stage, tau=tau, batch_size=B, lr=lr,
                     lr_schedule=TRAIN["lr_schedule"], lr_min_frac=TRAIN["lr_min_frac"], rounds=R,
                     evals_per_epoch=TRAIN["evals_per_epoch"], eval_rounds=tuple(TRAIN["eval_rounds"]),
@@ -182,15 +204,27 @@ def run_one(env: Env, exp: str, method: str, scheme: str, lr: float, epochs: flo
     manifest = run_manifest(env, method, scheme, radio, cfg, epochs)
     rid = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode()).hexdigest()[:10]
     name = (f"{method}_{scheme}_N{N}_Nr{Nr}-{Nr_F}_cut{stage}_tau{tau}_rho{rho:g}"
-            + (f"_gs{spread:g}" if spread else "") + f"_lr{lr:g}_s{seed}_{rid}")
+            + (f"_gs{spread:g}" if spread else "") + (f"_q{q_bits}" if q_bits != 32 else "")
+            + f"_lr{lr:g}_s{seed}_{rid}")
     out_dir = os.path.join(RESULTS, exp)
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, name + ".csv")
+    complete = lambda done: len(done) and (int(done["round"].max()) >= R or done["diverged"].astype(bool).any())
     if os.path.exists(csv_path):
-        done = pd.read_csv(csv_path)
-        if len(done) and (int(done["round"].max()) >= R or done["diverged"].astype(bool).any()):
+        if complete(pd.read_csv(csv_path)):
             print(f"[skip] {name} (same configuration, complete)")
             return csv_path
+    else:       # the identical run (same name = same identity hash) finished under another experiment
+        for other in sorted(glob.glob(os.path.join(RESULTS, "*", name + ".csv"))):
+            done = pd.read_csv(other)
+            if complete(done):
+                done.assign(exp=exp).to_csv(csv_path, index=False)
+                for ext in (".json", ".log"):
+                    if os.path.exists(other[:-4] + ext):
+                        shutil.copyfile(other[:-4] + ext, os.path.join(out_dir, name + ext))
+                print(f"[reuse] {name}: same configuration finished in "
+                      f"{os.path.basename(os.path.dirname(other))}/ -> copied to {exp}/")
+                return csv_path
     with open(os.path.join(out_dir, name + ".json"), "w") as f:
         json.dump({"run_id": rid, **manifest}, f, indent=1, sort_keys=True, default=str)
     with open(os.path.join(out_dir, name + ".log"), "w") as logf:
@@ -318,8 +352,9 @@ def exp_bench(env, args):
 
 def exp_lr(env, args):
     rows = []
-    for lr in LR_GRID:   # error-free reference: path gains change only its time, never its learning
-        p = run_one(env, "lr", "digital_fedavg", "iid", lr, args.lr_epochs, seed=args.seeds[0], spread=0.0)
+    for lr in LR_GRID:   # error-free (FP32) reference: path gains change only its time, never its learning
+        p = run_one(env, "lr", "digital_fedavg", "iid", lr, args.lr_epochs, seed=args.seeds[0], spread=0.0,
+                    q_bits=32)
         df = pd.read_csv(p)
         diverged = bool(df["diverged"].astype(bool).any())
         rows.append({"lr": lr, "final_val_acc": float("nan") if diverged else float(df["val_acc"].iloc[-1]),
@@ -405,13 +440,33 @@ def exp_pathloss(env, args):
                         run_one(env, "pathloss", method, scheme, lr, args.epochs, seed, rho=rho, spread=spread)
 
 
+def exp_fp16(env, args):
+    """FP16 as the digital payload (the draft's 16-bit transport check: "must actually round
+    transmitted tensors"): the methods that upload tensors digitally, trained with FP16-rounded
+    uploads and timed with q = 16 -- digital SFL-V1 and digital FedAvg at the nominal SNR, and
+    the hybrid (digital activations + AirComp) at the nominal SNR and at every --snrs value,
+    since its learning depends on the SNR. Their ZF variants are derived in plots.py; AirSFL
+    and AirComp-FL upload nothing digitally except labels and are unaffected. (FP16 is now the
+    default payload of main / snr, which reuse these runs.)"""
+    lr = _lr(env, args)
+    for seed in args.seeds:
+        for scheme in args.partition:
+            for method in [m for m in args.methods if m in FP16_METHODS]:
+                rhos = [ENV["rho_db"]] + ([r for r in args.snrs if r != ENV["rho_db"]]
+                                         if method == "sun_fdma_aircomp" else [])
+                for rho in rhos:
+                    run_one(env, "fp16", method, scheme, lr, args.epochs, seed, rho=rho, q_bits=16)
+
+
 EXPERIMENTS = {"bench": exp_bench, "lr": exp_lr, "main": exp_main, "snr": exp_snr, "nsweep": exp_nsweep,
-               "cuts": exp_cuts, "tau": exp_tau, "nr": exp_nr, "pathloss": exp_pathloss}
+               "cuts": exp_cuts, "tau": exp_tau, "nr": exp_nr, "pathloss": exp_pathloss, "fp16": exp_fp16}
 
 
 def print_budget():
     """Per-round uplink + computation budget of the default environment."""
-    radio = RadioConfig(**ENV, gains_db=path_gain_offsets_db(ENV["N"], PATH_GAIN["spread_db"], TRAIN["seed"]))
+    radio = RadioConfig(**ENV, gains_db=path_gain_offsets_db(ENV["N"], PATH_GAIN["spread_db"], TRAIN["seed"]),
+                        q_bits=DIGITAL_Q["q_bits"])
+    print(f"  digital payload: FP{radio.q_bits} (q = {radio.q_bits} bits per value) for {', '.join(FP16_METHODS)}")
     environment_summary(radio, stage=TRAIN["stage"], tau=TRAIN["tau"])
     lo, hi, fs = COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"], COMPUTE["server_tflops"]
     print(f"  computation: client f_i ~ U[{lo}, {hi}] TFLOPS (slowest client paces each step), "
@@ -443,6 +498,10 @@ def main():
                    help="path-gain spreads (dB) for --exp pathloss")
     p.add_argument("--pathloss-snrs", nargs="+", type=float, default=None,
                    help="SNRs for --exp pathloss (default: the nominal 20 dB only)")
+    p.add_argument("--digital-q", type=int, default=DIGITAL_Q["q_bits"], choices=[16, 32],
+                   help="digital payload bits of the methods that upload tensors digitally (digital SFL-V1, hybrid, "
+                        "digital FedAvg): 16 = FP16 (default; the uploaded tensors are really rounded), 32 = FP32. "
+                        "AirSFL / AirComp-FL are unaffected (same runs for both); --exp fp16 uses 16, --exp lr 32")
     p.add_argument("--path-gain-spread", type=float, default=0.0,
                    help="unequal path gains for EVERY run of this call: client gains spread uniformly (dB) over "
                         "this range around the reference (rho = median client); 0 = equal gains")
@@ -476,6 +535,7 @@ def main():
     TRAIN["evals_per_epoch"] = float(args.evals_per_epoch)
     TRAIN["dirichlet_alpha"] = float(args.dirichlet_alpha)
     PATH_GAIN["spread_db"] = float(args.path_gain_spread)
+    DIGITAL_Q["q_bits"] = int(args.digital_q)
     # FP32 everywhere (roadmap): no TF32 tensor-core shortcuts on Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

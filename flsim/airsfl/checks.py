@@ -1,3 +1,4 @@
+
 """
 flsim/airsfl/checks.py: correctness checks for the AirSFL environment
 (evaluation roadmap Sec. 9, implementation gates). Run:  python -m flsim.airsfl.checks
@@ -19,7 +20,10 @@ flsim/airsfl/checks.py: correctness checks for the AirSFL environment
      f. zero activation packets / zero aggregates carry zero error;
      h. recorded computation / training-time columns == the computation model;
      i. radio draws depend only on (seed, link, round, step);
-     j. ZF digital baselines == their OFDMA parents' learning (bitwise), timing == ZF retiming;
+     j. derived digital baselines (multi-user ZF; FP32 and FP16) == their OFDMA parents' learning
+        (bitwise), timing == retiming;
+     l. FP16 digital payload: transport error bound, analog methods unaffected (bitwise),
+        digital methods rounded at the FP16 level, both engines agree;
      k. unequal path gains: scale-free == dimensional, sampler Monte Carlo, uniform offsets ==
         shifted SNR, all-zero offsets == equal gains;
      g. vectorized crop+flip == per-image reference.
@@ -39,7 +43,7 @@ from flsim.airsfl.data import ClientStream, load_cifar10_tensors, make_eval_tens
 from flsim.airsfl.model import CifarResNet18GN, check_profiled_dims
 from flsim.airsfl.simulator import AirSFLSimulator, RunConfig, _HAS_FUNC
 from flsim.airsfl.timing import (RadioConfig, digital_rates, uplink_time_breakdown, verify_limit_cases,
-                                 verify_path_gains, verify_reference_example, verify_zf)
+                                 verify_fp16, verify_path_gains, verify_reference_example, verify_zf)
 
 _OK = lambda b: "PASS" if b else "FAIL"
 ENGINES = ("loop", "vmap") if _HAS_FUNC else ("loop",)
@@ -275,35 +279,107 @@ def check_time_columns_and_streams(verbose=True) -> bool:
     return ok
 
 
+DERIVED_PAIRS = (("digital_sflv1_zf", "digital_sflv1", 2), ("hybrid_zf_aircomp", "sun_fdma_aircomp", 2),
+                 ("digital_fedavg_zf", "digital_fedavg", None))
+
+
 def check_zf_baselines(verbose=True) -> bool:
-    """(j) The digital multi-user ZF baselines learn exactly like their OFDMA parents (the
-    digital links are reliable either way; the hybrid shares the parent's AirComp stream):
-    identical models, losses and accuracies. Their recorded uplink columns equal the parent
-    run's rows retimed with uplink_time_breakdown at the ZF rate -- the derivation plots.py
-    uses instead of training them again -- and their computation is the parent's."""
+    """(j) The derived digital baselines (multi-user ZF) learn exactly like their OFDMA
+    parents (the digital links are reliable either way; the hybrids share the parent's AirComp
+    stream): identical models, losses and accuracies. Their recorded uplink columns equal the
+    parent run's rows retimed with uplink_time_breakdown -- the derivation plots.py uses instead
+    of training them again -- and their computation is the parent's. Also for FP16 payloads."""
     radio, make_streams, weights, ev = _small_env()
     same = lambda x, y: x == y or (isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y))
     ok = True
-    for zf, parent in (("digital_sflv1_zf", "digital_sflv1"), ("hybrid_zf_aircomp", "sun_fdma_aircomp")):
-        a = _run(parent, 2, radio, make_streams, weights, ev, False, ENGINES[-1])
-        b = _run(zf, 2, radio, make_streams, weights, ev, False, ENGINES[-1])
-        good = torch.equal(a.global_vector(), b.global_vector()) and len(a.history) == len(b.history)
-        h0 = a.history[0]
-        rd = RadioConfig(N=h0["N"], Nr=h0["Nr"], Nr_F=h0["Nr_F"], S=h0["S"], eps_D=h0["eps_D"], eps_U=h0["eps_U"],
-                         eps_A=h0["eps_A"], rho_db=h0["rho_db"], batch_size=h0["B"])
-        br = uplink_time_breakdown(zf, {k: h0[k] for k in ("d_c", "d_s", "d_a")}, rd, h0["tau"], digital_rates(rd))
-        for ha, hb in zip(a.history, b.history):
-            good &= all(same(ha[k], hb[k]) for k in ("round", "train_loss", "val_acc", "val_loss", "agg_nsr_db",
-                                                     "compute_s_per_round", "mb_per_round"))
-            good &= all(abs(hb[c] - br[k]) <= 1e-12 * max(1.0, br[k]) for c, k in
-                        (("activation_ul_s", "activation"), ("labels_ul_s", "labels"),
-                         ("aggregation_ul_s", "aggregation"), ("ul_s_per_round", "total")))
-            good &= abs(hb["training_time_s"] - hb["round"] * (br["total"] + ha["compute_s_per_round"])) < 1e-9
-        good &= b.ul_s < a.ul_s                   # ZF shares all tones -> faster than OFDMA here
+    import dataclasses
+    for q in (32, 16):
+        rq = dataclasses.replace(radio, q_bits=q)
+        for der, parent, stage in DERIVED_PAIRS:
+            if q == 16 and der not in ("digital_sflv1_zf", "digital_fedavg_zf"):
+                continue                          # FP16: one split and one FL pair are enough
+            a = _run(parent, stage, rq, make_streams, weights, ev, False, ENGINES[-1])
+            b = _run(der, stage, rq, make_streams, weights, ev, False, ENGINES[-1])
+            good = torch.equal(a.global_vector(), b.global_vector()) and len(a.history) == len(b.history)
+            h0 = a.history[0]
+            rd = RadioConfig(N=h0["N"], Nr=h0["Nr"], Nr_F=h0["Nr_F"], S=h0["S"], eps_D=h0["eps_D"],
+                             eps_U=h0["eps_U"], eps_A=h0["eps_A"], rho_db=h0["rho_db"], batch_size=h0["B"],
+                             q_bits=h0["q_bits"])
+            br = uplink_time_breakdown(der, {k: h0[k] for k in ("d_c", "d_s", "d_a")}, rd, h0["tau"],
+                                       digital_rates(rd))
+            for ha, hb in zip(a.history, b.history):
+                good &= all(same(ha[k], hb[k]) for k in ("round", "train_loss", "val_acc", "val_loss", "agg_nsr_db",
+                                                         "act_nsr_db", "compute_s_per_round", "mb_per_round"))
+                good &= all(abs(hb[c] - br[k]) <= 1e-12 * max(1.0, br[k]) for c, k in
+                            (("activation_ul_s", "activation"), ("labels_ul_s", "labels"),
+                             ("aggregation_ul_s", "aggregation"), ("ul_s_per_round", "total")))
+                good &= abs(hb["training_time_s"] - hb["round"] * (br["total"] + ha["compute_s_per_round"])) < 1e-9
+            ok &= good
+            if verbose:
+                print(f"  (j) {der:19s} == {parent:16s} q={q}: learning bitwise, uplink {b.ul_s:9.3f} vs "
+                      f"{a.ul_s:9.3f} s/round == retiming of the parent run  {_OK(good)}")
+    return ok
+
+
+def check_fp16(verbose=True) -> bool:
+    """(l) FP16 digital payload:
+      1. _fp16_transport: per-256-value block error <= 2^-11 of the block maximum (2^-25 in the
+         subnormal range), over 12 decades of magnitude; zero blocks stay zero; FP16-representable
+         blocks are reproduced exactly;
+      2. AirSFL and AirComp-FL upload nothing digitally except labels: with q = 16 their training
+         and their uplink time are bitwise those of q = 32;
+      3. digital SFL-V1 and digital FedAvg with q = 16: the rounding error is recorded at the
+         FP16 level (activation / aggregate NSR between -80 and -55 dB), the trajectory stays close
+         to FP32, the uplink time is that of q = 16, and both engines agree (loose, as in (d2))."""
+    import dataclasses
+    from flsim.airsfl.simulator import _fp16_transport
+    ok = True
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(40, 256, generator=g, dtype=torch.float64)
+    x = x * (10.0 ** torch.linspace(-9, 3, 40, dtype=torch.float64))[:, None]     # 12 decades across blocks
+    x[7] = 0.0
+    xf = x.float()
+    y = _fp16_transport(xf.reshape(-1)).reshape(40, 256).double()
+    s = xf.double().abs().amax(dim=1, keepdim=True)
+    good = bool(((y - xf.double()).abs() <= 2.0 ** -11 * s * (1 + 1e-6) + 1e-45).all()) and bool((y[7] == 0).all())
+    rep = torch.tensor([0.5, -0.25, 1.0, 0.125] * 64)                       # exactly representable after scaling
+    good &= torch.equal(_fp16_transport(rep), rep)
+    ok &= good
+    if verbose:
+        rel = float(((y - xf.double()).abs() / s.clamp_min(1e-300)).max())
+        print(f"  (l1) FP16 transport: max error / block max = {rel:.2e} (<= 2^-11 = {2.0 ** -11:.2e}), zero block "
+              f"-> zero, representable -> exact  {_OK(good)}")
+    radio, make_streams, weights, ev = _small_env()
+    r16 = dataclasses.replace(radio, q_bits=16)
+    for m, stage in (("airsfl", 2), ("aircomp_fl", None)):
+        a = _run(m, stage, radio, make_streams, weights, ev, False, ENGINES[-1])
+        b = _run(m, stage, r16, make_streams, weights, ev, False, ENGINES[-1])
+        good = torch.equal(a.global_vector(), b.global_vector()) and a.ul_s == b.ul_s
         ok &= good
         if verbose:
-            print(f"  (j) {zf:17s} == {parent:16s} learning (bitwise), uplink {b.ul_s:.3f} vs {a.ul_s:.3f} s/round "
-                  f"== ZF retiming of the parent run  {_OK(good)}")
+            print(f"  (l2) {m:14s} q=16 == q=32 (training bitwise, uplink {b.ul_s:.4f} s/round)  {_OK(good)}")
+    for m, stage in (("digital_sflv1", 2), ("digital_fedavg", None), ("sun_fdma_aircomp", 2)):
+        a = _run(m, stage, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+        b = _run(m, stage, r16, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+        c = _run(m, stage, r16, make_streams, weights, ev, False, "loop", rounds=3)
+        dv = (a.global_vector() - b.global_vector()).abs()
+        de = (b.global_vector() - c.global_vector()).abs()
+        mean_db = lambda k: (lambda v: float(np.mean(v)) if v else float("nan"))(
+            [h[k] for h in b.history[1:] if not math.isnan(h[k])])
+        act, agg = mean_db("act_nsr_db"), mean_db("agg_nsr_db")
+        want_act, want_agg = stage is not None, m != "sun_fdma_aircomp"
+        good = float(dv.max()) > 0 and float(dv.max()) < 1e-2                        # moved, but only slightly
+        good &= (-80 < act < -55) if want_act else math.isnan(act)
+        good &= (-80 < agg < -55) if want_agg else agg > -55                          # hybrid: AirComp noise
+        rd = dataclasses.replace(r16)
+        rd.batch_size = b.cfg.batch_size
+        good &= abs(b.ul_s - uplink_time_breakdown(m, b.dims, rd, b.cfg.tau, digital_rates(rd))["total"]) < 1e-12
+        good &= float(de.max()) < 1e-2 and float(de.median()) < 1e-5
+        ok &= good
+        if verbose:
+            print(f"  (l3) {m:16s} q=16: act NSR {act:6.1f} dB, agg NSR {agg:6.1f} dB, max|theta16 - theta32| = "
+                  f"{float(dv.max()):.1e}, loop vs vmap max {float(de.max()):.1e} / median {float(de.median()):.1e}, "
+                  f"uplink {b.ul_s:.3f} vs {a.ul_s:.3f} s/round  {_OK(good)}")
     return ok
 
 
@@ -416,6 +492,7 @@ def run_all() -> bool:
     ok &= verify_limit_cases()
     ok &= verify_zf()
     ok &= verify_path_gains()
+    ok &= verify_fp16()
     print("\n########## 2. MODEL + COMPUTATION ##########")
     ok &= check_profiled_dims()["ok"]
     ok &= verify_compute()
@@ -428,6 +505,7 @@ def run_all() -> bool:
     ok &= check_activation_nsr_and_zero()
     ok &= check_time_columns_and_streams()
     ok &= check_zf_baselines()
+    ok &= check_fp16()
     ok &= check_path_gains()
     ok &= check_crop()
     print(f"\n==== ALL AIRSFL CHECKS: {_OK(ok)} ====")
