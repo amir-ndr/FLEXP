@@ -4,7 +4,7 @@ baselines (AirSFL WCNC draft, Eq. 11-13 and 25-26; evaluation roadmap Sec. 3, 5)
 
 The metric of the AirSFL study is MODELED UPLINK COMMUNICATION TIME: client ->
 M-server activation uploads plus client -> F-server model-update uploads (plus the
-reliable label upload). Computation is excluded. Both server downlinks (cut
+reliable label upload); computation is modelled separately (compute.py). Both server downlinks (cut
 derivatives, prefix broadcast) are idealized as reliable and non-bottleneck, so
 they are NOT timed for any method (paper Sec. II-C).
 
@@ -30,14 +30,31 @@ combining and before OFDMA bandwidth division: rho = Pmax*lambda_ref/(N0*W).
   The rate to the M-server uses Nr, to the F-server Nr_F (equal by default, then
   the two rates are identical: R_A,n = R_U,n, paper Sec. III-C).
 
+  DIGITAL MULTI-USER ZF (stronger digital baselines, not OMA) -- every client sends its
+  own coded FP32 stream on ALL S tones with Pmax/S per tone (like the analog stages);
+  the receiving server separates the N streams with the same ZF filter AirSFL uses and
+  decodes each one. Post-ZF SNR = rho*Y, Y = 1/[(H~^H H~)^-1]_nn ~ Gamma(Nr-N+1, 1):
+        Rbar_ZF = eps_D * df * S * c_ZF,   c_ZF = E[log2(1 + rho * Y)],   Z(D) = q*D / Rbar_ZF.
+  At N = 1 it equals OFDMA (single-user MRC on all tones). Its gap to AirSFL is only the
+  signalling cost q/c_ZF vs 1/2 tone-use per value (plus the smaller ZF array gain);
+  the OFDMA gap additionally contains the N-fold spatial reuse.
+
+  UNEQUAL PATH GAINS (optional robustness setting): lambda_n = g_n lambda_ref, the same to
+  both servers; rho is the median client's SNR (path_gain_offsets_db). Every digital
+  upload ends with its slowest client (Eq. 12), so the digital rates above are evaluated at
+  the weakest client's SNR rho * g_min. Analog airtime does not depend on the gains; they
+  enter only the analog distortion (simulator).
+
 Per-round UPLINK time (Eq. 25-26; d_a = activation size incl. batch B, d_c prefix
 params, d_s suffix params, d = d_c + d_s, tau local steps, ell_y label time):
 
   AirSFL                  tau*[A_U(d_a) + ell_y] + A_A(d_c)
   Digital SFL-V1          tau*[D_U(d_a) + ell_y] + D_A(d_c)
-  Sun-inspired FDMA-AC    tau*[D_U(d_a) + ell_y] + A_A(d_c)
+  Hybrid FDMA-AirComp     tau*[D_U(d_a) + ell_y] + A_A(d_c)      (Sun-inspired)
   AirComp-FL              A_A(d)                      (full model, no labels)
   Digital FedAvg          D_A(d)
+  Digital SFL-V1 (ZF)     tau*[Z_U(d_a) + ell_y] + Z_A(d_c)      (ell_y at the ZF rate)
+  Hybrid ZF-AirComp       tau*[Z_U(d_a) + ell_y] + A_A(d_c)
 
 Formula regression: verify_reference_example() reproduces the earlier roadmap's
 analytical example (N=8, Nr=32, S=64, eps=0.8, stage-3 cut) exactly.
@@ -72,10 +89,37 @@ class RadioConfig:
     rho_db: float = 20.0           # reference SNR (per client, pre-combining, full band)
     num_classes: int = 10
     batch_size: int = 16
+    gains_db: Optional[tuple] = None   # per-client long-term path gains lambda_n / lambda_ref in dB, the
+                                       # same to both servers (draft: h ~ CN(0, lambda_n I)); None = equal
+                                       # gains. rho refers to lambda_ref (see path_gain_offsets_db)
 
     def __post_init__(self):
         if self.Nr_F is None:
             self.Nr_F = self.Nr
+        if self.gains_db is not None:
+            self.gains_db = tuple(float(g) for g in self.gains_db)
+            if len(self.gains_db) != self.N:
+                raise ValueError(f"{len(self.gains_db)} path gains for N={self.N} clients")
+
+    @property
+    def g_lin(self) -> np.ndarray:
+        """Per-client path gains relative to lambda_ref (linear); ones for equal gains."""
+        if self.gains_db is None:
+            return np.ones(self.N)
+        return 10.0 ** (np.asarray(self.gains_db, dtype=np.float64) / 10.0)
+
+    @property
+    def unequal_gains(self) -> bool:
+        return self.gains_db is not None and any(g != 0.0 for g in self.gains_db)
+
+    @property
+    def g_min_db(self) -> float:
+        return 0.0 if self.gains_db is None else min(self.gains_db)
+
+    @property
+    def rho_min_lin(self) -> float:
+        """SNR of the weakest client, which paces every digital upload (Eq. 12: max over n)."""
+        return self.rho_lin * 10.0 ** (self.g_min_db / 10.0)
 
     @property
     def W_hz(self) -> float:
@@ -107,10 +151,12 @@ class RadioConfig:
 def digital_spectral_efficiency(radio: RadioConfig, rng: Optional[np.random.RandomState] = None,
                                 n_samples: int = 400000, Nr: Optional[int] = None) -> float:
     """Per-tone spectral efficiency c_D = E[log2(1 + rho*N*X)], X ~ Gamma(Nr, 1)
-    (MRC over the receiving server's Nr antennas). Monte-Carlo over a long sample."""
+    (MRC over the receiving server's Nr antennas). Monte-Carlo over a long sample.
+    With unequal path gains it is the weakest client's (rho -> rho * g_min): the digital
+    upload finishes when the slowest client does (Eq. 12)."""
     rng = rng if rng is not None else np.random.RandomState(0)
     X = rng.gamma(shape=Nr if Nr is not None else radio.Nr, scale=1.0, size=n_samples)
-    return float(np.mean(np.log2(1.0 + radio.rho_lin * radio.N * X)))
+    return float(np.mean(np.log2(1.0 + radio.rho_min_lin * radio.N * X)))
 
 
 def digital_rate_bps(radio: RadioConfig, c_D: Optional[float] = None,
@@ -121,14 +167,54 @@ def digital_rate_bps(radio: RadioConfig, c_D: Optional[float] = None,
     return radio.eps_D * radio.df_hz * radio.Sn * c_D
 
 
+def digital_zf_spectral_efficiency(radio: RadioConfig, rng: Optional[np.random.RandomState] = None,
+                                   n_samples: int = 400000, Nr: Optional[int] = None) -> float:
+    """Per-tone spectral efficiency of DIGITAL multi-user MIMO with ZF reception: every client
+    transmits its own coded stream on all S tones (power Pmax/S per tone, like the analog
+    stages) and the server separates the N streams with the ZF matrix C = H(H^H H)^-1 before
+    decoding each one. Post-ZF SNR of client n = (Pmax/S) / (N0 df [(H^H H)^-1]_nn) = rho g_n Y,
+    Y = 1/[(H~^H H~)^-1]_nn ~ Gamma(Nr - N + 1, 1) for i.i.d. Rayleigh ([(H^H H)^-1]_nn =
+    [(H~^H H~)^-1]_nn / g_n for H = H~ diag(sqrt(g))); c_ZF = E[log2(1 + rho g Y)] of the weakest
+    client, which paces the upload."""
+    rng = rng if rng is not None else np.random.RandomState(0)
+    Nr = Nr if Nr is not None else radio.Nr
+    if radio.N > Nr:
+        return float("nan")                          # ZF cannot separate more streams than antennas
+    Y = rng.gamma(shape=Nr - radio.N + 1, scale=1.0, size=n_samples)
+    return float(np.mean(np.log2(1.0 + radio.rho_min_lin * Y)))
+
+
+def path_gain_offsets_db(N: int, spread_db: float, seed: int) -> Optional[tuple]:
+    """Unequal long-term path gains (draft: h_n ~ CN(0, lambda_n I), matched to both servers):
+    N offsets 10 log10(lambda_n / lambda_ref), equally spaced over [-spread/2, +spread/2] dB
+    (stratified uniform-in-dB, so every seed has the same weakest client, exactly
+    spread * (1 - 1/N) / 2 dB below the reference) and assigned to clients by a seeded
+    permutation (which data partition is weak changes with the seed; identical for every
+    method of a seed). The reference SNR rho is the median client's. spread 0 -> None."""
+    if not spread_db:
+        return None
+    offs = spread_db * ((np.arange(N) + 0.5) / N - 0.5)
+    perm = np.random.RandomState(int(seed) * 7919 + 59).permutation(N)
+    return tuple(round(float(x), 6) for x in offs[perm])
+
+
 def digital_rates(radio: RadioConfig, seed: int = 2026) -> dict:
-    """Goodputs to the two servers: {"U": client->M-server, "A": client->F-server}.
-    Same channel sample seed for both, so equal arrays give identical rates."""
+    """Goodputs to the two servers: {"U": client->M-server, "A": client->F-server} for digital
+    OFDMA (S/N tones per client, MRC) and {"U_zf", "A_zf"} for digital multi-user ZF (all S
+    tones, ZF separation). Same channel sample seed for both servers, so equal arrays give
+    identical rates. With unequal path gains these are the weakest client's goodputs: the
+    clients upload concurrently and the stage ends when the slowest finishes (Eq. 12)."""
     cU = digital_spectral_efficiency(radio, np.random.RandomState(seed), Nr=radio.Nr)
     cA = cU if radio.Nr_F == radio.Nr else \
         digital_spectral_efficiency(radio, np.random.RandomState(seed), Nr=radio.Nr_F)
+    # same sample seed as OFDMA: at N = 1 both schemes are single-user MRC on all S tones
+    # and the two rates coincide exactly (verify_zf)
+    zU = digital_zf_spectral_efficiency(radio, np.random.RandomState(seed), Nr=radio.Nr)
+    zA = zU if radio.Nr_F == radio.Nr else \
+        digital_zf_spectral_efficiency(radio, np.random.RandomState(seed), Nr=radio.Nr_F)
+    zf = lambda c: radio.eps_D * radio.df_hz * radio.S * c
     return {"U": digital_rate_bps(radio, c_D=cU), "A": digital_rate_bps(radio, c_D=cA),
-            "c_U": cU, "c_A": cA}
+            "c_U": cU, "c_A": cA, "U_zf": zf(zU), "A_zf": zf(zA), "c_zf_U": zU, "c_zf_A": zA}
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +241,9 @@ def label_time_s(radio: RadioConfig, rate_bps: float) -> float:
 # Per-round uplink time per method (Eq. 25-26)
 # ---------------------------------------------------------------------------
 
-METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp", "aircomp_fl", "digital_fedavg")
+METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp", "aircomp_fl", "digital_fedavg",
+           "digital_sflv1_zf", "hybrid_zf_aircomp")
+SPLIT_METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp", "digital_sflv1_zf", "hybrid_zf_aircomp")
 
 _ALIASES = {
     "airsfl": "airsfl",
@@ -163,6 +251,8 @@ _ALIASES = {
     "sun_fdma_aircomp": "sun_fdma_aircomp", "sun": "sun_fdma_aircomp", "fdma_aircomp": "sun_fdma_aircomp",
     "aircomp_fl": "aircomp_fl", "aircomp-fl": "aircomp_fl",
     "digital_fedavg": "digital_fedavg", "fedavg": "digital_fedavg", "fl": "digital_fedavg",
+    "digital_sflv1_zf": "digital_sflv1_zf", "sflv1_zf": "digital_sflv1_zf",
+    "hybrid_zf_aircomp": "hybrid_zf_aircomp", "zf_aircomp": "hybrid_zf_aircomp",
 }
 
 
@@ -180,9 +270,13 @@ def uplink_time_breakdown(method: str, dims: dict, radio: RadioConfig, tau: int,
     AA = lambda D: analog_time_s(D, radio.eps_A, radio)
     DU = lambda D: digital_time_s(D, rates["U"])
     DA = lambda D: digital_time_s(D, rates["A"])
+    ZU = lambda D: digital_time_s(D, rates["U_zf"])        # digital multi-user ZF (all tones)
+    ZA = lambda D: digital_time_s(D, rates["A_zf"])
     # labels go up only when the M-server computes the loss, i.e. when there IS a split
-    # (d_a > 0); in the no-split limit the SFL rows reduce exactly to the FL rows
-    lab = tau * label_time_s(radio, rates["U"]) if d_a > 0 else 0.0
+    # (d_a > 0); in the no-split limit the SFL rows reduce exactly to the FL rows. They use
+    # the method's digital activation link (OFDMA, or ZF for the ZF baselines).
+    zf = m in ("digital_sflv1_zf", "hybrid_zf_aircomp")
+    lab = tau * label_time_s(radio, rates["U_zf" if zf else "U"]) if d_a > 0 else 0.0
     act = agg = 0.0
     if m == "airsfl":
         act, agg = tau * AU(d_a), AA(d_c)
@@ -190,6 +284,10 @@ def uplink_time_breakdown(method: str, dims: dict, radio: RadioConfig, tau: int,
         act, agg = tau * DU(d_a), DA(d_c)
     elif m == "sun_fdma_aircomp":
         act, agg = tau * DU(d_a), AA(d_c)
+    elif m == "digital_sflv1_zf":
+        act, agg = tau * ZU(d_a), ZA(d_c)
+    elif m == "hybrid_zf_aircomp":
+        act, agg = tau * ZU(d_a), AA(d_c)
     elif m == "aircomp_fl":
         lab, agg = 0.0, AA(d_c + d_s)
     elif m == "digital_fedavg":
@@ -216,7 +314,7 @@ def source_equivalent_mb_per_round(method: str, dims: dict, radio: RadioConfig, 
     m = _ALIASES.get(method.lower())
     d_c, d_s, d_a = int(dims["d_c"]), int(dims["d_s"]), int(dims["d_a"])
     label_bits = radio.batch_size * math.ceil(math.log2(radio.num_classes)) if d_a > 0 else 0
-    if m in ("airsfl", "digital_sflv1", "sun_fdma_aircomp"):
+    if m in SPLIT_METHODS:
         return radio.N * (Q_BITS * (tau * d_a + d_c) + tau * label_bits) / 8e6
     return radio.N * Q_BITS * (d_c + d_s) / 8e6
 
@@ -282,6 +380,15 @@ def verify_limit_cases(verbose: bool = True) -> bool:
             (bs["total"], bd["activation"] + bd["labels"] + ba["aggregation"])
         checks[f"stage {stage}: AirSFL total = sum of its phases"] = \
             (ba["total"], ba["activation"] + ba["labels"] + ba["aggregation"])
+    checks["HybridZF(no split) == AirComp-FL"] = (ul("hybrid_zf_aircomp", nosplit), ul("aircomp_fl", nosplit))
+    checks["SFLV1-ZF(no split) == q d / R_ZF"] = (ul("digital_sflv1_zf", nosplit),
+                                                  Q_BITS * nosplit["d_c"] / rates["A_zf"])
+    for stage, dims in profiled_dims(radio.batch_size).items():
+        bh = uplink_time_breakdown("hybrid_zf_aircomp", dims, radio, 5, rates)
+        bz = uplink_time_breakdown("digital_sflv1_zf", dims, radio, 5, rates)
+        ba = uplink_time_breakdown("airsfl", dims, radio, 5, rates)
+        checks[f"stage {stage}: HybridZF = SFLV1-ZF.act + labels + AirSFL.agg"] = \
+            (bh["total"], bz["activation"] + bz["labels"] + ba["aggregation"])
     ok = True
     if verbose:
         print("=== Eq. 25-26 limit-case / structural checks ===")
@@ -289,9 +396,100 @@ def verify_limit_cases(verbose: bool = True) -> bool:
         good = abs(a - b) <= 1e-9 * max(1.0, abs(b))
         ok &= good
         if verbose:
-            print(f"  {'OK ' if good else 'BAD'} {name:48s} {a:12.4f} vs {b:12.4f}")
+            print(f"  {'OK ' if good else 'BAD'} {name:58s} {a:12.4f} vs {b:12.4f}")
     if verbose:
         print(f"  LIMIT_CASES: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def verify_zf(verbose: bool = True) -> bool:
+    """Digital multi-user ZF rate:
+      (1) the Gamma(Nr-N+1, 1) post-ZF gain used for c_ZF == Monte-Carlo over explicit
+          channels H ~ CN(0, I) and the ZF filter (H^H H)^-1 H^H, at 20 dB and -10 dB;
+      (2) N = 1: ZF == OFDMA exactly (single-user MRC on all S tones);
+      (3) golden values of the default environment (cut 2, tau 5, 20 dB):
+          c_ZF ~= 11.75, Digital SFL-V1 (ZF) ~= 8.31 s, Hybrid ZF-AirComp ~= 6.92 s per round."""
+    ok = True
+    rng = np.random.RandomState(7)
+    base = RadioConfig()
+    lines = []
+    for rho_db in (20.0, -10.0):
+        radio = RadioConfig(rho_db=rho_db)
+        N, Nr = radio.N, radio.Nr
+        H = (rng.normal(size=(3000, Nr, N)) + 1j * rng.normal(size=(3000, Nr, N))) / math.sqrt(2)
+        Y = 1.0 / np.real(np.diagonal(np.linalg.inv(np.conj(np.swapaxes(H, 1, 2)) @ H), axis1=1, axis2=2))
+        mc = float(np.mean(np.log2(1.0 + radio.rho_lin * Y)))
+        th = digital_zf_spectral_efficiency(radio, np.random.RandomState(2026))
+        good = abs(mc - th) / th < 0.01 and abs(Y.mean() - (Nr - N + 1)) / (Nr - N + 1) < 0.01
+        ok &= good
+        lines.append(f"  (1) {rho_db:+5.0f} dB: c_ZF Gamma {th:.4f} vs explicit ZF {mc:.4f} bit/tone-use, "
+                     f"E[Y] {Y.mean():.2f} vs Nr-N+1 = {Nr - N + 1}  {'OK' if good else 'BAD'}")
+    one = RadioConfig(N=1)
+    r1 = digital_rates(one)
+    good = r1["U_zf"] == r1["U"] and r1["A_zf"] == r1["A"]
+    ok &= good
+    lines.append(f"  (2) N=1: R_ZF = {r1['U_zf']/1e6:.4f} Mbit/s == R_OFDMA = {r1['U']/1e6:.4f} Mbit/s  "
+                 f"{'OK' if good else 'BAD'}")
+    rates = digital_rates(base)
+    dims = profiled_dims(base.batch_size)[2]
+    got = {"c_ZF": rates["c_zf_U"], "sflv1_zf_s": uplink_time_per_round("digital_sflv1_zf", dims, base, 5, rates),
+           "hybrid_zf_s": uplink_time_per_round("hybrid_zf_aircomp", dims, base, 5, rates)}
+    golden = {"c_ZF": 11.75, "sflv1_zf_s": 8.31, "hybrid_zf_s": 6.92}
+    good = all(abs(got[k] - v) / v < 0.01 for k, v in golden.items())
+    ok &= good
+    lines.append("  (3) default environment: " + ", ".join(f"{k} = {got[k]:.3f} [golden {v}]"
+                                                         for k, v in golden.items()) + f"  {'OK' if good else 'BAD'}")
+    if verbose:
+        print("=== digital multi-user ZF rate ===")
+        print("\n".join(lines))
+        print(f"  ZF_RATE: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def verify_path_gains(verbose: bool = True) -> bool:
+    """Unequal path gains, timing side:
+      (1) explicit all-zero offsets == equal gains, bitwise;
+      (2) the digital rates equal those of an equal-gain link at the weakest client's SNR
+          (rho + g_min dB), i.e. the max over clients of Eq. 12;
+      (3) analog phases are unchanged (AirSFL's labels are digital and follow the weakest
+          client too); digital times grow with the spread;
+      (4) the offsets are stratified: weakest client -spread (1 - 1/N)/2 dB, median 0 dB,
+          same multiset for every seed, different client order."""
+    ok = True
+    lines = []
+    base = RadioConfig()
+    dims = profiled_dims(base.batch_size)[2]
+    r0 = digital_rates(base)
+    rz = digital_rates(RadioConfig(gains_db=(0.0,) * base.N))
+    good = all(r0[k] == rz[k] for k in r0)
+    ok &= good
+    lines.append(f"  (1) all-zero offsets == equal gains (bitwise): {'OK' if good else 'BAD'}")
+    prev = {m: uplink_time_per_round(m, dims, base, 5, r0) for m in METHODS}
+    b0 = uplink_time_breakdown("airsfl", dims, base, 5, r0)
+    for spread in (10.0, 20.0, 40.0):
+        g = path_gain_offsets_db(base.N, spread, seed=11)
+        rg = RadioConfig(gains_db=g)
+        rates = digital_rates(rg)
+        ref = digital_rates(RadioConfig(rho_db=base.rho_db + min(g)))
+        good = all(abs(rates[k] - ref[k]) <= 1e-9 * abs(ref[k]) for k in ("U", "A", "U_zf", "A_zf"))
+        t = {m: uplink_time_per_round(m, dims, rg, 5, rates) for m in METHODS}
+        b = uplink_time_breakdown("airsfl", dims, rg, 5, rates)
+        good &= b["activation"] == b0["activation"] and b["aggregation"] == b0["aggregation"]  # analog phases
+        good &= t["aircomp_fl"] == prev["aircomp_fl"]
+        good &= all(t[m] > prev[m] for m in ("digital_sflv1", "digital_sflv1_zf", "sun_fdma_aircomp",
+                                               "hybrid_zf_aircomp", "digital_fedavg"))
+        prev = {m: (t[m] if m != "aircomp_fl" else prev[m]) for m in METHODS}
+        other = path_gain_offsets_db(base.N, spread, seed=22)
+        good &= sorted(other) == sorted(g) and other != g and abs(float(np.median(g))) < 1e-9
+        good &= abs(min(g) + spread * (1 - 1 / base.N) / 2) < 1e-6
+        ok &= good
+        lines.append(f"  spread {spread:4.0f} dB: weakest {min(g):6.2f} dB | SFL-V1 {t['digital_sflv1']:7.1f} s, "
+                     f"SFL-V1 (ZF) {t['digital_sflv1_zf']:6.2f} s, AirSFL {t['airsfl']:.3f} s per round | "
+                     f"(2)-(4) {'OK' if good else 'BAD'}")
+    if verbose:
+        print("=== unequal path gains (timing) ===")
+        print("\n".join(lines))
+        print(f"  PATH_GAINS_TIMING: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
@@ -303,7 +501,13 @@ def environment_summary(radio: Optional[RadioConfig] = None, stage: int = 2, tau
     print(f"=== environment: N={radio.N}, Nr_M={radio.Nr}, Nr_F={radio.Nr_F}, S={radio.S} "
           f"(W={radio.W_hz/1e6:.2f} MHz, S_n={radio.Sn:g}), rho={radio.rho_db:g} dB, "
           f"eps=({radio.eps_D},{radio.eps_U},{radio.eps_A}), cut {stage}, tau={tau} ===")
-    print(f"  c_D = {rates['c_U']:.2f} bit/tone-use, digital goodput per client = {rates['U']/1e3:.1f} kbit/s")
+    if radio.unequal_gains:
+        print(f"  unequal path gains: {min(radio.gains_db):.2f} ... {max(radio.gains_db):.2f} dB around the "
+              f"reference (median); digital rates below are the weakest client's")
+    print(f"  OFDMA: c_D = {rates['c_U']:.2f} bit/tone-use on {radio.Sn:g} tones, goodput per client = "
+          f"{rates['U']/1e6:.3f} Mbit/s")
+    print(f"  ZF:    c_ZF = {rates['c_zf_U']:.2f} bit/tone-use on {radio.S} tones, goodput per client = "
+          f"{rates['U_zf']/1e6:.3f} Mbit/s")
     for m in METHODS:
         b = uplink_time_breakdown(m, dims, radio, tau, rates)
         print(f"  {m:17s} act {b['activation']:9.3f}  labels {b['labels']:.4f}  agg {b['aggregation']:9.3f}"
@@ -314,5 +518,9 @@ if __name__ == "__main__":
     verify_reference_example()
     print()
     verify_limit_cases()
+    print()
+    verify_zf()
+    print()
+    verify_path_gains()
     print()
     environment_summary()

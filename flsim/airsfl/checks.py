@@ -2,7 +2,8 @@
 flsim/airsfl/checks.py: correctness checks for the AirSFL environment
 (evaluation roadmap Sec. 9, implementation gates). Run:  python -m flsim.airsfl.checks
 
-  1. Timing: formula regression + Eq. 25-26 limit cases (each phase counted once).
+  1. Timing: formula regression + Eq. 25-26 limit cases (each phase counted once); digital
+     multi-user ZF rate (Gamma(Nr-N+1) gain vs explicit ZF channels, N=1 == OFDMA, golden).
   2. Model: roadmap d_c / d_s / d_a at all four cuts.
   3. Radio: gates 1-3, 5 (packing, packet power, ZF identity, noiseless AirComp, zero
      packets); Monte-Carlo MSE vs Eq. 10 / 23; scale-free == dimensional formulas.
@@ -18,6 +19,9 @@ flsim/airsfl/checks.py: correctness checks for the AirSFL environment
      f. zero activation packets / zero aggregates carry zero error;
      h. recorded computation / training-time columns == the computation model;
      i. radio draws depend only on (seed, link, round, step);
+     j. ZF digital baselines == their OFDMA parents' learning (bitwise), timing == ZF retiming;
+     k. unequal path gains: scale-free == dimensional, sampler Monte Carlo, uniform offsets ==
+        shifted SNR, all-zero offsets == equal gains;
      g. vectorized crop+flip == per-image reference.
   Computation model (flsim.airsfl.compute.verify_compute): FLOP counts vs closed form and
   the framework counter, prefix + suffix == full model, N=1 limit, hand calculation.
@@ -34,7 +38,8 @@ from flsim.airsfl.compute import compute_time_breakdown, split_flops, verify_com
 from flsim.airsfl.data import ClientStream, load_cifar10_tensors, make_eval_tensors, partition
 from flsim.airsfl.model import CifarResNet18GN, check_profiled_dims
 from flsim.airsfl.simulator import AirSFLSimulator, RunConfig, _HAS_FUNC
-from flsim.airsfl.timing import RadioConfig, verify_limit_cases, verify_reference_example
+from flsim.airsfl.timing import (RadioConfig, digital_rates, uplink_time_breakdown, verify_limit_cases,
+                                 verify_path_gains, verify_reference_example, verify_zf)
 
 _OK = lambda b: "PASS" if b else "FAIL"
 ENGINES = ("loop", "vmap") if _HAS_FUNC else ("loop",)
@@ -83,9 +88,9 @@ def _small_env(N=4, Nr=16, S=8, per_client=64, n_val=200, device=torch.device("c
 
 
 def _run(method, stage, radio, make_streams, weights, ev, noiseless, engine="loop", rounds=2, tau=2, B=8,
-         seed=11):
+         seed=11, eval_rounds=()):
     cfg = RunConfig(method=method, stage=stage, tau=tau, batch_size=B, lr=0.05, rounds=rounds,
-                    noiseless=noiseless, seed=seed, engine=engine)
+                    noiseless=noiseless, seed=seed, engine=engine, eval_rounds=eval_rounds)
     sim = AirSFLSimulator(cfg, copy.deepcopy(radio), make_streams(B, seed), weights, ev,
                           torch.device("cpu"), n_train=45000, log=lambda *a: None)
     sim.run()
@@ -259,6 +264,130 @@ def check_time_columns_and_streams(verbose=True) -> bool:
     ok &= good
     if verbose:
         print(f"  (i) radio draws depend only on (seed, link, round, step), no seed collisions: {_OK(good)}")
+    # extra evaluation rounds (--early-evals) only add rows; the training trajectory is untouched
+    a = _run("airsfl", 2, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+    b = _run("airsfl", 2, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=3, eval_rounds=(1, 2))
+    good = torch.equal(a.global_vector(), b.global_vector()) and \
+        [h["round"] for h in b.history] == sorted({h["round"] for h in a.history} | {1, 2})
+    ok &= good
+    if verbose:
+        print(f"      extra evaluation rounds leave the trajectory bitwise unchanged: {_OK(good)}")
+    return ok
+
+
+def check_zf_baselines(verbose=True) -> bool:
+    """(j) The digital multi-user ZF baselines learn exactly like their OFDMA parents (the
+    digital links are reliable either way; the hybrid shares the parent's AirComp stream):
+    identical models, losses and accuracies. Their recorded uplink columns equal the parent
+    run's rows retimed with uplink_time_breakdown at the ZF rate -- the derivation plots.py
+    uses instead of training them again -- and their computation is the parent's."""
+    radio, make_streams, weights, ev = _small_env()
+    same = lambda x, y: x == y or (isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y))
+    ok = True
+    for zf, parent in (("digital_sflv1_zf", "digital_sflv1"), ("hybrid_zf_aircomp", "sun_fdma_aircomp")):
+        a = _run(parent, 2, radio, make_streams, weights, ev, False, ENGINES[-1])
+        b = _run(zf, 2, radio, make_streams, weights, ev, False, ENGINES[-1])
+        good = torch.equal(a.global_vector(), b.global_vector()) and len(a.history) == len(b.history)
+        h0 = a.history[0]
+        rd = RadioConfig(N=h0["N"], Nr=h0["Nr"], Nr_F=h0["Nr_F"], S=h0["S"], eps_D=h0["eps_D"], eps_U=h0["eps_U"],
+                         eps_A=h0["eps_A"], rho_db=h0["rho_db"], batch_size=h0["B"])
+        br = uplink_time_breakdown(zf, {k: h0[k] for k in ("d_c", "d_s", "d_a")}, rd, h0["tau"], digital_rates(rd))
+        for ha, hb in zip(a.history, b.history):
+            good &= all(same(ha[k], hb[k]) for k in ("round", "train_loss", "val_acc", "val_loss", "agg_nsr_db",
+                                                     "compute_s_per_round", "mb_per_round"))
+            good &= all(abs(hb[c] - br[k]) <= 1e-12 * max(1.0, br[k]) for c, k in
+                        (("activation_ul_s", "activation"), ("labels_ul_s", "labels"),
+                         ("aggregation_ul_s", "aggregation"), ("ul_s_per_round", "total")))
+            good &= abs(hb["training_time_s"] - hb["round"] * (br["total"] + ha["compute_s_per_round"])) < 1e-9
+        good &= b.ul_s < a.ul_s                   # ZF shares all tones -> faster than OFDMA here
+        ok &= good
+        if verbose:
+            print(f"  (j) {zf:17s} == {parent:16s} learning (bitwise), uplink {b.ul_s:.3f} vs {a.ul_s:.3f} s/round "
+                  f"== ZF retiming of the parent run  {_OK(good)}")
+    return ok
+
+
+def check_path_gains(verbose=True) -> bool:
+    """(k) Unequal path gains lambda_n = g_n lambda_ref (optional robustness setting):
+      1. the simulator's scale-free forms == dimensional Eq. 10 / 23 on a channel with
+         unequal gains ([G^-1]_nn = [G~^-1]_nn / g_n; ||v||^2 = d^T G~^-1 d, d = 1/sqrt(g));
+      2. Monte Carlo through the simulator's own samplers: joint ZF error variance per client
+         E[G~inv_nn] / (2 g_n) = 1 / (2 (Nr - N) g_n); AirComp E[||v~||^2] = sum_n (1/g_n) / (Nr - N);
+      3. training: equal offsets of -3 dB for every client == equal gains at rho - 3 dB (same
+         trajectory to float rounding, same time columns);
+      4. all-zero offsets take the equal-gain code path (bitwise identical run)."""
+    import dataclasses
+    from flsim.airsfl.timing import path_gain_offsets_db
+    ok = True
+    # 1. scale-free == dimensional on one channel
+    radio = RadioConfig(N=6, Nr=16, S=12, rho_db=10.0, gains_db=path_gain_offsets_db(6, 20.0, 3))
+    g = radio.g_lin
+    rng = np.random.RandomState(3)
+    Ht = (rng.normal(size=(radio.Nr, radio.N)) + 1j * rng.normal(size=(radio.Nr, radio.N))) / math.sqrt(2)
+    H = math.sqrt(radio.lambda_ref) * Ht * np.sqrt(g)[None, :]                   # physical channel
+    Gt_inv = np.linalg.inv(Ht.conj().T @ Ht)
+    z = torch.randn(256, dtype=torch.float64)
+    m = 128
+    good = True
+    for n in range(radio.N):
+        dim = R.zf_noise_var_per_coord(z, R.zf_column_norms_sq(H)[n], radio)
+        sf = Gt_inv[n, n].real / g[n] * float(z.pow(2).sum()) / (2 * radio.rho_lin * m)
+        good &= abs(dim - sf) / dim < 1e-9
+    deltas = [torch.randn(256, dtype=torch.float64) for _ in range(radio.N)]
+    a = [1.0 / radio.N] * radio.N
+    dim_A = R.sigma2(radio) / (2 * R.aircomp_alpha(deltas, a, R.aircomp_v_norm_sq(H), radio) ** 2)
+    dvec = 1.0 / np.sqrt(g)
+    maxterm = max(a[n] ** 2 * float(deltas[n].pow(2).sum()) for n in range(radio.N))
+    sf_A = float(np.real(dvec @ Gt_inv @ dvec)) * maxterm / (2 * radio.rho_lin * m)
+    good &= abs(dim_A - sf_A) / dim_A < 1e-9
+    ok &= good
+    if verbose:
+        print(f"  (k1) unequal gains: scale-free == dimensional (ZF Eq. 10, AirComp Eq. 23): {_OK(good)}")
+    # 2. Monte Carlo through the simulator's samplers
+    base, make_streams, weights, ev = _small_env()
+    rg = dataclasses.replace(base, gains_db=path_gain_offsets_db(base.N, 20.0, 5))
+    cfg = RunConfig(method="airsfl", stage=2, tau=1, batch_size=8, lr=0.05, rounds=1, seed=11, engine="loop")
+    sim = AirSFLSimulator(cfg, copy.deepcopy(rg), make_streams(8, 11), weights, ev, torch.device("cpu"),
+                          n_train=45000, log=lambda *a: None)
+    gl = rg.g_lin
+    E = torch.cat([sim._sample_zf_joint() for _ in range(4)], dim=1).double()       # (N, 4K, 256)
+    emp = E.pow(2).mean(dim=(1, 2)).numpy()
+    theory = 1.0 / (2 * (rg.Nr - rg.N) * gl)
+    err_zf = float(np.max(np.abs(emp / theory - 1)))
+    sim.gen_A.manual_seed(123)
+    K = 4096
+    noise = sim._aircomp_noise(torch.ones(K), K * 256).double()
+    emp_v2 = float(noise.pow(2).mean()) * 2 * rg.rho_lin * 128
+    th_v2 = float(np.sum(1.0 / gl)) / (rg.Nr_F - rg.N)
+    err_ac = abs(emp_v2 / th_v2 - 1)
+    good = err_zf < 0.03 and err_ac < 0.03
+    ok &= good
+    if verbose:
+        print(f"  (k2) simulator samplers vs theory: ZF per-client variance max rel. error {100 * err_zf:.2f}%, "
+              f"AirComp ||v||^2 rel. error {100 * err_ac:.2f}%  {_OK(good)}")
+    # 3. uniform -3 dB offsets == equal gains at rho - 3 dB
+    a3 = _run("airsfl", 2, dataclasses.replace(base, gains_db=(-3.0,) * base.N), make_streams, weights, ev,
+              False, ENGINES[-1])
+    b3 = _run("airsfl", 2, dataclasses.replace(base, rho_db=base.rho_db - 3.0), make_streams, weights, ev,
+              False, ENGINES[-1])
+    dv = (a3.global_vector() - b3.global_vector()).abs()
+    diff, med = float(dv.max()), float(dv.median())
+    tdiff = max(abs(ha["uplink_s"] - hb["uplink_s"]) for ha, hb in zip(a3.history, b3.history))
+    # same noise realizations up to float32 rounding (which can flip a ReLU mask): tolerance as in (d2);
+    # a wrong gain scaling would move the parameters by the size of the noise itself
+    good = a3.unequal and diff < 1e-2 and med < 1e-6 and tdiff < 1e-9
+    ok &= good
+    if verbose:
+        print(f"  (k3) offsets -3 dB for all == equal gains at rho-3 dB: max|theta diff| = {diff:.1e}, "
+              f"median {med:.1e}, time diff {tdiff:.1e}  {_OK(good)}")
+    # 4. all-zero offsets take the equal-gain path
+    a0 = _run("airsfl", 2, dataclasses.replace(base, gains_db=(0.0,) * base.N), make_streams, weights, ev,
+              False, ENGINES[-1])
+    b0 = _run("airsfl", 2, base, make_streams, weights, ev, False, ENGINES[-1])
+    good = (not a0.unequal) and torch.equal(a0.global_vector(), b0.global_vector())
+    ok &= good
+    if verbose:
+        print(f"  (k4) all-zero offsets == equal gains (bitwise): {_OK(good)}")
     return ok
 
 
@@ -285,6 +414,8 @@ def run_all() -> bool:
     print("\n########## 1. TIMING ##########")
     ok = verify_reference_example()["ok"]
     ok &= verify_limit_cases()
+    ok &= verify_zf()
+    ok &= verify_path_gains()
     print("\n########## 2. MODEL + COMPUTATION ##########")
     ok &= check_profiled_dims()["ok"]
     ok &= verify_compute()
@@ -296,6 +427,8 @@ def run_all() -> bool:
     ok &= check_training_equivalences()
     ok &= check_activation_nsr_and_zero()
     ok &= check_time_columns_and_streams()
+    ok &= check_zf_baselines()
+    ok &= check_path_gains()
     ok &= check_crop()
     print(f"\n==== ALL AIRSFL CHECKS: {_OK(ok)} ====")
     return ok

@@ -3,7 +3,7 @@
 #
 # AirSFL vs baselines (CIFAR-10, ResNet-18 GroupNorm; two-server draft + roadmap).
 # Environment variables (all optional):
-#   EXP        one or more of: bench lr main snr nsweep cuts tau nr     (default "bench")
+#   EXP        one or more of: bench lr main snr nsweep cuts tau nr pathloss   (default "bench")
 #   PARTITION  "iid", "dirichlet" or "iid dirichlet"                      (default both)
 #   SEEDS      paired seeds, e.g. "11 22 33 44 55"                        (default 11)
 #   METHODS    subset, e.g. "airsfl" (to split a sweep over parallel jobs)
@@ -12,19 +12,23 @@
 #   SNRS       SNR list for EXP=snr                                       (default "-20 -10 0 10")
 #   RESULTS    results root, e.g. examples/AirSFL/results_quick_aug       (default .../results)
 #   TARGETS    validation targets for the figures, e.g. "0.75 0.8"        (default: 95% rule)
-#   EXTRA      any other run_airsfl.py flags, e.g. "--no-augment", "--fast-cudnn",
-#              "--engine vmap"
+#   EXTRA      any other run_airsfl.py flags, e.g. "--early-evals", "--spreads 10 20 30 40",
+#              "--path-gain-spread 20", "--augment", "--engine loop", "--deterministic"
+#              (defaults: no augmentation, vmap engine, fast cuDNN; a run that hits GPU
+#              out-of-memory restarts on the loop engine by itself)
+#   PLOT_EXTRA any other plots.py flags, e.g. "--budget-mult 1 3 --sweep-curves epochs uplink"
 # Every run is identified by a hash of its full configuration: a finished run with the
 # same configuration is skipped (resubmit a timed-out job with the same variables), any
 # changed setting produces a new run. Figures/tables are rebuilt at the end of each job.
 #
-# QUICK GPU TEST (1 seed, 50 epochs, augmentation on, new folder):
-#   Q=examples/AirSFL/results_quick_aug
+# QUICK GPU TEST (1 seed, 50 epochs, new folder):
+#   Q=examples/AirSFL/results_quick_v2
 #   J=$(sbatch --parsable --export=ALL,EXP="lr",RESULTS=$Q slurm/run_airsfl.slurm)
 #   for P in iid dirichlet; do
-#     sbatch --dependency=afterok:$J --export=ALL,EXP="main",PARTITION=$P,EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
+#     sbatch --dependency=afterok:$J --export=ALL,EXP="main",PARTITION=$P,EPOCHS=50,RESULTS=$Q,EXTRA="--early-evals" slurm/run_airsfl.slurm
 #     for M in airsfl sun_fdma_aircomp aircomp_fl; do
-#       sbatch --dependency=afterok:$J --export=ALL,EXP="snr",PARTITION=$P,METHODS=$M,EPOCHS=50,RESULTS=$Q slurm/run_airsfl.slurm
+#       sbatch --dependency=afterok:$J --export=ALL,EXP="snr",PARTITION=$P,METHODS=$M,EPOCHS=50,RESULTS=$Q,EXTRA="--early-evals" slurm/run_airsfl.slurm
+#       sbatch --dependency=afterok:$J --export=ALL,EXP="pathloss",PARTITION=$P,METHODS=$M,EPOCHS=50,RESULTS=$Q,EXTRA="--early-evals" slurm/run_airsfl.slurm
 #     done
 #   done
 #
@@ -120,6 +124,7 @@ ARGS=(--exp ${EXP} --partition ${PARTITION} --seeds ${SEEDS})
 PLOT_ARGS=()
 [[ -n "${RESULTS:-}" ]]   && PLOT_ARGS+=(--results ${RESULTS})
 [[ -n "${TARGETS:-}" ]]   && PLOT_ARGS+=(--targets ${TARGETS})
+[[ -n "${PLOT_EXTRA:-}" ]] && PLOT_ARGS+=(${PLOT_EXTRA})
 echo "AirSFL: ${ARGS[*]}"
 python examples/AirSFL/run_airsfl.py "${ARGS[@]}"
 python examples/AirSFL/plots.py "${PLOT_ARGS[@]}"

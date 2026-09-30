@@ -22,6 +22,12 @@ TEST accuracy; target markers sit at the checkpoint where VALIDATION reached the
 Digital learning does not depend on SNR, cut, efficiency or antenna count (ideal
 decoding): for those sweeps its time axes are recomputed analytically from the same runs.
 
+Digital multi-user ZF baselines (stronger digital references than OFDMA): "Digital SFL-V1
+(ZF)" and "Hybrid ZF-AirComp SFL" learn exactly like digital SFL-V1 / Hybrid FDMA-AirComp
+SFL (reliable digital links either way; same AirComp stream), so they are derived from those
+runs with the uplink time recomputed at the ZF rate (flsim.airsfl.timing; verified against
+real runs in flsim.airsfl.checks). --methods selects which methods are drawn.
+
 Only CSVs of the current schema with the calibrated initial LR and augmentation setting
 (results/lr/chosen_lr.json, or --lr / --augment) and one epoch budget are loaded.
 
@@ -29,8 +35,10 @@ Figures -> <results>/figures/, tables -> <results>/tables/:
   fig1_acc_vs_uplink_time     test accuracy vs accumulated uplink time
   fig1c_acc_vs_training_time  test accuracy vs training time (uplink + computation)
   fig1b_acc_vs_epochs         test accuracy vs global-epoch equivalents (learning only)
+  fig1e_acc_vs_uplink_time_linear  Sun et al.-style curves on a linear time axis, 20 dB and low SNR
   fig2_snr                    final accuracy, uplink / training time to target vs SNR
-  fig2b_airsfl_snr_curves     AirSFL accuracy vs uplink time at every SNR (+ digital SFL-V1)
+  fig2b_airsfl_snr_curves     AirSFL accuracy vs uplink time at every SNR (+ error-free AirSFL,
+                              digital SFL-V1 (ZF / OFDMA) at the lowest SNR and at 20 dB)
   fig2c_acc_at_budget         test accuracy reached within a fixed time budget vs SNR
   fig3_uplink_breakdown       per-round uplink phases vs N (analytic)
   fig3b_uplink_vs_cut         per-round uplink time vs cut (analytic)
@@ -41,6 +49,11 @@ Figures -> <results>/figures/, tables -> <results>/tables/:
   fig7_nsweep                 N in {20,30,40}: time to a common target (if run)
   fig8_efficiency             time to target vs analog efficiency (0.4/0.6/0.7, ideal 1.0)
   fig9_cut_tau                time to target vs cut and vs tau (if run)
+  fig10_compute_regimes       time to target: uplink only / edge-GPU / IoT-CPU (Sun et al.) devices
+  fig11_path_gains            unequal path gains (exp `pathloss`): accuracy, time to target, s/round vs spread
+  fig2d_curves_all_snr_<axis>, fig11b_curves_all_spreads_<axis>
+                              learning curves of all methods at every SNR / path-gain spread (--sweep-curves)
+  fig1d_acc_vs_training_time_iot  accuracy vs training time with IoT-CPU devices
   tables: table_main, table_snr, table_budget, table_cuts, table_round_time, table_nsweep,
           table_efficiency, table_cut_tau  (.csv + .md + .tex)
 """
@@ -57,7 +70,8 @@ import numpy as np
 import pandas as pd
 
 from flsim.airsfl.compute import SPLIT_METHODS, compute_time_breakdown, split_flops
-from flsim.airsfl.timing import (RadioConfig, digital_rates, profiled_dims, source_equivalent_mb_per_round,
+from flsim.airsfl.timing import (RadioConfig, digital_rates, path_gain_offsets_db, profiled_dims,
+                                 source_equivalent_mb_per_round,
                                  uplink_time_breakdown, uplink_time_per_round)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,18 +83,35 @@ FILTER = {}                 # base_lr / augment / epochs_budget of the loaded ca
 TARGETS = None              # prespecified validation targets (set in main)
 COMPUTE = dict(client_tflops_lo=1.0, client_tflops_hi=2.0, server_tflops=20.0)   # table/analytic default
 BUDGETS = {"uplink": None, "training": None}
+BUDGET_MULTS = [1.0]        # fig2c: budgets = base budget x each multiplier (--budget-mult)
+LINEAR = {"snrs": None, "xmax": None}   # fig1e: SNR panels and x range (--linear-snrs, --linear-xmax)
+SWEEP_CURVES = {"axes": ["epochs", "uplink"], "xscale": "log"}   # fig2d / fig11b (--sweep-curves, --curves-xscale)
 
 STYLE = {
-    "airsfl":           dict(label="AirSFL (proposed)", color="#d62728", marker="o", lw=2.6, ls="-"),
-    "digital_sflv1":    dict(label="Digital SFL-V1", color="#1f77b4", marker="s", lw=1.8, ls="-"),
-    "sun_fdma_aircomp": dict(label="FDMA-AirComp SFL", color="#9467bd", marker="^", lw=1.8, ls="-"),
-    "aircomp_fl":       dict(label="AirComp-FL", color="#2ca02c", marker="D", lw=1.8, ls="-"),
-    "digital_fedavg":   dict(label="Digital FedAvg", color="#7f7f7f", marker="v", lw=1.6, ls="--"),
+    "airsfl":            dict(label="AirSFL (proposed)", color="#d62728", marker="o", lw=2.6, ls="-"),
+    "aircomp_fl":        dict(label="AirComp-FL", color="#2ca02c", marker="D", lw=1.8, ls="-"),
+    "hybrid_zf_aircomp": dict(label="Hybrid ZF-AirComp SFL", color="#8c564b", marker="X", lw=1.8, ls="-."),
+    "sun_fdma_aircomp":  dict(label="Hybrid FDMA-AirComp SFL", color="#9467bd", marker="^", lw=1.8, ls="-"),
+    "digital_sflv1_zf":  dict(label="Digital SFL-V1 (ZF)", color="#17becf", marker="P", lw=1.8, ls="-."),
+    "digital_sflv1":     dict(label="Digital SFL-V1 (OFDMA)", color="#1f77b4", marker="s", lw=1.8, ls="-"),
+    "digital_fedavg":    dict(label="Digital FedAvg (OFDMA)", color="#7f7f7f", marker="v", lw=1.6, ls="--"),
+    "airsfl_errfree":    dict(label="AirSFL, error-free (upper bound)", color="#d62728", marker="*", lw=1.6, ls=":"),
 }
+# computation presets, all recomputed from the stored FLOP counts and client draws (no retraining):
+# (client TFLOPS lo, hi, M-server TFLOPS)
+PRESETS = [
+    ("uplink only (no computation)", None),
+    ("edge GPU [AdaptSFL]: clients U[1,2] TFLOPS, server 20 TFLOPS", (1.0, 2.0, 20.0)),
+    ("IoT CPU [Sun et al.]: 16 FLOP/cycle x U[0.1,2] GHz, server 320 GFLOPS", (0.0016, 0.032, 0.32)),
+]
 PART_NAME = {"iid": "IID", "dirichlet": "Non-IID (Dir-0.5)"}
-ORDER = ["airsfl", "sun_fdma_aircomp", "aircomp_fl", "digital_sflv1", "digital_fedavg"]
-SFL = ["airsfl", "sun_fdma_aircomp", "digital_sflv1"]
-DIGITAL = ("digital_sflv1", "digital_fedavg")
+# families side by side: analog, hybrid (ZF / OFDMA activations), digital SFL (ZF / OFDMA), FedAvg
+ALL_METHODS = ["airsfl", "aircomp_fl", "hybrid_zf_aircomp", "sun_fdma_aircomp", "digital_sflv1_zf",
+               "digital_sflv1", "digital_fedavg"]
+ORDER = list(ALL_METHODS)             # methods drawn (plots.py --methods)
+# multi-user ZF digital baselines, derived from the parent runs (identical learning, ZF timing)
+DERIVED = {"digital_sflv1_zf": "digital_sflv1", "hybrid_zf_aircomp": "sun_fdma_aircomp"}
+DIGITAL = ("digital_sflv1", "digital_fedavg", "digital_sflv1_zf")   # learning independent of the SNR
 ENV0 = dict(N=30, Nr=64, Nr_F=64, S=120, eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0, batch_size=16)
 TAU0, CUT0, B0 = 5, 2, 16
 AXES = {"uplink": ("uplink_s", "Accumulated uplink communication time (s)"),
@@ -104,12 +135,12 @@ def _read(exp):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def _filter(df):
+def _filter(df, skip=()):
     if df.empty:
         return df
     keep = np.ones(len(df), dtype=bool)
     for col, val in FILTER.items():
-        if val is None or col not in df:
+        if val is None or col not in df or col in skip:
             continue
         keep &= np.isclose(df[col].astype(float), float(val)) if isinstance(val, float) else (df[col] == val).values
     return df[keep]
@@ -119,7 +150,8 @@ _RATE_CACHE = {}
 
 
 def _rates(radio):
-    key = (radio.N, radio.Nr, radio.Nr_F, radio.S, radio.eps_D, radio.rho_db)
+    # digital rates depend on the gains only through the weakest client (Eq. 12)
+    key = (radio.N, radio.Nr, radio.Nr_F, radio.S, radio.eps_D, radio.rho_db, radio.g_min_db)
     if key not in _RATE_CACHE:
         _RATE_CACHE[key] = digital_rates(radio)
     return _RATE_CACHE[key]
@@ -129,10 +161,17 @@ def _radio(**kw):
     return RadioConfig(**{**ENV0, **kw})
 
 
+def _gains_of(r0):
+    """Per-client path gains (dB) a run was trained with; None for equal gains / older CSVs."""
+    g = r0.get("path_gains_db") if hasattr(r0, "get") else None
+    return tuple(json.loads(g)) if isinstance(g, str) and g.strip() else None
+
+
 def _radio_of(run, **ov):
     r0 = run.iloc[0]
     kw = dict(N=int(r0.N), Nr=int(r0.Nr), Nr_F=int(r0.Nr_F), S=int(r0.S), eps_D=float(r0.eps_D),
-              eps_U=float(r0.eps_U), eps_A=float(r0.eps_A), rho_db=float(r0.rho_db), batch_size=int(r0.B))
+              eps_U=float(r0.eps_U), eps_A=float(r0.eps_A), rho_db=float(r0.rho_db), batch_size=int(r0.B),
+              gains_db=_gains_of(r0))
     kw.update(ov)
     return RadioConfig(**kw)
 
@@ -162,13 +201,81 @@ def _set_times(run, ul, comp):
 
 
 def _retime(method, run, dims=None, stage=None, **ov):
-    """Same training run, time axes recomputed under radio overrides / another cut."""
+    """Same training run, time axes (and uplink phases) recomputed for `method` under radio
+    overrides / another cut. Several runs (seeds) are retimed one by one: each keeps its own
+    computation time (its own slowest-client draw)."""
+    if "run_id" in run and run.run_id.nunique() > 1:
+        return _per_run(run, lambda g: _retime(method, g, dims, stage, **ov))
     r0 = run.iloc[0]
     radio = _radio_of(run, **ov)
     dims = dims or {"d_c": int(r0.d_c), "d_s": int(r0.d_s), "d_a": int(r0.d_a)}
-    ul = uplink_time_per_round(method, dims, radio, int(r0.tau), _rates(radio))
+    b = uplink_time_breakdown(method, dims, radio, int(r0.tau), _rates(radio))
     comp = _compute_per_round(method, run, stage)["total"] if stage is not None else float(r0.compute_s_per_round)
-    return _set_times(run, ul, comp)
+    out = _set_times(run, b["total"], comp).assign(activation_ul_s=b["activation"], labels_ul_s=b["labels"],
+                                                   aggregation_ul_s=b["aggregation"])
+    for k in ("rho_db", "eps_D", "eps_U", "eps_A"):      # the retimed run now describes that radio setting
+        if k in ov:
+            out[k] = ov[k]
+    return out
+
+
+def _derive_zf(df):
+    """Add the digital multi-user ZF baselines to a set of runs. Their learning is exactly that
+    of the parent run (the digital links are reliable either way, and the hybrid shares the
+    parent's AirComp stream), so every parent run is copied and only its uplink time is
+    recomputed at the ZF rate for that run's own N, antennas, SNR, cut and tau
+    (flsim.airsfl.checks runs both and verifies this)."""
+    if df.empty:
+        return df
+    out = [df]
+    for zf, parent in DERIVED.items():
+        src = df[df.method == parent]
+        if src.empty or (df.method == zf).any():
+            continue
+        der = _per_run(src, lambda g: _retime(zf, g))
+        out.append(der.assign(method=zf, label=STYLE[zf]["label"], run_id=der.run_id.astype(str) + "|zf"))
+    return pd.concat(out, ignore_index=True)
+
+
+def _with_compute(run, preset):
+    """One run's time axes under a computation preset (None = uplink only)."""
+    r0 = run.iloc[0]
+    ul = float(r0.ul_s_per_round)
+    if preset is None:
+        return _set_times(run, ul, 0.0)
+    lo, hi, fs = preset
+    fl = {k: float(r0[f"flops_{k}"]) for k in ("client_fp", "client_bp", "server_fp", "server_bp")}
+    f_min = (lo + (hi - lo) * float(r0.u_client_min)) * 1e12
+    c = compute_time_breakdown(r0.method, fl, int(r0.N), int(r0.B), int(r0.tau), f_min, fs * 1e12)
+    return _set_times(run, ul, c["total"])
+
+
+def _per_run(df, fn):
+    return pd.concat([fn(g) for _, g in df.groupby("run_id")], ignore_index=True) if not df.empty else df
+
+
+def _airsfl_error_free(main, scheme):
+    """Noise-free AirSFL = digital SFL-V1's learning trajectory (bitwise identical, see checks)
+    placed on AirSFL's per-round uplink time: the error-free upper bound. The computation per
+    round of the two is identical for a seed (same cut, same client draws), so each seed keeps
+    its own. `main` holds one operating SNR (20 dB, or the one chosen with --snr)."""
+    dig = main[(main.partition == scheme) & (main.method == "digital_sflv1")]
+    air = main[(main.partition == scheme) & (main.method == "airsfl")]
+    if dig.empty or air.empty:
+        return pd.DataFrame()
+    ul = float(air.ul_s_per_round.iloc[0])            # seed-independent analog airtime (+ tiny digital labels)
+    return _per_run(dig, lambda g: _set_times(g, ul, float(g.compute_s_per_round.iloc[0])))
+
+
+def _main_at(main, snr, rho):
+    """The operating-point data set at SNR rho, from the CSVs: analog methods from the SNR sweep
+    at rho (ZF hybrid derived from its runs), digital methods (SNR-independent learning)
+    retimed at rho. rho = 20 dB is `main` itself."""
+    if rho == 20.0:
+        return main
+    frames = [r for scheme in _schemes(main) for m in ALL_METHODS
+              for r in [_snr_runs(main, snr, scheme, m, rho)] if not r.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _apply_compute(df):
@@ -266,12 +373,30 @@ def final_acc(df, col="test_acc"):
 
 def acc_at_budget(df, T, xcol):
     """Per-seed TEST accuracy of the last checkpoint whose time <= T (mean, min, max)."""
-    v = []
+    b = budget_point(df, T, xcol)
+    return b["a"], b["lo"], b["hi"]
+
+
+def budget_point(df, T, xcol):
+    """Accuracy within a time budget T, per seed: TEST accuracy of the last evaluated checkpoint
+    with time <= T. Also returns how many rounds fit into T and the last evaluated round, and
+    `evaluated` = False when no seed has a trained checkpoint (round >= 1) inside T -- the
+    value is then only the initial model's accuracy, not the (unevaluated) model at T."""
+    acc, last, fit = [], [], []
     for g in _seed_runs(df):
         ok = g[g[xcol] <= T]
-        v.append(100 * float(ok.test_acc.iloc[-1]) if not ok.empty else np.nan)
-    v = [x for x in v if not np.isnan(x)]
-    return (float(np.mean(v)), float(min(v)), float(max(v))) if v else (np.nan, np.nan, np.nan)
+        if ok.empty:
+            continue
+        acc.append(100 * float(ok.test_acc.iloc[-1]))
+        last.append(int(ok["round"].iloc[-1]))
+        per_round = float(g[xcol].iloc[-1]) / max(1, int(g["round"].iloc[-1]))
+        fit.append(min(int(g["round"].iloc[-1]), int(T // per_round)) if per_round > 0 else int(g["round"].iloc[-1]))
+    if not acc:
+        return {"a": np.nan, "lo": np.nan, "hi": np.nan, "last_round": np.nan, "rounds_in_budget": np.nan,
+                "evaluated": False}
+    return {"a": float(np.mean(acc)), "lo": float(min(acc)), "hi": float(max(acc)),
+            "last_round": float(np.mean(last)), "rounds_in_budget": float(np.mean(fit)),
+            "evaluated": max(last) >= 1}
 
 
 def _save(fig, name):
@@ -295,17 +420,20 @@ def _write_table(df, name, floatfmt=".4g"):
     print(f"[table] {name}")
 
 
-def _plot_curve(ax, df, st, xcol, label=True, ls=None, color=None, lw=None, ycol="test_acc"):
-    """Seed-mean curve (round 0 dropped) with a min-max seed band when >1 seed."""
+def _plot_curve(ax, df, st, xcol, label=True, ls=None, color=None, lw=None, ycol="test_acc", first_round=1,
+                markers=False):
+    """Seed-mean curve (rounds < first_round dropped; round 0 has time 0, which a log axis
+    cannot show) with a min-max seed band when >1 seed."""
     run = _curve(df)
-    run = run[run["round"] >= 1]
+    run = run[run["round"] >= first_round]
     if run.empty:
         return run
     c = color or st["color"]
+    mk = dict(marker=st["marker"], markevery=max(1, len(run) // 8), ms=5) if markers else {}
     ax.plot(run[xcol], 100 * run[ycol], color=c, ls=ls or st["ls"], lw=lw or st["lw"],
-            label=st["label"] if label is True else (label or None))
+            label=st["label"] if label is True else (label or None), **mk)
     if df.seed.nunique() > 1:
-        g = df[df["round"] >= 1].groupby("round")[ycol]
+        g = df[df["round"] >= first_round].groupby("round")[ycol]
         lo, hi = g.min().sort_index(), g.max().sort_index()
         ax.fill_between(run[xcol].values, 100 * lo.values, 100 * hi.values, color=c, alpha=0.15, lw=0)
     return run
@@ -332,7 +460,7 @@ def fig1_and_table(main):
     if not schemes:
         return
     ns = _nseeds(main)
-    env = f"N=30, Nr=64 (M & F), W=1.8 MHz, 20 dB, cut 2, tau=5; {_seed_txt(ns)}"
+    env = f"N=30, Nr=64 (M & F), W=1.8 MHz, {ENV0['rho_db']:g} dB, cut 2, tau=5; {_seed_txt(ns)}"
     for axis, fname in (("uplink", "fig1_acc_vs_uplink_time"), ("training", "fig1c_acc_vs_training_time")):
         xcol, xlab = AXES[axis]
         fig, axes = plt.subplots(1, len(schemes), figsize=(6.3 * len(schemes), 4.7), squeeze=False)
@@ -345,6 +473,9 @@ def fig1_and_table(main):
                     continue
                 run = _plot_curve(ax, dm, STYLE[m], xcol)
                 _mark_target(ax, run, A, STYLE[m], xcol)
+            ef = _airsfl_error_free(main, scheme)          # Sun et al.'s "Error-free" benchmark
+            if not ef.empty:
+                _plot_curve(ax, ef, STYLE["airsfl_errfree"], xcol, lw=1.4)
             if A is not None:
                 ax.plot([], [], ls="", marker="o", mfc="w", mec="k", ms=8,
                         label=f"first checkpoint with validation acc >= {100*A:.0f}%")
@@ -360,13 +491,16 @@ def fig1_and_table(main):
     for ax, scheme in zip(axes[0], schemes):
         sub = main[main.partition == scheme]
         for m in ORDER:
+            if m in DERIVED and DERIVED[m] in ORDER:
+                continue                      # same learning curve as its OFDMA parent
             if not sub[sub.method == m].empty:
                 _plot_curve(ax, sub[sub.method == m], STYLE[m], "epoch_equiv")
         ax.set_xlabel("Global-epoch equivalents")
         ax.set_ylabel("Test accuracy (%)")
         ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}")
     axes[0][0].legend(loc="lower right")
-    fig.suptitle(f"Accuracy vs sample exposure ({env}); gaps = analog distortion", y=1.02, fontsize=11)
+    fig.suptitle(f"Accuracy vs sample exposure ({env}); gaps = analog distortion\n"
+                 f"(the ZF digital baselines learn exactly like their OFDMA counterparts)", y=1.04, fontsize=11)
     _save(fig, "fig1b_acc_vs_epochs")
 
     rows = []
@@ -381,7 +515,10 @@ def fig1_and_table(main):
                 acc, amin, amax = final_acc(dm)
                 su = paired_speedup(st_ul["digital_sflv1"], st_ul[m]) if "digital_sflv1" in st_ul else (np.nan,) * 4
                 sr = paired_speedup(st_tr["digital_sflv1"], st_tr[m]) if "digital_sflv1" in st_tr else (np.nan,) * 4
-                rows.append({"partition": PART_NAME[scheme], "method": STYLE[m]["label"], "seeds": st_ul[m]["n"],
+                xu = paired_speedup(st_ul[m], st_ul["airsfl"]) if "airsfl" in st_ul else (np.nan,) * 4
+                xr = paired_speedup(st_tr[m], st_tr["airsfl"]) if "airsfl" in st_tr else (np.nan,) * 4
+                rows.append({"partition": PART_NAME[scheme], "method": STYLE[m]["label"],
+                             "SNR (dB)": float(r0.rho_db), "seeds": st_ul[m]["n"],
                              "UL s/round": float(r0.ul_s_per_round), "act s/round": float(r0.activation_ul_s),
                              "labels s/round": float(r0.labels_ul_s), "agg s/round": float(r0.aggregation_ul_s),
                              "compute s/round": float(r0.compute_s_per_round),
@@ -394,6 +531,7 @@ def fig1_and_table(main):
                              "UL time to target (s)": st_ul[m]["t"],
                              "training time to target (s)": st_tr[m]["t"],
                              "MB to target": st_ul[m]["k"] * float(r0.mb_per_round),
+                             "UL time / AirSFL (paired)": xu[0], "training time / AirSFL (paired)": xr[0],
                              "UL speed-up vs SFL-V1 (paired)": su[0], "training speed-up vs SFL-V1 (paired)": sr[0]})
     if rows:
         _write_table(pd.DataFrame(rows), "table_main")
@@ -412,6 +550,24 @@ def _snr_runs(main, snr, scheme, m, rho):
     if snr.empty:
         return snr
     return snr[(snr.partition == scheme) & (snr.method == m) & (snr.rho_db == rho)]
+
+
+def _spread_runs(main, snr, pl, scheme, m, spread, rho=20.0):
+    """Runs of method m with unequal path gains of nominal spread (dB) at SNR rho. Spread 0:
+    the equal-gain runs. Analog methods: the `pathloss` runs. Digital methods (learning does
+    not depend on the gains): the equal-gain runs retimed at the weakest client's rate."""
+    base = _snr_runs(main, snr, scheme, m, rho)
+    if not spread:
+        return base
+    if m in DIGITAL:
+        if base.empty:
+            return base
+        r0 = base.iloc[0]      # stratified offsets: the weakest client (all digital timing needs) is seed-free
+        return _retime(m, base, rho_db=rho, gains_db=path_gain_offsets_db(int(r0.N), spread, int(r0.seed)))
+    if pl.empty or "path_gain_spread_db" not in pl:
+        return pl.iloc[0:0]
+    return pl[(pl.partition == scheme) & (pl.method == m) & (pl.rho_db == rho)
+              & np.isclose(pl.path_gain_spread_db.astype(float), spread)]
 
 
 def _unreached(ax, x, color):
@@ -443,8 +599,11 @@ def fig2_snr(main, snr):
                 allacc += [amin, amax]
                 nsr = run[run["round"] >= 1]["act_nsr_db"].mean() if m == "airsfl" else np.nan
                 agg = run[run["round"] >= 1]["agg_nsr_db"].mean() if m in ("airsfl", "sun_fdma_aircomp",
-                                                                          "aircomp_fl") else np.nan
+                                                                          "hybrid_zf_aircomp", "aircomp_fl") \
+                    else np.nan
                 rows.append({"partition": PART_NAME[scheme], "method": st["label"], "SNR (dB)": rho,
+                             "UL s/round": float(run.ul_s_per_round.iloc[0]),
+                             "training s/round": float(run.e2e_s_per_round.iloc[0]),
                              "seeds": su["n"], "final test acc (%)": a, "acc min": amin, "acc max": amax,
                              "target val acc (%)": 100 * A if A else np.nan, "reached": f"{su['hit']}/{su['n']}",
                              "UL time to target (s)": su["t"], "training time to target (s)": sr["t"],
@@ -477,8 +636,8 @@ def fig2_snr(main, snr):
             axes[i][0].set_ylim(lo - 1, hi + 1)
         axes[i][0].set_xlabel("Reference SNR rho (dB)")
         axes[i][0].set_ylabel("Final test accuracy (%)")
-        axes[i][0].set_title(f"{PART_NAME[scheme]}: final accuracy vs SNR\n"
-                             "(digital learning is SNR-independent; bars = seed min-max)", fontsize=10.5)
+        axes[i][0].set_title(f"{PART_NAME[scheme]}: final accuracy vs SNR (bars = seed min-max)\n"
+                             "digital learning is SNR-independent; ZF variants = their OFDMA twins", fontsize=10.5)
         for j, axis in ((1, "uplink"), (2, "training")):
             axes[i][j].set_yscale("log")
             axes[i][j].set_xlabel("Reference SNR rho (dB)")
@@ -500,11 +659,17 @@ def fig2_snr(main, snr):
             if not run.empty:
                 _plot_curve(ax, run, STYLE["airsfl"], "uplink_s", label=f"AirSFL, {rho:g} dB",
                             color=cmap(0.3 + 0.7 * j / max(1, len(rhos) - 1)), lw=2.0, ls="-")
-        for rho, ls in sorted({(min(rhos), "--"), (20.0, "-")}):
-            run = _snr_runs(main, snr, scheme, "digital_sflv1", rho)
-            if not run.empty:
-                _plot_curve(ax, run, STYLE["digital_sflv1"], "uplink_s", label=f"Digital SFL-V1, {rho:g} dB",
-                            ls=ls, lw=1.8)
+        ef = _airsfl_error_free(main, scheme)
+        if not ef.empty:
+            _plot_curve(ax, ef, STYLE["airsfl_errfree"], "uplink_s", lw=1.8)
+        for m in ("digital_sflv1_zf", "digital_sflv1"):
+            if m not in ORDER:
+                continue
+            for rho, ls in sorted({(min(rhos), "--"), (20.0, "-")}):
+                run = _snr_runs(main, snr, scheme, m, rho)
+                if not run.empty:
+                    _plot_curve(ax, run, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']}, {rho:g} dB",
+                                ls=ls, lw=1.8)
         ax.set_xscale("log")
         ax.set_xlabel(AXES["uplink"][1])
         ax.set_ylabel("Test accuracy (%)")
@@ -515,10 +680,14 @@ def fig2_snr(main, snr):
     _save(fig, "fig2b_airsfl_snr_curves")
 
     # 2c: accuracy reached within a fixed time budget vs SNR (uplink and training axes)
+    # budgets: base T per axis (--budget-uplink / --budget-training, default AirSFL's full-run
+    # time at 20 dB), times each multiplier in BUDGET_MULTS (--budget-mult); one column each
+    cols = [(axis, mult) for axis in ("uplink", "training") for mult in BUDGET_MULTS]
     rows = []
-    fig, axes = plt.subplots(len(schemes), 2, figsize=(12, 4.4 * len(schemes)), squeeze=False)
+    fig, axes = plt.subplots(len(schemes), len(cols), figsize=(6 * len(cols), 4.5 * len(schemes)), squeeze=False)
     for i, scheme in enumerate(schemes):
-        for j, axis in enumerate(("uplink", "training")):
+        for j, (axis, mult) in enumerate(cols):
+            ax = axes[i][j]
             xcol = AXES[axis][0]
             T = BUDGETS[axis]
             if T is None:                            # default: AirSFL's full-run time at 20 dB (seed mean)
@@ -526,30 +695,231 @@ def fig2_snr(main, snr):
                 if air.empty:
                     continue
                 T = float(np.mean([g[xcol].iloc[-1] for g in _seed_runs(air)]))
+            T *= mult
             for m in ORDER:
                 pts = []
                 for rho in rhos:
                     run = _snr_runs(main, snr, scheme, m, rho)
                     if run.empty:
                         continue
-                    a, lo, hi = acc_at_budget(run, T, xcol)
-                    pts.append((rho, a, lo, hi))
+                    b = budget_point(run, T, xcol)
+                    pts.append((rho, b))
                     rows.append({"partition": PART_NAME[scheme], "axis": axis, "budget (s)": T,
-                                 "method": STYLE[m]["label"], "SNR (dB)": rho, "test acc at budget (%)": a,
-                                 "min": lo, "max": hi})
-                if pts:
-                    st = STYLE[m]
-                    r, a, lo, hi = map(np.array, zip(*pts))
-                    axes[i][j].errorbar(r, a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"],
-                                        ls=st["ls"], lw=st["lw"], capsize=3, label=st["label"])
-            axes[i][j].set_xlabel("Reference SNR rho (dB)")
-            axes[i][j].set_ylabel("Test accuracy within the budget (%)")
-            axes[i][j].set_title(f"{PART_NAME[scheme]}: accuracy after {T:.4g} s of {axis} time", fontsize=10.5)
-    axes[0][0].legend(fontsize=8)
-    fig.tight_layout()
+                                 "method": STYLE[m]["label"], "SNR (dB)": rho, "test acc at budget (%)": b["a"],
+                                 "min": b["lo"], "max": b["hi"], "rounds within budget": b["rounds_in_budget"],
+                                 "last evaluated round": b["last_round"], "evaluated": b["evaluated"]})
+                st = STYLE[m]
+                ev = [(r, b) for r, b in pts if b["evaluated"]]
+                if ev:
+                    r = np.array([x for x, _ in ev])
+                    a, lo, hi = (np.array([b[k] for _, b in ev]) for k in ("a", "lo", "hi"))
+                    ax.errorbar(r, a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"], ls=st["ls"],
+                                lw=st["lw"], capsize=3, label=st["label"])
+                labeled = bool(ev)
+                for r, b in pts:                     # no trained checkpoint inside T: initial model only
+                    if not b["evaluated"] and not np.isnan(b["a"]):
+                        ax.plot([r], [b["a"]], marker=st["marker"], mfc="white", mec=st["color"], ms=8, ls="",
+                                label=None if labeled else st["label"])
+                        labeled = True
+            ef = _airsfl_error_free(main, scheme)
+            if not ef.empty:                         # SNR-independent upper bound on AirSFL's time axis
+                b = budget_point(ef, T, xcol)
+                st = STYLE["airsfl_errfree"]
+                ax.plot([min(rhos), max(rhos)], [b["a"], b["a"]], color=st["color"], ls=st["ls"], lw=st["lw"],
+                        label=st["label"])
+                rows.append({"partition": PART_NAME[scheme], "axis": axis, "budget (s)": T, "method": st["label"],
+                             "SNR (dB)": np.nan, "test acc at budget (%)": b["a"], "min": b["lo"], "max": b["hi"],
+                             "rounds within budget": b["rounds_in_budget"], "last evaluated round": b["last_round"],
+                             "evaluated": b["evaluated"]})
+            ax.set_xlabel("Reference SNR rho (dB)")
+            ax.set_ylabel("Test accuracy within the budget (%)")
+            ax.set_title(f"{PART_NAME[scheme]}: accuracy after {T:.4g} s of {axis} time"
+                         + (f" ({mult:g} x AirSFL's run)" if mult != 1 or BUDGETS[axis] is None else ""),
+                         fontsize=10)
+    handles = {}                                     # one legend for the figure, below the panels
+    for ax in axes.ravel():
+        for h, lab in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(lab, h)
+    handles["hollow marker: no evaluated checkpoint within the budget (value = initial model)"] = \
+        plt.Line2D([], [], marker="o", mfc="white", mec="k", ls="")
+    fig.legend(handles.values(), handles.keys(), loc="lower center", ncol=min(5, len(handles)), fontsize=8.5,
+               bbox_to_anchor=(0.5, 0.0))
+    fig.tight_layout(rect=(0, 0.07 if len(schemes) > 1 else 0.12, 1, 1))
     _save(fig, "fig2c_acc_at_budget")
     if rows:
         _write_table(pd.DataFrame(rows), "table_budget")
+
+
+def _sweep_curves(fname, title, schemes, panels, runs_of, axis, xscale):
+    """Learning curves of every drawn method at every point of a sweep: rows = partitions,
+    columns = sweep points; runs_of(scheme, method, point) -> runs ("airsfl_errfree" = the
+    error-free upper bound). On the epochs axis the ZF variants coincide with their OFDMA
+    parents and the error-free curve with digital SFL-V1, so those duplicates are skipped."""
+    xcol, xlab = {"epochs": ("epoch_equiv", "Global-epoch equivalents"), "uplink": AXES["uplink"],
+                  "training": AXES["training"]}[axis]
+    fig, axes = plt.subplots(len(schemes), len(panels), figsize=(4.9 * len(panels), 4.2 * len(schemes)),
+                             squeeze=False, sharey="row")
+    for i, scheme in enumerate(schemes):
+        for j, (label, point) in enumerate(panels):
+            ax = axes[i][j]
+            for m in ORDER + ["airsfl_errfree"]:
+                if axis == "epochs" and ((m in DERIVED and DERIVED[m] in ORDER) or
+                                         (m == "airsfl_errfree" and "digital_sflv1" in ORDER)):
+                    continue
+                run = runs_of(scheme, m, point)
+                if run is None or run.empty:
+                    continue
+                _plot_curve(ax, run, STYLE[m], xcol, first_round=1 if (xscale == "log" and axis != "epochs") else 0,
+                            lw=1.5 if m == "airsfl_errfree" else None)
+            if axis != "epochs":
+                ax.set_xscale(xscale)
+            ax.set_title(f"{PART_NAME[scheme]}, {label}", fontsize=10)
+            ax.set_xlabel(xlab, fontsize=9)
+            if j == 0:
+                ax.set_ylabel("Test accuracy (%)")
+    handles = {}
+    for ax in axes.ravel():
+        for h, lab in zip(*ax.get_legend_handles_labels()):
+            handles.setdefault(lab, h)
+    fig.legend(handles.values(), handles.keys(), loc="lower center", ncol=min(4, max(1, len(handles))), fontsize=8.5)
+    fig.suptitle(title, y=1.01, fontsize=11)
+    fig.tight_layout(rect=(0, 0.08 if len(schemes) > 1 else 0.14, 1, 1))
+    _save(fig, fname)
+
+
+def fig_sweep_curves(main, snr, pl):
+    """Learning curves of all methods at every swept SNR (fig2d_*) and at every path-gain
+    spread (fig11b_*), on the axes chosen with --sweep-curves (epochs / uplink / training)."""
+    schemes = _schemes(main)
+    if not schemes or not SWEEP_CURVES["axes"]:
+        return
+    ef = lambda scheme: _airsfl_error_free(main, scheme)
+    rhos = sorted(set([20.0] + ([] if snr.empty else [float(r) for r in snr.rho_db.unique()])))
+    if len(rhos) > 1:
+        for axis in SWEEP_CURVES["axes"]:
+            _sweep_curves(f"fig2d_curves_all_snr_{axis}",
+                          "Learning curves at every SNR (digital learning is SNR-independent, its rate is not)",
+                          schemes, [(f"rho = {r:g} dB", r) for r in rhos],
+                          lambda s, m, r: ef(s) if m == "airsfl_errfree" else _snr_runs(main, snr, s, m, r),
+                          axis, SWEEP_CURVES["xscale"])
+    if not pl.empty:
+        spreads = [0.0] + sorted(set(float(x) for x in pl.path_gain_spread_db))
+        for axis in SWEEP_CURVES["axes"]:
+            _sweep_curves(f"fig11b_curves_all_spreads_{axis}",
+                          "Learning curves at every path-gain spread (20 dB median client; digital uploads wait for "
+                          "the weakest client)", schemes, [(f"spread {s:g} dB", s) for s in spreads],
+                          lambda sc, m, s: ef(sc) if m == "airsfl_errfree" else _spread_runs(main, snr, pl, sc, m, s),
+                          axis, SWEEP_CURVES["xscale"])
+
+
+def fig11_path_gains(main, snr, pl):
+    """Unequal path gains (the draft's robustness test; rho = median client's SNR): final
+    accuracy, uplink time to the primary target and uplink seconds per round vs the spread.
+    Digital uploads wait for the weakest client (Eq. 12); analog airtime does not depend on
+    the gains, which enter only the distortion (weak clients get noisier ZF activations and
+    set the AirComp scaling)."""
+    if pl.empty or "path_gain_spread_db" not in pl:
+        return
+    schemes = _schemes(pl)
+    spreads = [0.0] + sorted(set(float(x) for x in pl.path_gain_spread_db))
+    rows = []
+    for rho in sorted(set(float(r) for r in pl.rho_db)):
+        fig, axes = plt.subplots(len(schemes), 3, figsize=(17, 4.4 * len(schemes)), squeeze=False)
+        for i, scheme in enumerate(schemes):
+            A = primary_target(main, scheme)
+            for m in ORDER:
+                st = STYLE[m]
+                pts = []
+                for s in spreads:
+                    run = _spread_runs(main, snr, pl, scheme, m, s, rho)
+                    if run.empty:
+                        continue
+                    a, lo, hi = final_acc(run)
+                    tt = ttt(run, A, "uplink_s")
+                    pts.append((s, a, lo, hi, tt, float(run.ul_s_per_round.iloc[0])))
+                    rows.append({"partition": PART_NAME[scheme], "SNR (dB)": rho, "spread (dB)": s,
+                                 "weakest client (dB)": -s * (1 - 1 / int(run.N.iloc[0])) / 2,
+                                 "method": st["label"],
+                                 "UL s/round": pts[-1][5], "final test acc (%)": a, "acc min": lo, "acc max": hi,
+                                 "reached": f"{tt['hit']}/{tt['n']}", "UL time to target (s)": tt["t"],
+                                 "training time to target (s)": ttt(run, A, "training_time_s")["t"],
+                                 "activation NSR (dB)": run[run["round"] >= 1]["act_nsr_db"].mean(),
+                                 "aggregation NSR (dB)": run[run["round"] >= 1]["agg_nsr_db"].mean()})
+                if not pts:
+                    continue
+                x = np.array([p[0] for p in pts])
+                a, lo, hi = (np.array([p[k] for p in pts]) for k in (1, 2, 3))
+                axes[i][0].errorbar(x, a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"],
+                                    ls=st["ls"], lw=st["lw"], capsize=3, label=st["label"])
+                ok = [(p[0], p[4]) for p in pts if p[4]["hit"] > 0]
+                if ok:
+                    axes[i][1].plot([v for v, _ in ok], [s_["t"] for _, s_ in ok], color=st["color"],
+                                    marker=st["marker"], ls=st["ls"], lw=st["lw"], label=st["label"])
+                for p in pts:
+                    if p[4]["hit"] == 0:
+                        _unreached(axes[i][1], p[0], st["color"])
+                axes[i][2].plot(x, [p[5] for p in pts], color=st["color"], marker=st["marker"], ls=st["ls"],
+                                lw=st["lw"], label=st["label"])
+            for j, ylab in enumerate(("Final test accuracy (%)", "Uplink time to target (s)",
+                                      "Uplink seconds per round")):
+                axes[i][j].set_xlabel("Path-gain spread (dB) around the median client")
+                axes[i][j].set_ylabel(ylab)
+                if j:
+                    axes[i][j].set_yscale("log")
+            axes[i][0].set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB: final accuracy", fontsize=10.5)
+            axes[i][1].set_title(f"uplink time to {100 * A:.0f}% val. acc. (x at the top = not reached)"
+                                 if A else "uplink time to target", fontsize=10.5)
+            axes[i][2].set_title("per-round uplink time (digital: paced by the weakest client)", fontsize=10.5)
+        axes[0][0].legend(fontsize=8)
+        fig.tight_layout()
+        _save(fig, "fig11_path_gains" + (f"_rho{rho:g}" if len(set(pl.rho_db)) > 1 else ""))
+    if rows:
+        _write_table(pd.DataFrame(rows), "table_pathloss")
+
+
+def fig1e_linear_time(main, snr):
+    """Learning curves in the style of Sun et al. (Fig. 2a/b): test accuracy vs accumulated
+    uplink time on a LINEAR axis, at 20 dB and at the lowest swept SNR (--linear-snrs). On the
+    log axis of fig1 a per-round-time ratio is a pure shift, so every curve has the same shape;
+    on a linear axis it is a different slope. All methods run the same equal-period schedule,
+    so the curves differ by per-round airtime and, at low SNR, by analog distortion (AirSFL
+    vs its error-free twin). Dotted: the run's epoch budget is used up (final value carried)."""
+    schemes = _schemes(main)
+    if not schemes:
+        return
+    snrs = LINEAR["snrs"] or ([20.0] + ([float(snr.rho_db.min())] if not snr.empty else []))
+    fig, axes = plt.subplots(len(schemes), len(snrs), figsize=(6.6 * len(snrs), 4.7 * len(schemes)),
+                             squeeze=False)
+    for i, scheme in enumerate(schemes):
+        xmax = LINEAR["xmax"]
+        if xmax is None:                     # default: AirComp-FL's full run at 20 dB (fastest baseline)
+            ends = [float(r.uplink_s.max()) for r in (_snr_runs(main, snr, scheme, m, 20.0)
+                                                       for m in ("aircomp_fl", "airsfl")) if not r.empty]
+            xmax = 1.05 * max(ends) if ends else None
+        for j, rho in enumerate(snrs):
+            ax = axes[i][j]
+            curves = [(m, _snr_runs(main, snr, scheme, m, rho)) for m in ORDER]
+            curves.append(("airsfl_errfree", _airsfl_error_free(main, scheme)))
+            for m, run in curves:
+                if run.empty:
+                    continue
+                st = STYLE[m]
+                c = _plot_curve(ax, run, st, "uplink_s", first_round=0, markers=True,
+                                lw=1.6 if m == "airsfl_errfree" else None)
+                if xmax and not c.empty and float(c.uplink_s.iloc[-1]) < xmax:
+                    ax.plot([float(c.uplink_s.iloc[-1]), xmax], [100 * float(c.test_acc.iloc[-1])] * 2,
+                            color=st["color"], ls=":", lw=1.0, alpha=0.7)
+            if xmax:
+                ax.set_xlim(0, xmax)
+            ax.set_xlabel(AXES["uplink"][1])
+            ax.set_ylabel("Test accuracy (%)")
+            ax.set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB", fontsize=10.5)
+    axes[0][0].legend(fontsize=7.5, loc="lower right")
+    fig.suptitle("Accuracy vs uplink time, linear axis (same equal-period schedule for all methods: curves differ "
+                 "by airtime per round and, at low SNR, by analog distortion; dotted = epoch budget used up)",
+                 y=1.01, fontsize=10.5)
+    fig.tight_layout()
+    _save(fig, "fig1e_acc_vs_uplink_time_linear")
 
 
 # ---------------------------------------------------------------------------
@@ -564,9 +934,24 @@ def _analytic_compute(m, N=30, stage=CUT0, tau=TAU0, u_min=0.0):
                                   (lo + (hi - lo) * u_min) * 1e12, COMPUTE["server_tflops"] * 1e12)
 
 
+def _xlabels(ms):
+    return [STYLE[m]["label"].replace(" (proposed)", "") for m in ms]
+
+
+def _ratio_txt(v):
+    return f"{v:.0f}x" if v >= 10 else f"{v:.1f}x"
+
+
 def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     dims = profiled_dims(B0)[stage]
-    fig, axes = plt.subplots(1, 4, figsize=(19, 4.8), gridspec_kw={"width_ratios": [1, 1, 1, 1.25]})
+    sfl = [m for m in ORDER if m in SPLIT_METHODS]
+    npan = len(sfl) + 1                                   # one stacked panel per split method + all methods
+    ncol = min(3, npan)
+    nrow = math.ceil(npan / ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6.2 * ncol, 4.6 * nrow), squeeze=False)
+    axes = axes.ravel()
+    for ax in axes[npan:]:
+        ax.axis("off")
     phases = [("activation", "#ff9896", "activations (client -> M-server)"),
               ("labels", "#ffbb78", "labels"),
               ("aggregation", "#aec7e8", "prefix differences (client -> F-server)")]
@@ -576,7 +961,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
         for N in Ns:
             r = _radio(N=N)
             tot[m].append(uplink_time_breakdown(m, dims, r, tau, _rates(r)))
-    for ax, m in zip(axes[:3], SFL):
+    for ax, m in zip(axes, sfl):
         bottom = np.zeros(len(Ns))
         for key, col, lab in phases:
             vals = np.array([b[key] for b in tot[m]])
@@ -585,34 +970,44 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
         for i, b in enumerate(tot[m]):
             ax.text(i, b["total"] * 1.02, f"{b['total']:.2f} s" if b["total"] < 10 else f"{b['total']:.0f} s",
                     ha="center", va="bottom", fontsize=9, fontweight="bold" if m == "airsfl" else None)
-        ax.set_ylim(0, max(b["total"] for b in tot[m]) * 1.18)
+        ax.set_ylim(0, max(b["total"] for b in tot[m]) * 1.45)
         ax.set_xticks(x)
-        ax.set_xticklabels([f"N={N}\n({120 // N} tones)" for N in Ns], fontsize=9)
+        tones = "all 120 tones" if m not in ("digital_sflv1", "sun_fdma_aircomp") else None
+        ax.set_xticklabels([f"N={N}\n({tones or f'{120 // N} tones'})" for N in Ns], fontsize=9)
         ax.set_title(STYLE[m]["label"], color=STYLE[m]["color"], fontweight="bold")
         ax.set_ylabel("Uplink seconds per round")
-    axes[0].legend(fontsize=7.5, loc="lower right")
-    w = 0.16
+    axes[0].legend(fontsize=7.5, loc="upper left")
+    ax = axes[len(sfl)]
+    w = 0.8 / len(ORDER)
     for j, m in enumerate(ORDER):
-        axes[3].bar(x + (j - 2) * w, [b["total"] for b in tot[m]], width=w, color=STYLE[m]["color"],
-                    edgecolor="k", lw=0.4, label=STYLE[m]["label"])
-    ratios = [tot["digital_sflv1"][i]["total"] / tot["airsfl"][i]["total"] for i in range(len(Ns))]
-    axes[3].set_yscale("log")
-    axes[3].set_ylim(0.5, 1e4)
-    axes[3].set_xticks(x)
-    axes[3].set_xticklabels([f"N={N}\nSFL-V1 / AirSFL = {ratios[i]:.0f}" for i, N in enumerate(Ns)], fontsize=9)
-    axes[3].set_title("All methods (log scale; FL has no activation phase)")
-    axes[3].legend(fontsize=7.5, ncol=2, loc="upper left")
-    fig.suptitle(f"Per-round uplink airtime by phase (cut {stage}, tau={tau}, Nr=64 at both servers, "
-                 f"W=1.8 MHz, 20 dB, eps=0.6): analog time is independent of N, OFDMA time grows with N",
-                 y=1.03, fontsize=11)
+        ax.bar(x + (j - (len(ORDER) - 1) / 2) * w, [b["total"] for b in tot[m]], width=w, color=STYLE[m]["color"],
+               edgecolor="k", lw=0.4, label=STYLE[m]["label"])
+    ref = [m for m in ("digital_sflv1_zf", "digital_sflv1") if m in tot]
+    ticks = []
+    for i, N in enumerate(Ns):
+        txt = f"N={N}"
+        if "airsfl" in tot and ref:
+            txt += "\nSFL-V1 / AirSFL:\n" + ", ".join(
+                f"{'ZF' if m.endswith('_zf') else 'OFDMA'} {_ratio_txt(tot[m][i]['total'] / tot['airsfl'][i]['total'])}"
+                for m in ref)
+        ticks.append(txt)
+    ax.set_yscale("log")
+    ax.set_ylim(0.5, 1e4)
+    ax.set_xticks(x)
+    ax.set_xticklabels(ticks, fontsize=8.5)
+    ax.set_title("All methods (log scale; FL has no activation phase)")
+    ax.legend(fontsize=7, ncol=2, loc="upper left")
+    fig.suptitle(f"Per-round uplink airtime by phase (cut {stage}, tau={tau}, Nr=64 at both servers, W=1.8 MHz, "
+                 f"{ENV0['rho_db']:g} dB, eps=0.6):\nanalog time is independent of N; digital OFDMA time grows ~N (S/N tones "
+                 f"per client), digital ZF only through the ZF gain Nr-N+1", y=1.02, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig3_uplink_breakdown")
 
     # 3b: per-round uplink time vs cut (N=30)
     r = _radio()
     rows = []
-    fig, ax = plt.subplots(figsize=(9.5, 4.8))
-    wb = 0.16
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    wb = 0.8 / len(ORDER)
     dims_all = profiled_dims(B0)
     for j, m in enumerate(ORDER):
         vals = []
@@ -626,17 +1021,17 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
                          "d_c": dims_all[s]["d_c"], "d_s": dims_all[s]["d_s"], "d_a": dims_all[s]["d_a"],
                          "tau*d_a < d_s": tau * dims_all[s]["d_a"] < dims_all[s]["d_s"],
                          "MB/round": source_equivalent_mb_per_round(m, dims_all[s], r, tau)})
-        ax.bar(np.arange(4) + (j - 2) * wb, vals, width=wb, color=STYLE[m]["color"], edgecolor="k", lw=0.4,
-               label=STYLE[m]["label"])
+        ax.bar(np.arange(4) + (j - (len(ORDER) - 1) / 2) * wb, vals, width=wb, color=STYLE[m]["color"],
+               edgecolor="k", lw=0.4, label=STYLE[m]["label"])
     ax.set_yscale("log")
     ax.set_ylim(0.5, 1e4)
     ax.set_xticks(np.arange(4))
     ax.set_xticklabels([f"cut {s}{' (default)' if s == stage else ''}\nd_a={dims_all[s]['d_a']/1e6:.2f}M\n"
                         f"d_c={dims_all[s]['d_c']/1e6:.2f}M" for s in (1, 2, 3, 4)], fontsize=9)
     ax.set_ylabel("Uplink seconds per round")
-    ax.set_title("Per-round uplink time vs cut (N=30): with equal analog efficiencies and\n"
+    ax.set_title(f"Per-round uplink time vs cut (N=30, {ENV0['rho_db']:g} dB): with equal analog efficiencies and\n"
                  "negligible labels, AirSFL < AirComp-FL when tau*d_a < d_s", fontsize=10.5)
-    ax.legend(fontsize=8, ncol=3, loc="upper center")
+    ax.legend(fontsize=8, ncol=4, loc="upper center")
     _save(fig, "fig3b_uplink_vs_cut")
     _write_table(pd.DataFrame(rows), "table_cuts")
 
@@ -653,7 +1048,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
                    "aggregation UL": b["aggregation"]}
         rows.append({"method": STYLE[m]["label"], **comp[m], "uplink": b["total"], "compute": c["total"],
                      "training (s/round)": b["total"] + c["total"]})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4.8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.2))
     x = np.arange(len(ORDER))
     ul = np.array([rw["uplink"] for rw in rows])
     trn = np.array([rw["training (s/round)"] for rw in rows])
@@ -665,9 +1060,10 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     ax1.set_yscale("log")
     ax1.set_ylim(0.1, trn.max() * 20)
     ax1.set_xticks(x)
-    ax1.set_xticklabels([STYLE[m]["label"].replace(" (proposed)", "") for m in ORDER], rotation=20, ha="right")
+    ax1.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
     ax1.set_ylabel("Seconds per round")
-    ax1.set_title("(a) Per-round time (cut 2, N=30, slowest client 1 TFLOPS, M-server 20 TFLOPS)", fontsize=10)
+    ax1.set_title(f"(a) Per-round time (cut 2, N=30, {ENV0['rho_db']:g} dB, slowest client 1 TFLOPS, M-server 20 TFLOPS)",
+                  fontsize=10)
     ax1.legend(fontsize=8, loc="upper left")
     left = np.zeros(len(ORDER))
     for name, col in parts:
@@ -675,7 +1071,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
         ax2.barh(x, frac, left=left, color=col, edgecolor="k", lw=0.4, label=name)
         left += frac
     ax2.set_yticks(x)
-    ax2.set_yticklabels([STYLE[m]["label"].replace(" (proposed)", "") for m in ORDER])
+    ax2.set_yticklabels(_xlabels(ORDER))
     ax2.set_xlim(0, 1)
     ax2.set_xlabel("Fraction of the round (sequential stages of each co-split step)")
     ax2.set_title("(b) Where a training round's time goes", fontsize=10)
@@ -692,31 +1088,37 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
 def fig4_overhead(main):
     r = _radio()
     dims = profiled_dims(B0)[CUT0]
-    fig, (ax, axb) = plt.subplots(1, 2, figsize=(13, 4.8))
+    fig, (ax, axb) = plt.subplots(1, 2, figsize=(14, 5.2))
     for m in ORDER:
         mb = source_equivalent_mb_per_round(m, dims, r, TAU0)
         ul = uplink_time_per_round(m, dims, r, TAU0, _rates(r))
         st = STYLE[m]
-        ax.scatter([mb], [ul], s=160, color=st["color"], marker=st["marker"], edgecolor="k", zorder=5,
+        ax.scatter([mb], [ul], s=130, color=st["color"], marker=st["marker"], edgecolor="k", zorder=5,
                    label=st["label"])
-        off = {"digital_sflv1": (12, 4), "sun_fdma_aircomp": (12, -22)}.get(m, (12, -4))   # avoid overlap
-        ax.annotate(f"{st['label'].replace(' (proposed)', '')}\n{ul:.2f} s" if ul < 10 else
-                    f"{st['label'].replace(' (proposed)', '')}\n{ul:.0f} s",
-                    (mb, ul), textcoords="offset points", xytext=off, fontsize=8.5)
+        # the split variants share one x (same bytes): digital SFL-V1 labelled on the left, the others right
+        left = m in ("digital_sflv1", "digital_sflv1_zf")
+        ax.annotate(f"{ul:.2f} s" if ul < 10 else f"{ul:.0f} s", (mb, ul), textcoords="offset points",
+                    xytext=(-10, 2) if left else (10, -6 if m.startswith("hybrid") or m.startswith("sun") else -3),
+                    ha="right" if left else "left", fontsize=8.5, color=st["color"], fontweight="bold")
+    ax.legend(fontsize=7.5, loc="upper center", ncol=2)
     sfl_mb = source_equivalent_mb_per_round("airsfl", dims, r, TAU0)
     fl_mb = source_equivalent_mb_per_round("aircomp_fl", dims, r, TAU0)
     ax.axvline(sfl_mb, color="k", ls=":", lw=1)
     t_air = uplink_time_per_round("airsfl", dims, r, TAU0, _rates(r))
-    t_dig = uplink_time_per_round("digital_sflv1", dims, r, TAU0, _rates(r))
-    ax.text(sfl_mb + 0.08 * fl_mb, 12, f"three SFL variants: identical\n{sfl_mb:.0f} MB/round of source data;\n"
-            f"AirSFL airtime = {100 * t_air / t_dig:.2f}% of digital\nSFL-V1 (a {t_dig / t_air:.1f}-fold ratio)",
-            fontsize=8.5, va="center", bbox=dict(boxstyle="round", fc="white", ec="0.7"))
+    n_sfl = sum(m in SPLIT_METHODS for m in ORDER)
+    txt = f"all {n_sfl} SFL variants carry the same\n{sfl_mb:.0f} MB/round of source data;\nAirSFL airtime per round ="
+    for m in ("digital_sflv1_zf", "digital_sflv1"):
+        if m in ORDER:
+            t = uplink_time_per_round(m, dims, r, TAU0, _rates(r))
+            txt += f"\n  1/{_ratio_txt(t / t_air)[:-1]} of {STYLE[m]['label']}"
+    ax.text(sfl_mb + 0.3 * fl_mb, 0.45, txt, fontsize=8.5, va="center",
+            bbox=dict(boxstyle="round", fc="white", ec="0.7"))
     ax.set_yscale("log")
-    ax.set_ylim(0.3, 5e3)
+    ax.set_ylim(0.1, 3e4)                                  # headroom for the legend
     ax.set_xlim(0, fl_mb * 1.3)
     ax.set_xlabel("Source-equivalent uplink volume per round (MB)")
     ax.set_ylabel("Uplink airtime per round (s)")
-    ax.set_title(f"(a) Bytes vs airtime per round (cut {CUT0})")
+    ax.set_title(f"(a) Bytes vs airtime per round (cut {CUT0}, {ENV0['rho_db']:g} dB)")
     x = np.arange(len(ORDER))
     any_bar = False
     schemes = _schemes(main)
@@ -735,7 +1137,7 @@ def fig4_overhead(main):
             else:
                 any_bar = True
     axb.set_xticks(x)
-    axb.set_xticklabels([STYLE[m]["label"].replace(" (proposed)", "") for m in ORDER], rotation=20, ha="right")
+    axb.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
     axb.set_ylabel("Source-equivalent GB to target")
     axb.set_title("(b) Uplink source volume to reach the target (not airtime)")
     if any_bar:
@@ -767,9 +1169,10 @@ def fig5_nr(main, nr):
             _plot_curve(ax, dm, STYLE["airsfl"], "uplink_s", color=cmap(0.35 + 0.6 * i / max(1, len(nrs) - 1)),
                         lw=2.0, ls="-", label=f"AirSFL, Nr_M={Nr}, Nr_F={int(dm.Nr_F.iloc[0])} "
                                               f"(Nr_M-N={Nr - int(dm.N.iloc[0])})")
-        ref = main[(main.partition == scheme) & (main.method == "digital_sflv1")] if not main.empty else main
-        if not ref.empty:
-            _plot_curve(ax, ref, STYLE["digital_sflv1"], "uplink_s", label="Digital SFL-V1 (Nr=64)")
+        for m in ("digital_sflv1_zf", "digital_sflv1"):
+            ref = main[(main.partition == scheme) & (main.method == m)] if not main.empty else main
+            if m in ORDER and not ref.empty:
+                _plot_curve(ax, ref, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']} (Nr=64)")
         ax.set_xscale("log")
         ax.set_xlabel(AXES["uplink"][1])
         ax.set_ylabel("Test accuracy (%)")
@@ -786,13 +1189,14 @@ def fig6_time_to_target(main):
     schemes = _schemes(main)
     if not schemes:
         return
-    fig, axes = plt.subplots(2, len(schemes), figsize=(6.4 * len(schemes), 9.4), squeeze=False)
+    fig, axes = plt.subplots(2, len(schemes), figsize=(1.15 * len(ORDER) * len(schemes), 9.8), squeeze=False)
     x = np.arange(len(ORDER))
     for row, axis in enumerate(("uplink", "training")):
         xcol = AXES[axis][0]
         for ax, scheme in zip(axes[row], schemes):
             A = primary_target(main, scheme)
             stats = {m: ttt(main[(main.partition == scheme) & (main.method == m)], A, xcol) for m in ORDER}
+            air = stats.get("airsfl", {"hit": 0})
             for i, m in enumerate(ORDER):
                 s, st = stats[m], STYLE[m]
                 if s["n"] == 0:
@@ -804,25 +1208,23 @@ def fig6_time_to_target(main):
                 ax.bar(i, s["t"], color=st["color"], edgecolor="k", lw=0.5, width=0.62,
                        yerr=[[s["t"] - s["tmin"]], [s["tmax"] - s["t"]]] if s["hit"] > 1 else None, capsize=4)
                 txt = f"{s['t']:.3g} s"
-                if m != "airsfl" and stats["airsfl"]["hit"] > 0:
-                    sp = paired_speedup(s, stats["airsfl"])[0]
-                    txt += f"\n{sp:.0f}x AirSFL" if sp >= 10 else f"\n{sp:.1f}x AirSFL"
+                if m != "airsfl" and air["hit"] > 0:
+                    txt += f"\n{_ratio_txt(paired_speedup(s, air)[0])}"
                 if s["hit"] < s["n"]:
-                    txt += f"\n({s['hit']}/{s['n']} seeds)"
-                ax.text(i, s["tmax"] * 1.25, txt, ha="center", va="bottom", fontsize=8.5,
+                    txt += f"\n({s['hit']}/{s['n']})"
+                ax.text(i, s["tmax"] * 1.25, txt, ha="center", va="bottom", fontsize=8,
                         fontweight="bold" if m == "airsfl" else None)
             ax.set_yscale("log")
             ymax = max((s["tmax"] for s in stats.values() if s["hit"] > 0), default=10)
             ax.set_ylim(top=ymax * 40)
             ax.set_xticks(x)
-            ax.set_xticklabels([STYLE[m]["label"].replace(" (proposed)", "") for m in ORDER], rotation=20,
-                               ha="right")
+            ax.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
             ax.set_ylabel(f"{'Uplink' if axis == 'uplink' else 'Training (uplink + computation)'} time (s)")
             ax.set_title(f"{PART_NAME[scheme]}: {axis} time to {100*A:.0f}% validation accuracy" if A
                          else PART_NAME[scheme], fontsize=10.5)
     ns = _nseeds(main)
-    fig.suptitle(f"Time to the target accuracy ({_seed_txt(ns)}; labels: method time / AirSFL time, "
-                 f"paired per seed)", y=1.01, fontsize=11)
+    fig.suptitle(f"Time to the target accuracy at {ENV0['rho_db']:g} dB ({_seed_txt(ns)}; labels: time, method time / AirSFL time "
+                 f"paired per seed, (k/n) seeds that reached it)", y=1.01, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig6_time_to_target")
 
@@ -838,9 +1240,9 @@ def fig7_nsweep(main, nsweep):
     allr = allr[(allr.rho_db == 20.0) & (allr.tau == TAU0) & allr.cut.isin([CUT0, 0])]   # 0 = FL (no cut)
     Ns = tuple(sorted({int(n) for n in allr.N}))
     schemes = _schemes(allr)
-    fig, axes = plt.subplots(2, len(schemes), figsize=(6.4 * len(schemes), 9.2), squeeze=False)
+    fig, axes = plt.subplots(2, len(schemes), figsize=(7.4 * len(schemes), 9.4), squeeze=False)
     x = np.arange(len(Ns))
-    w = 0.16
+    w = 0.84 / len(ORDER)
     rows = []
     for pi, scheme in enumerate(schemes):
         sub = allr[allr.partition == scheme]
@@ -855,9 +1257,10 @@ def fig7_nsweep(main, nsweep):
             ax = axes[row][pi]
             xcol = AXES[axis][0]
             for j, m in enumerate(ORDER):
-                vals = []
+                vals, ran = [], []
                 for N in Ns:
                     dm = sub[(sub.N == N) & (sub.method == m)]
+                    ran.append(not dm.empty)
                     if dm.empty:
                         vals.append(np.nan)
                         continue
@@ -872,10 +1275,10 @@ def fig7_nsweep(main, nsweep):
                                      "UL time to target (s)": s["t"],
                                      "training time to target (s)": ttt(dm, A, "training_time_s")["t"],
                                      "final test acc (%)": final_acc(dm)[0]})
-                xs = x + (j - 2) * w
+                xs = x + (j - (len(ORDER) - 1) / 2) * w
                 ax.bar(xs, vals, width=w, color=STYLE[m]["color"], edgecolor="k", lw=0.4, label=STYLE[m]["label"])
-                for xi, v in zip(xs, vals):
-                    if np.isnan(v):
+                for xi, v, r in zip(xs, vals, ran):
+                    if r and np.isnan(v):
                         ax.text(xi, 0.02, "×", ha="center", color=STYLE[m]["color"], fontsize=10,
                                 transform=ax.get_xaxis_transform())
             ax.set_yscale("log")
@@ -901,7 +1304,7 @@ def fig8_efficiency(main, eps_list=(0.4, 0.6, 0.7)):
         return
     cases = [(f"analog eps={e}", dict(eps_U=e, eps_A=e)) for e in eps_list] + \
             [("ideal payload-only (all eps=1)", dict(eps_U=1.0, eps_A=1.0, eps_D=1.0))]
-    fig, axes = plt.subplots(1, len(schemes), figsize=(6.6 * len(schemes), 4.8), squeeze=False)
+    fig, axes = plt.subplots(1, len(schemes), figsize=(1.1 * len(ORDER) * len(schemes), 5.0), squeeze=False)
     colors = ["#fcbba1", "#fb6a4a", "#cb181d", "#67000d"]
     rows = []
     x = np.arange(len(ORDER))
@@ -925,12 +1328,13 @@ def fig8_efficiency(main, eps_list=(0.4, 0.6, 0.7)):
                    label=name)
         ax.set_yscale("log")
         ax.set_xticks(x)
-        ax.set_xticklabels([STYLE[m]["label"].replace(" (proposed)", "") for m in ORDER], rotation=20, ha="right")
+        ax.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
         ax.set_ylabel("Uplink time to target (s)")
         ax.set_title(f"{PART_NAME[scheme]}: uplink time to {100*A:.0f}% (digital eps_D=0.6 unless ideal)"
                      if A else PART_NAME[scheme], fontsize=10.5)
         ax.legend(fontsize=7.5)
-    fig.suptitle("Efficiency sensitivity: declared overhead factors (same training runs, time recomputed)",
+    fig.suptitle(f"Efficiency sensitivity at {ENV0['rho_db']:g} dB: declared overhead factors (same training runs, "
+                 f"time recomputed)",
                  y=1.02, fontsize=11)
     fig.tight_layout()
     _save(fig, "fig8_efficiency")
@@ -958,11 +1362,11 @@ def fig9_cut_tau(main, cuts, tau):
                 pts = []
                 if panel == "cut":
                     for c in (1, 2, 3, 4):
-                        if m in ("airsfl", "sun_fdma_aircomp"):
+                        if m in ("airsfl", "sun_fdma_aircomp", "hybrid_zf_aircomp"):
                             src = main if c == CUT0 else cuts
                             dm = src[(src.partition == scheme) & (src.method == m) & (src.cut == c)]
-                        elif m == "digital_sflv1":      # learning cut-independent -> retime the main run
-                            dm = main[(main.partition == scheme) & (main.method == m)]
+                        elif m in ("digital_sflv1", "digital_sflv1_zf"):   # learning cut-independent:
+                            dm = main[(main.partition == scheme) & (main.method == m)]   # retime the main run
                             dm = dm if dm.empty else _retime(m, dm, dims=dims_all[c], stage=c)
                         else:                           # FL: no cut
                             dm = main[(main.partition == scheme) & (main.method == m)]
@@ -1003,6 +1407,86 @@ def fig9_cut_tau(main, cuts, tau):
         _write_table(pd.DataFrame(rows), "table_cut_tau")
 
 
+# ---------------------------------------------------------------------------
+# Figure 10 / 1d + table_compute_regimes: how much computation changes the picture
+# ---------------------------------------------------------------------------
+
+def fig10_compute_regimes(main):
+    """Training time to the primary target under three accountings, recomputed from the same
+    runs: uplink only, edge-GPU devices (AdaptSFL setting) and IoT-CPU devices (Sun et al.:
+    16 FLOPs/cycle x U[0.1, 2] GHz, 20 GHz server). Plus fig1d: accuracy vs training time
+    in the IoT-CPU setting, where computation dominates the round."""
+    schemes = _schemes(main)
+    if not schemes:
+        return
+    fig, axes = plt.subplots(1, len(schemes), figsize=(1.3 * len(ORDER) * len(schemes), 5.4), squeeze=False)
+    colors = ["#fdae6b", "#6baed6", "#31a354"]
+    x = np.arange(len(ORDER))
+    w = 0.8 / len(PRESETS)
+    rows = []
+    for ax, scheme in zip(axes[0], schemes):
+        A = primary_target(main, scheme)
+        for pi, (name, preset) in enumerate(PRESETS):
+            stats = {}
+            for m in ORDER:
+                dm = main[(main.partition == scheme) & (main.method == m)]
+                if dm.empty:
+                    continue
+                rt = _per_run(dm, lambda g: _with_compute(g, preset))
+                stats[m] = (ttt(rt, A, "training_time_s"), float(rt.e2e_s_per_round.iloc[0]))
+            vals = [stats[m][0]["t"] if m in stats else np.nan for m in ORDER]
+            xs = x + (pi - (len(PRESETS) - 1) / 2) * w
+            ax.bar(xs, vals, width=w, color=colors[pi], edgecolor="k", lw=0.4, label=name)
+            air = stats["airsfl"][0] if "airsfl" in stats else None
+            for xi, m, v in zip(xs, ORDER, vals):
+                if m not in stats:
+                    continue
+                s, per_round = stats[m]
+                ratio = paired_speedup(s, air)[0] if air is not None and air["hit"] > 0 else np.nan
+                if np.isnan(v):
+                    ax.text(xi, 0.03, "×", ha="center", fontsize=10, transform=ax.get_xaxis_transform())
+                elif m != "airsfl" and not np.isnan(ratio):
+                    ax.text(xi, v * 1.15, _ratio_txt(ratio), ha="center", va="bottom", fontsize=7, rotation=90)
+                rows.append({"partition": PART_NAME[scheme], "accounting": name, "method": STYLE[m]["label"],
+                             "s/round": per_round, "reached": f"{s['hit']}/{s['n']}",
+                             "time to target (s)": s["t"], "x AirSFL (paired)": ratio})
+        ax.set_yscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels(_xlabels(ORDER), rotation=25, ha="right")
+        ax.set_ylabel("Time to target (s)")
+        ax.set_title(f"{PART_NAME[scheme]}: time to {100*A:.0f}% validation accuracy\n"
+                     f"(labels: method time / AirSFL time)" if A else PART_NAME[scheme], fontsize=10.5)
+        ax.legend(fontsize=7.5, loc="upper left")
+        ax.set_ylim(top=ax.get_ylim()[1] * 30)
+    fig.suptitle(f"How much computation changes the comparison at {ENV0['rho_db']:g} dB (same training runs; "
+                 f"downlinks ideal)",
+                 y=1.02, fontsize=11)
+    fig.tight_layout()
+    _save(fig, "fig10_compute_regimes")
+    if rows:
+        _write_table(pd.DataFrame(rows), "table_compute_regimes")
+
+    # fig1d: accuracy vs training time with IoT-CPU devices
+    name, preset = PRESETS[2]
+    fig, axes = plt.subplots(1, len(schemes), figsize=(6.3 * len(schemes), 4.7), squeeze=False)
+    for ax, scheme in zip(axes[0], schemes):
+        A = primary_target(main, scheme)
+        for m in ORDER:
+            dm = main[(main.partition == scheme) & (main.method == m)]
+            if dm.empty:
+                continue
+            rt = _per_run(dm, lambda g: _with_compute(g, preset))
+            run = _plot_curve(ax, rt, STYLE[m], "training_time_s")
+            _mark_target(ax, run, A, STYLE[m], "training_time_s")
+        ax.set_xscale("log")
+        ax.set_xlabel("Training time: uplink + computation (s)")
+        ax.set_ylabel("Test accuracy (%)")
+        ax.set_title(f"CIFAR-10, ResNet-18 — {PART_NAME[scheme]}")
+    axes[0][0].legend(loc="lower right", fontsize=8)
+    fig.suptitle(f"Accuracy vs training time at {ENV0['rho_db']:g} dB, {name}", y=1.02, fontsize=11)
+    _save(fig, "fig1d_acc_vs_training_time_iot")
+
+
 def main():
     import argparse
     global RESULTS, FIG, TAB, TARGETS
@@ -1020,11 +1504,36 @@ def main():
     p.add_argument("--server-tflops", type=float, default=None, help="recompute with this M-server TFLOPS")
     p.add_argument("--budget-uplink", type=float, default=None, help="fig2c budget on the uplink axis (s)")
     p.add_argument("--budget-training", type=float, default=None, help="fig2c budget on the training axis (s)")
+    p.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS,
+                   help="methods to draw (default all; the ZF baselines are derived from the digital_sflv1 / "
+                        "sun_fdma_aircomp runs)")
+    p.add_argument("--budget-mult", nargs="+", type=float, default=[1.0],
+                   help="fig2c: budgets = base budget x each value, e.g. 1 3 10 (base = AirSFL's full run)")
+    p.add_argument("--linear-snrs", nargs="+", type=float, default=None,
+                   help="fig1e: SNR panels (default 20 dB and the lowest swept SNR)")
+    p.add_argument("--linear-xmax", type=float, default=None,
+                   help="fig1e: x range in uplink seconds (default AirComp-FL's full run at 20 dB)")
+    p.add_argument("--sweep-curves", nargs="*", default=["epochs", "uplink"], choices=["epochs", "uplink", "training"],
+                   help="learning curves of all methods at every SNR (fig2d) and path-gain spread (fig11b) on these "
+                        "axes; pass the flag without values to skip them")
+    p.add_argument("--curves-xscale", choices=["log", "linear"], default="log",
+                   help="time-axis scale of the sweep learning curves")
+    p.add_argument("--path-gain-spread", type=float, default=0.0,
+                   help="load main/snr/... runs trained with this path-gain spread (dB; 0 = equal gains)")
+    p.add_argument("--snr", nargs="+", type=float, default=[20.0],
+                   help="operating SNR(s) of the main-point figures (fig1/1b/1c/1d, 3/3b/3c, 4, 6, 8, 10, table_main). "
+                        "20 = the nominal set (all figures); any other swept SNR is rebuilt from the CSVs into "
+                        "figures_snr<SNR>/ and tables_snr<SNR>/, e.g. --snr 20 -20")
     a = p.parse_args()
+    BUDGET_MULTS[:] = a.budget_mult
+    LINEAR.update(snrs=a.linear_snrs, xmax=a.linear_xmax)
+    SWEEP_CURVES.update(axes=list(a.sweep_curves), xscale=a.curves_xscale)
+    FILTER["path_gain_spread_db"] = float(a.path_gain_spread)
     if a.results:
         RESULTS = os.path.abspath(a.results)
         FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
     TARGETS = a.targets
+    ORDER[:] = [m for m in ALL_METHODS if m in a.methods]
     BUDGETS["uplink"], BUDGETS["training"] = a.budget_uplink, a.budget_training
     cal_path = os.path.join(RESULTS, "lr", "chosen_lr.json")
     cal = json.load(open(cal_path)) if os.path.exists(cal_path) else {}
@@ -1035,28 +1544,58 @@ def main():
         COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"] = a.client_tflops
     if a.server_tflops:
         COMPUTE["server_tflops"] = a.server_tflops
-    d = {e: _filter(_read(e)) for e in ("main", "snr", "nr", "nsweep", "cuts", "tau")}
+    skip = lambda e: ("path_gain_spread_db",) if e == "pathloss" else ()     # the spread is its sweep variable
+    d = {e: _filter(_read(e), skip(e)) for e in ("main", "snr", "nr", "nsweep", "cuts", "tau", "pathloss")}
     budgets = sorted(set(d["main"].epochs_budget)) if not d["main"].empty else []
     FILTER["epochs_budget"] = a.epochs if a.epochs is not None else (
         float(d["main"].groupby("epochs_budget").run_id.nunique().idxmax()) if budgets else None)
     if len(budgets) > 1 and a.epochs is None:
         print(f"[plots] WARNING: `main` holds epoch budgets {budgets}; using {FILTER['epochs_budget']} "
               f"(choose with --epochs)")
-    d = {e: _filter(df) for e, df in d.items()}
+    d = {e: _filter(df, skip(e)) for e, df in d.items()}
     if recompute:
         d = {e: _apply_compute(df) for e, df in d.items()}
+    d = {e: _derive_zf(df) for e, df in d.items()}
     print(f"[plots] results={RESULTS} | filter {FILTER} | compute {COMPUTE} "
           f"({'recomputed' if recompute else 'as stored'}) | targets = "
-          f"{TARGETS or 'rule (95% of the error-free reference)'}")
-    fig3_breakdown()
-    fig4_overhead(d["main"])
-    fig1_and_table(d["main"])
-    fig2_snr(d["main"], d["snr"])
-    fig5_nr(d["main"], d["nr"])
-    fig6_time_to_target(d["main"])
-    fig7_nsweep(d["main"], d["nsweep"])
-    fig8_efficiency(d["main"])
-    fig9_cut_tau(d["main"], d["cuts"], d["tau"])
+          f"{TARGETS or 'rule (95% of the error-free reference)'} | methods {ORDER}")
+    fig_dir, tab_dir = FIG, TAB
+    for rho in a.snr:
+        if rho == 20.0:                      # nominal point: every figure, sweeps included
+            ENV0["rho_db"], FIG, TAB = 20.0, fig_dir, tab_dir
+            fig3_breakdown()
+            fig4_overhead(d["main"])
+            fig1_and_table(d["main"])
+            fig2_snr(d["main"], d["snr"])
+            fig1e_linear_time(d["main"], d["snr"])
+            fig11_path_gains(d["main"], d["snr"], d["pathloss"])
+            fig_sweep_curves(d["main"], d["snr"], d["pathloss"])
+            fig5_nr(d["main"], d["nr"])
+            fig6_time_to_target(d["main"])
+            fig7_nsweep(d["main"], d["nsweep"])
+            fig8_efficiency(d["main"])
+            fig9_cut_tau(d["main"], d["cuts"], d["tau"])
+            fig10_compute_regimes(d["main"])
+            continue
+        # another operating SNR: the main-point figures rebuilt from the CSVs (analog methods from
+        # the SNR sweep at rho, digital methods retimed at rho) into figures_snr<rho>/, tables_snr<rho>/.
+        # The N / cut / tau / antenna sweeps exist only at 20 dB and are not redrawn.
+        if d["snr"].empty or not np.isclose(d["snr"].rho_db.astype(float), rho).any():
+            print(f"[plots] --snr {rho:g}: no SNR-sweep runs at {rho:g} dB in {RESULTS}/snr -> skipped")
+            continue
+        main_rho = _main_at(d["main"], d["snr"], rho)
+        ENV0["rho_db"] = rho
+        FIG = os.path.join(RESULTS, f"figures_snr{rho:g}")
+        TAB = os.path.join(RESULTS, f"tables_snr{rho:g}")
+        print(f"[plots] operating SNR {rho:g} dB -> {FIG}, {TAB} "
+              f"(methods present: {sorted(set(main_rho.method)) if not main_rho.empty else []})")
+        fig3_breakdown()
+        fig4_overhead(main_rho)
+        fig1_and_table(main_rho)
+        fig6_time_to_target(main_rho)
+        fig8_efficiency(main_rho)
+        fig10_compute_regimes(main_rho)
+    ENV0["rho_db"], FIG, TAB = 20.0, fig_dir, tab_dir
 
 
 if __name__ == "__main__":

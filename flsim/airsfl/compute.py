@@ -15,7 +15,7 @@ FLOP counting (per training sample), same convention as flsim.system.flops:
 
 Per-round computation latency (sequential stages of each co-split step, as in
 AdaptSFL; clients run in parallel, the slowest client paces every step):
-  split methods (AirSFL, digital SFL-V1, Sun-inspired):
+  split methods (AirSFL, digital SFL-V1 [OFDMA or ZF], hybrid FDMA/ZF-AirComp SFL):
       client FP : tau * b * C_FP / f_min            C_FP  = client-side FP FLOPs/sample
       server FP : tau * N * b * Phi_FP / f_s         Phi_FP = server-side FP FLOPs/sample
       server BP : tau * N * b * Phi_BP / f_s         (the M-server runs all N suffix copies
@@ -39,9 +39,8 @@ import torch
 import torch.nn as nn
 
 from flsim.airsfl.model import CifarResNet18GN
+from flsim.airsfl.timing import SPLIT_METHODS   # noqa: F401  (re-exported: split methods run SFL compute)
 from flsim.system.flops import _conv2d_macs, _linear_macs
-
-SPLIT_METHODS = ("airsfl", "digital_sflv1", "sun_fdma_aircomp")
 
 
 @dataclass

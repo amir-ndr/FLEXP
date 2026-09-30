@@ -13,6 +13,11 @@ differences. Both downlinks (cut derivatives, prefix broadcast) are ideal.
   sun_fdma_aircomp    yes     digital OFDMA (reliable)       analog AirComp (+ Eq. 23 error)
   aircomp_fl          no      -                              analog AirComp of the FULL model
   digital_fedavg      no      -                              digital OFDMA, full model (exact)
+  digital_sflv1_zf    yes     digital multi-user ZF (rel.)   digital multi-user ZF (exact)
+  hybrid_zf_aircomp   yes     digital multi-user ZF (rel.)   analog AirComp (+ Eq. 23 error)
+The two ZF digital rows learn exactly like digital_sflv1 / sun_fdma_aircomp (reliable
+digital links either way; identical AirComp stream); only their uplink time differs, so
+the experiments derive them from those runs instead of training them again.
 
 All methods share data, init, model, minibatches, (optional) augmentation, plain
 SGD, the LR schedule, tau, participation, weights a_n = D_n/sum D, bandwidth,
@@ -36,6 +41,10 @@ sigma^2/(lambda p_n) = 1/rho):
       shared M-server noise.
   AirComp, per real coord of packet k: 1^T G~^-1 1 * max_n a_n^2 ||Delta_nk||^2 / (2 rho m_k)
       (baseline combiner v = H(H^H H)^-1 1, alpha_k = min over clients, Eq. 19-20).
+Unequal path gains (optional, lambda_n = g_n lambda_ref, same to both servers): client n's
+ZF error is scaled by 1/sqrt(g_n) (joint correlation kept, [G^-1]_nm / sqrt(g_n g_m)) and
+1^T G~^-1 1 above becomes d^T G~^-1 d with d = 1/sqrt(g) (the weakest clients dominate
+the AirComp scaling); rho is the median client's SNR.
 Packets: 128 complex payload symbols (256 real coords) per coherent per-tone packet,
 i.i.d. Rayleigh across packets; zero packets carry no error. The M-link and F-link
 use SEPARATE, seeded channel/noise streams, so every analog-aggregation method
@@ -51,6 +60,7 @@ noise draws do not depend on how much randomness earlier rounds consumed.
 """
 
 import copy
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -75,20 +85,27 @@ PACKET_REAL = 256          # 128 complex payload symbols per coherent per-tone p
 _CHUNK = 1024              # packets per channel-sampling chunk (memory bound)
 SCHEMA = 4                 # CSV/semantics version (plots ignore older files; part of the run identity)
 
-METHOD_SPEC = {
-    "airsfl":           {"split": True,  "zf_act": True,  "aircomp": True},
-    "digital_sflv1":    {"split": True,  "zf_act": False, "aircomp": False},
-    "sun_fdma_aircomp": {"split": True,  "zf_act": False, "aircomp": True},
-    "aircomp_fl":       {"split": False, "zf_act": False, "aircomp": True},
-    "digital_fedavg":   {"split": False, "zf_act": False, "aircomp": False},
+METHOD_SPEC = {   # digital: how the reliable digital uplinks share the band ("ofdma" | "zf")
+    "airsfl":            {"split": True,  "zf_act": True,  "aircomp": True,  "digital": None},
+    "digital_sflv1":     {"split": True,  "zf_act": False, "aircomp": False, "digital": "ofdma"},
+    "sun_fdma_aircomp":  {"split": True,  "zf_act": False, "aircomp": True,  "digital": "ofdma"},
+    "aircomp_fl":        {"split": False, "zf_act": False, "aircomp": True,  "digital": None},
+    "digital_fedavg":    {"split": False, "zf_act": False, "aircomp": False, "digital": "ofdma"},
+    # multi-user ZF digital baselines: same learning as digital_sflv1 / sun_fdma_aircomp (the
+    # digital links are reliable either way), only the uplink time differs. plots.py derives
+    # them from those runs; they are listed here so a run of them is possible and checkable.
+    "digital_sflv1_zf":  {"split": True,  "zf_act": False, "aircomp": False, "digital": "zf"},
+    "hybrid_zf_aircomp": {"split": True,  "zf_act": False, "aircomp": True,  "digital": "zf"},
 }
 
 METHOD_LABELS = {
     "airsfl": "AirSFL",
     "digital_sflv1": "Digital SFL-V1",
-    "sun_fdma_aircomp": "FDMA-AirComp SFL (Sun-inspired)",
+    "sun_fdma_aircomp": "Hybrid FDMA-AirComp SFL",
     "aircomp_fl": "AirComp-FL",
     "digital_fedavg": "Digital FedAvg",
+    "digital_sflv1_zf": "Digital SFL-V1 (ZF)",
+    "hybrid_zf_aircomp": "Hybrid ZF-AirComp SFL",
 }
 
 
@@ -106,6 +123,8 @@ class RunConfig:
     warmup_rounds: int = 0          # optional linear warmup (same for every method)
     rounds: int = 100
     evals_per_epoch: float = 1.0    # evaluate at the first round boundary after each 1/x epoch
+    eval_rounds: tuple = ()         # extra evaluation rounds (e.g. 1, 2, 4, 8, 16: early checkpoints for
+                                    # slow methods in time-budget plots); evaluation never alters training
     noiseless: bool = False         # exact transport (analog errors switched off)
     seed: int = 11                  # model init + radio streams (data streams seeded outside)
     engine: str = "vmap"            # "vmap" (all clients in parallel) | "loop" (reference)
@@ -141,8 +160,13 @@ class AirSFLSimulator:
             raise ValueError(f"ZF needs N <= Nr at the M-server (got N={radio.N}, Nr={radio.Nr})")
         if spec["aircomp"] and radio.N > radio.Nr_F:
             raise ValueError(f"the baseline AirComp combiner needs N <= Nr_F (got N={radio.N}, Nr_F={radio.Nr_F})")
-        if (splits or not spec["aircomp"]) and radio.N > radio.S:
+        digital_used = splits or not spec["aircomp"]         # activations/labels, or the model upload
+        if digital_used and spec["digital"] == "ofdma" and radio.N > radio.S:
             raise ValueError(f"digital OFDMA (activations/labels/models) needs N <= S (got S={radio.S}, N={radio.N})")
+        if spec["digital"] == "zf" and ((splits and radio.N > radio.Nr) or
+                                        (not spec["aircomp"] and radio.N > radio.Nr_F)):
+            raise ValueError(f"digital multi-user ZF needs N <= Nr at its receiver(s) "
+                             f"(got N={radio.N}, Nr={radio.Nr}, Nr_F={radio.Nr_F})")
         self.method, self.cfg, self.radio = m, cfg, radio
         self.device, self.log, self.n_train = device, log, n_train
         self.engine = cfg.engine
@@ -180,6 +204,12 @@ class AirSFLSimulator:
         self.gen_U.manual_seed(int(cfg.seed) * 7919 + 17)
         self.gen_A = torch.Generator(device=self.rdev)
         self.gen_A.manual_seed(int(cfg.seed) * 7919 + 29)
+        # unequal long-term path gains lambda_n = g_n lambda_ref (same to both servers). With
+        # H = sqrt(lambda_ref) H~ diag(sqrt(g)): (H^H H)^-1 = diag(1/sqrt(g)) G~^-1 diag(1/sqrt(g)) / lambda_ref,
+        # so client n's ZF error scales by 1/sqrt(g_n) (joint correlation kept) and the AirComp
+        # combiner norm ||v||^2 = 1^T (H^H H)^-1 1 becomes d^T G~^-1 d with d = 1/sqrt(g)
+        self.unequal = radio.unequal_gains
+        self.g = torch.tensor(radio.g_lin, dtype=torch.float64, device=self.rdev)
 
         # dimensions (measured from the actual model)
         d_c = sum(self.gparams[i].numel() for i in self.pref_idx)
@@ -255,6 +285,8 @@ class AirSFLSimulator:
             w = torch.randn((k, PACKET_REAL // 2, N), dtype=torch.complex128, generator=self.gen_U,
                             device=self.rdev)
             out[s:s + k] = torch.einsum("kij,klj->kli", L, w).to(torch.complex64)
+        if self.unequal:                                  # [(H^H H)^-1]_nm = [G~^-1]_nm / sqrt(g_n g_m)
+            out = out * (1.0 / torch.sqrt(self.g)).to(torch.complex64)
         # client-major, real/imag interleaved per symbol (inverse of the packing Eq. 2)
         return torch.view_as_real(out.permute(2, 0, 1).contiguous()).reshape(N, K, PACKET_REAL).to(self.device)
 
@@ -276,7 +308,11 @@ class AirSFLSimulator:
             k = min(_CHUNK, K - s)
             H = torch.randn((k, Nr, N), dtype=torch.complex128, generator=self.gen_A, device=self.rdev)
             Ginv = torch.linalg.inv(H.conj().transpose(-1, -2) @ H)
-            v2[s:s + k] = Ginv.sum(dim=(-1, -2)).real                 # ||v~||^2 = 1^T G~inv 1
+            if self.unequal:                                          # ||v~||^2 = dg^T G~inv dg, dg = 1/sqrt(g)
+                dg = (1.0 / torch.sqrt(self.g)).to(torch.complex128)
+                v2[s:s + k] = torch.einsum("n,knm,m->k", dg, Ginv, dg).real
+            else:
+                v2[s:s + k] = Ginv.sum(dim=(-1, -2)).real             # ||v~||^2 = 1^T G~inv 1
         m = torch.ceil(_packet_lengths(d, K, self.rdev) / 2.0)
         var = v2 * maxterm.to(self.rdev, torch.float64) / (2.0 * self.radio.rho_lin * m)
         noise = torch.randn((K, PACKET_REAL), generator=self.gen_A, device=self.rdev) \
@@ -439,6 +475,9 @@ class AirSFLSimulator:
             "cut": self.stage if self.stage is not None else 0, "tau": self.cfg.tau, "B": self.cfg.batch_size,
             "rho_db": self.radio.rho_db, "N": self.N, "Nr": self.radio.Nr, "Nr_F": self.radio.Nr_F,
             "S": self.radio.S, "eps_D": self.radio.eps_D, "eps_U": self.radio.eps_U, "eps_A": self.radio.eps_A,
+            "gain_range_db": (max(self.radio.gains_db) - min(self.radio.gains_db)) if self.unequal else 0.0,
+            "gain_min_db": self.radio.g_min_db,
+            "path_gains_db": json.dumps(list(self.radio.gains_db)) if self.unequal else "",
             "seed": self.cfg.seed, "noiseless": self.cfg.noiseless, "base_lr": self.cfg.lr,
             "lr_schedule": self.cfg.lr_schedule, "engine": self.engine,
             "round": r, "processed_samples": r * spr, "epoch_equiv": r * spr / self.n_train,
@@ -470,7 +509,9 @@ class AirSFLSimulator:
 
     def run(self) -> list:
         cfg, t0 = self.cfg, time.time()
-        self.log(f"[AirSFL] {METHOD_LABELS[self.method]} | cut={self.stage} | rho={self.radio.rho_db:g} dB | "
+        self.log(f"[AirSFL] {METHOD_LABELS[self.method]} | cut={self.stage} | rho={self.radio.rho_db:g} dB"
+                 + (f" (path gains {min(self.radio.gains_db):.1f}..{max(self.radio.gains_db):.1f} dB)"
+                    if self.unequal else "") + " | "
                  f"N={self.N} Nr_M={self.radio.Nr} Nr_F={self.radio.Nr_F} S={self.radio.S} | "
                  f"tau={cfg.tau} B={cfg.batch_size} | rounds={cfg.rounds} | lr={cfg.lr:g} ({cfg.lr_schedule}) | "
                  f"UL {self.ul_s:.3f} s/rnd (act {self.ul_break['activation']:.3f}, labels "
@@ -510,7 +551,7 @@ class AirSFLSimulator:
                          f"-> stopping this run")
                 break
             processed = (r + 1) * spr
-            if processed >= next_eval or r + 1 == cfg.rounds:
+            if processed >= next_eval or r + 1 == cfg.rounds or r + 1 in cfg.eval_rounds:
                 while next_eval <= processed:
                     next_eval += eval_step
                 rec = self._record(r + 1, lr, float(loss_sum) / (cfg.tau * self.N), t0)

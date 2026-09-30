@@ -31,12 +31,16 @@ import torch
 # ---------------------------------------------------------------------------
 
 def draw_channel(radio, rng: np.random.RandomState, Nr: int = None) -> np.ndarray:
-    """H (Nr x N) complex Rayleigh, columns h_n ~ CN(0, lambda I_Nr). Nr defaults to the
-    M-server array; pass radio.Nr_F for the F-server link."""
+    """H (Nr x N) complex Rayleigh, columns h_n ~ CN(0, lambda_n I_Nr) with lambda_n =
+    g_n lambda_ref (g_n = 1 for equal path gains). Nr defaults to the M-server array; pass
+    radio.Nr_F for the F-server link."""
     lam = radio.lambda_ref
     scale = math.sqrt(lam / 2.0)                      # per real/imag part
     Nr, N = (Nr if Nr is not None else radio.Nr), radio.N
-    return (rng.normal(0, scale, (Nr, N)) + 1j * rng.normal(0, scale, (Nr, N)))
+    H = rng.normal(0, scale, (Nr, N)) + 1j * rng.normal(0, scale, (Nr, N))
+    if getattr(radio, "unequal_gains", False):
+        H = H * np.sqrt(radio.g_lin)[None, :]
+    return H
 
 
 def zf_column_norms_sq(H: np.ndarray) -> np.ndarray:
@@ -216,13 +220,20 @@ def verify_gates(radio, rng, verbose: bool = True) -> bool:
 
 
 def run_radio_checks(verbose: bool = True) -> bool:
-    from flsim.airsfl.timing import RadioConfig
+    from flsim.airsfl.timing import RadioConfig, path_gain_offsets_db
     radio = RadioConfig(N=8, Nr=32, S=64, rho_db=20.0)     # small array: fast Monte-Carlo
     rng = np.random.RandomState(7)
     zf = verify_zf_mse(radio, rng)
     ac = verify_aircomp_mse(radio, rng)
     gates = verify_gates(RadioConfig(), np.random.RandomState(11), verbose=verbose)
+    # the same chains with unequal path gains (20 dB spread): Eq. 10 / 20 hold per client
+    radio_g = RadioConfig(N=8, Nr=32, S=64, rho_db=20.0, gains_db=path_gain_offsets_db(8, 20.0, 11))
+    zf_g = verify_zf_mse(radio_g, rng)
+    ac_g = verify_aircomp_mse(radio_g, rng)
+    gates &= verify_gates(RadioConfig(gains_db=path_gain_offsets_db(30, 20.0, 11)), np.random.RandomState(11),
+                          verbose=False)
     ok = zf["max_rel_err"] < 0.05 and ac["rel_err"] < 0.05 and gates
+    ok &= zf_g["max_rel_err"] < 0.05 and ac_g["rel_err"] < 0.05
     if verbose:
         print("=== AirSFL radio checks (empirical MSE vs analytical Eq. 10/20) ===")
         print(f"  ZF activation (Eq. 10): max relative error over {radio.N} clients "
@@ -231,6 +242,8 @@ def run_radio_checks(verbose: bool = True) -> bool:
               f"empirical = {zf['empirical'][0]:.4e}")
         print(f"  AirComp aggregation (Eq. 20): relative error = {ac['rel_err']*100:.2f}%   [< 5% => OK]")
         print(f"      analytical D_A = {ac['analytical']:.4e}, empirical = {ac['empirical']:.4e}")
+        print(f"  unequal path gains (20 dB spread): ZF max rel. error {zf_g['max_rel_err']*100:.2f}%, "
+              f"AirComp rel. error {ac_g['rel_err']*100:.2f}%, gates   [< 5% => OK]")
         print(f"  RADIO_CHECKS: {'PASS' if ok else 'FAIL'}")
     return ok
 
