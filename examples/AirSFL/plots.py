@@ -123,7 +123,8 @@ PART_NAME = {"iid": "IID", "dirichlet": "Non-IID (Dirichlet)"}   # alpha filled 
 ALL_METHODS = ["airsfl", "aircomp_fl", "hybrid_zf_aircomp", "sun_fdma_aircomp", "digital_sflv1_zf",
                "digital_sflv1", "digital_fedavg"]
 EXTRA_METHODS = ["digital_fedavg_zf"]
-ORDER = list(ALL_METHODS)             # methods drawn (plots.py --methods)
+DEFAULT_METHODS = [m for m in ALL_METHODS if m != "digital_fedavg"]   # drawn by default (FedAvg: --methods)
+ORDER = list(DEFAULT_METHODS)         # methods drawn (plots.py --methods)
 # digital baselines derived from their parent runs (identical learning, multi-user ZF timing:
 # all tones, concurrent streams separated by ZF)
 DERIVED = {"digital_sflv1_zf": "digital_sflv1", "hybrid_zf_aircomp": "sun_fdma_aircomp",
@@ -462,8 +463,12 @@ def _seed_txt(n):
 
 
 def rule_target(df, scheme):
-    m = "target_ref" if (df.method == "target_ref").any() else "digital_fedavg"   # the FP32 FedAvg if present
-    ref = df[(df.partition == scheme) & (df.method == m)]
+    """95% rule on the error-free reference: the FP32 FedAvg runs, else the FP32 digital SFL-V1 runs
+    (identical learning: exact transport makes SFL-V1 full-model SGD), else the drawn ones."""
+    sub = df[df.partition == scheme]
+    have = set(sub.method)
+    m = next((k for k in ("target_ref", "digital_fedavg", "errfree_ref", "digital_sflv1") if k in have), None)
+    ref = sub[sub.method == m] if m else sub.iloc[0:0]
     if ref.empty:
         return None
     return math.floor(100 * 0.95 * float(_curve(ref)["val_acc"].iloc[-1])) / 100.0
@@ -923,11 +928,15 @@ def _sweep_curves(fname, title, schemes, panels, runs_of, axis, xscale):
     parents and the error-free curve with digital SFL-V1, so those duplicates are skipped."""
     xcol, xlab = {"epochs": ("epoch_equiv", "Global-epoch equivalents"), "uplink": AXES["uplink"],
                   "training": AXES["training"]}[axis]
-    fig, axes = plt.subplots(len(schemes), len(panels), figsize=(4.9 * len(panels), 4.2 * len(schemes)),
-                             squeeze=False, sharey="row")
+    ncol = min(len(panels), 5)                      # at most 5 panels per row (e.g. 9 SNRs -> 5 + 4)
+    per = math.ceil(len(panels) / ncol)             # grid rows per partition
+    nrows = per * len(schemes)
+    fig, axes = plt.subplots(nrows, ncol, figsize=(4.9 * ncol, 4.2 * nrows), squeeze=False)
     for i, scheme in enumerate(schemes):
+        block = []
         for j, (label, point) in enumerate(panels):
-            ax = axes[i][j]
+            ax = axes[i * per + j // ncol][j % ncol]
+            block.append(ax)
             for m in ORDER + ["airsfl_errfree"]:
                 if axis == "epochs" and ((m in DERIVED and DERIVED[m] in ORDER) or
                                          (m == "airsfl_errfree" and "digital_sflv1" in ORDER)):
@@ -941,15 +950,21 @@ def _sweep_curves(fname, title, schemes, panels, runs_of, axis, xscale):
                 ax.set_xscale(xscale)
             ax.set_title(f"{PART_NAME[scheme]}, {label}", fontsize=10)
             ax.set_xlabel(xlab, fontsize=9)
-            if j == 0:
+            if j % ncol == 0:
                 ax.set_ylabel("Test accuracy (%)")
+        lo = min(ax.get_ylim()[0] for ax in block)      # one accuracy scale per partition
+        hi = max(ax.get_ylim()[1] for ax in block)
+        for ax in block:
+            ax.set_ylim(lo, hi)
+        for j in range(len(panels), per * ncol):
+            axes[i * per + j // ncol][j % ncol].axis("off")
     handles = {}
     for ax in axes.ravel():
         for h, lab in zip(*ax.get_legend_handles_labels()):
             handles.setdefault(lab, h)
     fig.legend(handles.values(), handles.keys(), loc="lower center", ncol=min(4, max(1, len(handles))), fontsize=8.5)
     fig.suptitle(title, y=1.01, fontsize=11)
-    fig.tight_layout(rect=(0, 0.08 if len(schemes) > 1 else 0.14, 1, 1))
+    fig.tight_layout(rect=(0, min(0.14, 0.75 / (4.2 * nrows)), 1, 1))
     _save(fig, fname)
 
 
@@ -1688,6 +1703,7 @@ def fig12_digital_transport(sets):
     dashed line; labels = method / AirSFL (paired per seed)."""
     main = sets[ENV0["q_bits"]]
     schemes = _schemes(main)
+    fams = [(f, ms) for f, ms in TRANSPORT_FAMILIES if ms["OFDMA"] in ORDER]   # families of the drawn methods
     dims = profiled_dims(B0)[CUT0]
     radios = {q: _radio(q_bits=q) for q in (32, 16)}
     t_air = uplink_time_per_round("airsfl", dims, radios[32], TAU0, _rates(radios[32]))
@@ -1710,7 +1726,7 @@ def fig12_digital_transport(sets):
             ax.text(x, val * 1.15, _ratio_txt(lab_ratio), ha="center", va="bottom", fontsize=6.5, rotation=90)
 
     # (a) per-round uplink time, analytic
-    for fi, (fam, ms) in enumerate(TRANSPORT_FAMILIES):
+    for fi, (fam, ms) in enumerate(fams):
         for ci, (acc, q) in enumerate(combos):
             t = uplink_time_per_round(ms[acc], dims, radios[q], TAU0, _rates(radios[q]))
             draw(axes[0], fi, ci, t, t / t_air)
@@ -1725,7 +1741,7 @@ def fig12_digital_transport(sets):
         ax = axes[1 + pi]
         A = primary_target(main, scheme)
         air = ttt(main[(main.partition == scheme) & (main.method == "airsfl")], A, "uplink_s")
-        for fi, (fam, ms) in enumerate(TRANSPORT_FAMILIES):
+        for fi, (fam, ms) in enumerate(fams):
             for ci, (acc, q) in enumerate(combos):
                 src = sets.get(q, pd.DataFrame())
                 dm = src[(src.partition == scheme) & (src.method == ms[acc])] if not src.empty else src
@@ -1754,8 +1770,8 @@ def fig12_digital_transport(sets):
     for ax in axes:
         ax.set_yscale("log")
         ax.set_ylim(top=ax.get_ylim()[1] * 20)
-        ax.set_xticks(range(len(TRANSPORT_FAMILIES)))
-        ax.set_xticklabels([f for f, _ in TRANSPORT_FAMILIES], fontsize=9)
+        ax.set_xticks(range(len(fams)))
+        ax.set_xticklabels([f for f, _ in fams], fontsize=9)
     handles = [plt.Rectangle((0, 0), 1, 1, color=ACCESS_STYLE[a][0], ec="k", lw=0.4) for a in ACCESS_STYLE] + \
         [plt.Rectangle((0, 0), 1, 1, fc="white", ec="k", lw=0.4),
          plt.Rectangle((0, 0), 1, 1, fc="white", ec="k", lw=0.4, hatch="//"),
@@ -1787,10 +1803,10 @@ def main():
     p.add_argument("--server-tflops", type=float, default=None, help="recompute with this M-server TFLOPS")
     p.add_argument("--budget-uplink", type=float, default=None, help="fig2c budget on the uplink axis (s)")
     p.add_argument("--budget-training", type=float, default=None, help="fig2c budget on the training axis (s)")
-    p.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS + EXTRA_METHODS,
-                   help="methods to draw (default: the 7 main ones; the ZF variants are derived from the "
-                        "digital_sflv1 / sun_fdma_aircomp / digital_fedavg runs; the FedAvg-ZF variant appears in "
-                        "fig12 regardless)")
+    p.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, choices=ALL_METHODS + EXTRA_METHODS,
+                   help="methods to draw (default: AirSFL, AirComp-FL, the two hybrids and digital SFL-V1 (ZF / "
+                        "OFDMA); add digital_fedavg (and digital_fedavg_zf) to draw digital FedAvg. The ZF variants "
+                        "are derived from the digital_sflv1 / sun_fdma_aircomp / digital_fedavg runs)")
     p.add_argument("--digital-q", nargs="+", type=int, default=[16], choices=[16, 32],
                    help="digital payload(s) of the drawn figure sets: 16 = the FP16 runs (default) -> figures/, "
                         "tables/; 32 = the FP32 runs -> figures_q32/, tables_q32/ (--digital-q 16 32: both)")

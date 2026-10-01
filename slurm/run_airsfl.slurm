@@ -9,7 +9,7 @@
 #   METHODS    subset, e.g. "airsfl" (to split a sweep over parallel jobs)
 #   EPOCHS     global-epoch equivalents per run                           (default 100)
 #   LR_EPOCHS  budget of each LR-calibration run                          (default 20)
-#   SNRS       SNR list for EXP=snr                                       (default "-20 -10 0 10")
+#   SNRS       SNR list for EXP=snr                         (default "-20 -15 -10 -5 0 5 10 15")
 #   RESULTS    results root, e.g. examples/AirSFL/results_quick_aug       (default .../results)
 #   TARGETS    validation targets for the figures, e.g. "0.75 0.8"        (default: 95% rule)
 #   EXTRA      any other run_airsfl.py flags, e.g. "--early-evals", "--spreads 10 20 30 40",

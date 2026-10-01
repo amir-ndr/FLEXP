@@ -36,7 +36,7 @@ copied, e.g. FP16 runs of --exp fp16 into main/), any changed setting produces a
   lr      LR calibration on the error-free digital reference (FedAvg, IID, FP32); the chosen
           initial LR is then used by ALL methods (refused if calibrated under another setup)
   main    5 methods x {IID, Dirichlet-alpha (default 0.1, --dirichlet-alpha)} at 20 dB
-  snr     analog methods x SNR (default -20, -10, 0, 10 dB; 20 dB from main). Digital
+  snr     analog methods x SNR (default -20, -15, ..., 15 dB in 5 dB steps; 20 dB from main). Digital
           learning is SNR-independent (ideal decoding): only its time is recomputed in plots
   nsweep  5 methods x N in {20, 40} (N=30 from main)
   cuts    AirSFL + Sun-inspired x cuts {1, 3, 4} (2 from main; digital SFL-V1 learning is
@@ -57,7 +57,7 @@ the reference of the target rule and the FP32 rows of plots.py's payload-sensiti
 Usage:
   python examples/AirSFL/run_airsfl.py --exp bench lr
   python examples/AirSFL/run_airsfl.py --exp main --partition iid dirichlet --seeds 11 22 33 44 55
-  python examples/AirSFL/run_airsfl.py --exp snr --snrs -20 -10 0 10
+  python examples/AirSFL/run_airsfl.py --exp snr --snrs -20 -15 -10 -5 0 5 10 15
 """
 
 import argparse
@@ -105,7 +105,7 @@ EARLY_EVALS = (1, 2, 4, 8, 16)         # --early-evals: extra checkpoints before
 # GPU out-of-memory (shared GPU) is restarted automatically with the loop engine.
 LR_GRID = [0.01, 0.03, 0.1, 0.3]       # roadmap {0.01, 0.03, 0.1} + 0.3 to detect a grid-edge optimum
 LR_CAL_EPOCHS = 20
-SNR_SWEEP = [-20.0, -10.0, 0.0, 10.0]  # + 20 dB from main
+SNR_SWEEP = [-20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]  # + 20 dB from main
 N_SWEEP = [20, 40]
 CUT_SWEEP = [1, 3, 4]
 TAU_SWEEP = [1, 10, 20, 50]            # stage-2 per-round crossover with AirComp-FL near tau = d_s/d_a ~ 20
@@ -498,7 +498,7 @@ def main():
                    help="path-gain spreads (dB) for --exp pathloss")
     p.add_argument("--pathloss-snrs", nargs="+", type=float, default=None,
                    help="SNRs for --exp pathloss (default: the nominal 20 dB only)")
-    p.add_argument("--digital-q", type=int, default=DIGITAL_Q["q_bits"], choices=[16, 32],
+    p.add_argument("--digital-q", type=int, default=16, choices=[16, 32],
                    help="digital payload bits of the methods that upload tensors digitally (digital SFL-V1, hybrid, "
                         "digital FedAvg): 16 = FP16 (default; the uploaded tensors are really rounded), 32 = FP32. "
                         "AirSFL / AirComp-FL are unaffected (same runs for both); --exp fp16 uses 16, --exp lr 32")

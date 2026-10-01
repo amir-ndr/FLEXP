@@ -125,7 +125,7 @@ calibrated on the error-free digital reference from {0.01, 0.03, 0.1, 0.3}, no a
 (`--augment` enables crop + flip; in the 50-epoch quick test it lowered accuracy from 76 % to
 60 % and pushed the LR calibration to the grid edge), evaluation once per global-epoch
 equivalent (`--evals-per-epoch`), FP16 digital payload (`--digital-q`), FP32 arithmetic
-(TF32 disabled). SNR sweep ρ ∈ {−20, −10, 0, 10, 20} dB. The SNR figures
+(TF32 disabled). SNR sweep ρ ∈ {−20, −15, …, 15, 20} dB (5 dB steps). The SNR figures
 also show **AirSFL, error-free**: digital SFL-V1's trajectory (identical to noiseless
 AirSFL) on AirSFL's time axis — the upper bound, like the "Error-free" curve of Sun et al.
 
@@ -148,7 +148,7 @@ reported as k/n seeds; speed-ups are paired per seed.
 | `bench` | seconds/round of both engines × cuDNN mode | — |
 | `lr` | FedAvg (error-free, FP32), IID, LR grid, 20 epochs | — |
 | `main` | 5 methods × {IID, Dir-α} at 20 dB (α = 0.1, `--dirichlet-alpha`) | fig1, 1b, 1c, 4b, 6, 8, table_main |
-| `snr` | 3 analog methods × {−20, −10, 0, 10} dB | fig2, 2b, 2c, table_snr, table_budget |
+| `snr` | 3 analog methods × {−20, −15, −10, −5, 0, 5, 10, 15} dB (20 dB from `main`; digital SFL-V1 retimed, its learning is SNR-independent) | fig2, 2b, 2c, 2d, table_snr, table_budget |
 | `nsweep` | 5 methods × N=20, 40 | fig7 |
 | `cuts` | AirSFL + Sun × cuts 1, 3, 4 | fig9 |
 | `tau` | 5 methods × τ = 1, 10, 20, 50 | fig9 |
@@ -191,12 +191,15 @@ call it alone with its own `--targets` (it writes only its own folder).
 
 **Learning curves of every sweep point**: `fig2d_curves_all_snr_<axis>` (every SNR) and
 `fig11b_curves_all_spreads_<axis>` (every spread) for all methods; `plots.py --sweep-curves
-epochs uplink training` chooses the axes, `--curves-xscale linear` the time scale.
+epochs uplink training` chooses the axes, `--curves-xscale linear` the time scale. At most 5
+panels per row (the 9 SNRs take two rows per partition).
 
 The two ZF digital baselines appear in every figure without runs of their own (derived from
 `digital_sflv1` / `sun_fdma_aircomp` runs of the same experiment, e.g. the hybrid at every
-SNR of `snr`). `plots.py --methods ...` selects the methods drawn, e.g.
-`--methods airsfl aircomp_fl hybrid_zf_aircomp digital_sflv1_zf digital_sflv1`.
+SNR of `snr`). `plots.py --methods ...` selects the methods drawn. Default: AirSFL, AirComp-FL,
+the two hybrids and digital SFL-V1 (ZF, OFDMA); Digital FedAvg is no longer drawn (add
+`digital_fedavg` to `--methods` to bring it back). Its FP32 runs still set the 95% target
+(else the FP32 digital SFL-V1 runs, which learn identically).
 
 `fig1e` draws the learning curves on a **linear** uplink-time axis (the style of Sun et al.,
 Fig. 2a/b) at 20 dB and at the lowest swept SNR: on the log axis of fig1 a per-round-time
