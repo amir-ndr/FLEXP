@@ -105,6 +105,8 @@ SWEEP_CURVES = {"axes": ["epochs", "uplink"], "xscale": "log"}   # fig2d / fig11
 ALSO = set()                # optional figures (--also): fig3b (uplink vs cut), fig11 (path-gain experiment)
 # figures also saved panel by panel (--panels) into <results>/paper_results/<key>/ (FP16 set; FP32: paper_results_q32)
 PANELS = {"figs": {"1e", "2c", "2_snr", "7"}, "dir": None}
+MAIN_SEEDS = {"seeds": None}   # --main-seeds: seeds of the 20 dB (main) points of every figure (None = all)
+TARGET_SRC = {"df": None}      # data set whose digital SFL-V1 runs (all seeds) set the 95% target (set in main)
 
 STYLE = {
     "airsfl":            dict(label="AirSFL (proposed)", color="#d62728", marker="o", lw=2.6, ls="-"),
@@ -503,10 +505,17 @@ def rule_target(df, scheme):
     return math.floor(100 * 0.95 * float(_curve(ref)["val_acc"].iloc[-1])) / 100.0
 
 
+def _main20(df):
+    """The 20 dB (main) runs restricted to --main-seeds (all seeds by default)."""
+    if MAIN_SEEDS["seeds"] is None or df.empty:
+        return df
+    return df[df.seed.astype(int).isin(MAIN_SEEDS["seeds"])]
+
+
 def targets_for(df, scheme):
     if TARGETS:
         return list(TARGETS)
-    A = rule_target(df, scheme)
+    A = rule_target(TARGET_SRC["df"] if TARGET_SRC["df"] is not None else df, scheme)
     return [A] if A is not None else []
 
 
@@ -589,13 +598,17 @@ def _save(fig, name):
     print(f"[fig] {name}")
 
 
-def _export_panels(fig, key, named_axes, hollow_note=False):
+def _export_panels(fig, key, named_axes, hollow_note=False, tables=None):
     """Also save every panel of a finished figure as its own file, <results>/<dir>/<key>/<name>.png
-    (+ .pdf): a copy of the figure keeps only that panel, exactly as drawn (title, axis labels,
-    markers), without the figure-wide title and legend, and gets its own legend below the axes."""
+    (+ .pdf, + <name>.csv with the plotted numbers when `tables` has them): a copy of the figure keeps
+    only that panel (title, axis labels, markers) and shows only the seed MEANS -- error bars and
+    seed bands removed, the sideways offsets of the final-accuracy panel undone -- without the
+    figure-wide title and legend, with its own legend below the axes."""
     if PANELS["dir"] is None or key not in PANELS["figs"]:
         return
     import pickle
+    from matplotlib.collections import PolyCollection
+    from matplotlib.container import ErrorbarContainer
     out = os.path.join(RESULTS, PANELS["dir"], key)
     os.makedirs(out, exist_ok=True)
     blob = pickle.dumps(fig)
@@ -613,7 +626,19 @@ def _export_panels(fig, key, named_axes, hollow_note=False):
             f._suptitle.set_visible(False)
         if ax.get_legend() is not None:
             ax.get_legend().remove()
+        for c in list(ax.containers):                 # seed min-max error bars -> means only
+            if isinstance(c, ErrorbarContainer):
+                for art in list(c.lines[1]) + list(c.lines[2]):
+                    art.remove()
+        for coll in list(ax.collections):             # seed min-max bands of the learning curves
+            if isinstance(coll, PolyCollection):
+                coll.remove()
+        for ln in ax.get_lines():                     # undo the sideways offsets (only needed for bars)
+            if getattr(ln, "_dodge", 0.0):
+                ln.set_xdata(np.asarray(ln.get_xdata(), dtype=float) - ln._dodge)
+        ax.set_title(ax.get_title().replace("(bars = seed min-max)", "(mean over seeds)"), fontsize=10.5)
         h, lab = ax.get_legend_handles_labels()
+        h = [x.lines[0] if isinstance(x, ErrorbarContainer) else x for x in h]
         if hollow_note and any(ln.get_linestyle() == "None" and str(ln.get_markerfacecolor()).lower() in ("white", "w")
                                for ln in ax.get_lines()):
             h.append(plt.Line2D([], [], marker="o", mfc="white", mec="k", ls=""))
@@ -626,8 +651,29 @@ def _export_panels(fig, key, named_axes, hollow_note=False):
         for ext in ("png", "pdf"):
             f.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=200)
         plt.close(f)
+        if tables is not None and name in tables and not tables[name].empty:
+            tables[name].to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.4g")
         n += 1
     print(f"[panels] {key}: {n} panels -> {out}")
+
+
+def _pivot_panel(t, index, value, labels, reached=None):
+    """A panel's plotted numbers: one row per x value, one column per method (seed means), optional
+    '<method> [reached]' columns (seeds that reached the target / seeds) and 'seeds' per row."""
+    t = t[t.method.isin(labels)]
+    if t.empty:
+        return pd.DataFrame()
+    out = t.pivot_table(index=index, columns="method", values=value, aggfunc="first", dropna=False)
+    out = out.reindex(columns=[c for c in labels if c in out.columns])
+    if reached:
+        r = t.pivot_table(index=index, columns="method", values=reached, aggfunc="first")
+        for c in labels:
+            if c in r.columns:
+                out[f"{c} [reached]"] = r[c]
+    if "seeds" in t:
+        out["seeds"] = t.groupby(index)["seeds"].agg(lambda v: f"{v.min()}" if v.min() == v.max()
+                                                    else f"{v.min()}-{v.max()}")
+    return out.reset_index()
 
 
 def _write_table(df, name, floatfmt=".4g"):
@@ -780,6 +826,8 @@ def fig1_and_table(main):
 
 def _snr_runs(main, snr, scheme, m, rho):
     base = main[(main.partition == scheme) & (main.method == m) & (main.rho_db == 20.0)]
+    if rho == 20.0:
+        base = _main20(base)                 # --main-seeds (digital points at other SNRs keep every seed)
     if m in DIGITAL:
         return base if base.empty else _retime(m, base, rho_db=rho)
     if rho == 20.0:
@@ -852,8 +900,9 @@ def fig2_snr(main, snr):
                              "activation NSR (dB)": nsr, "aggregation NSR (dB)": agg})
             if acc and m in dodge:
                 r, a, lo, hi = map(np.array, zip(*acc))
-                axes[i][0].errorbar(r + dodge[m], a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"],
-                                    ls=st["ls"], lw=st["lw"], capsize=3, label=_joint_label(m))
+                eb = axes[i][0].errorbar(r + dodge[m], a, yerr=[a - lo, hi - a], color=st["color"],
+                                         marker=st["marker"], ls=st["ls"], lw=st["lw"], capsize=3, label=_joint_label(m))
+                eb.lines[0]._dodge = dodge[m]        # the paper panel (means only) puts it back on the SNR
             for j, axis in ((1, "uplink"), (2, "training")):
                 ok = [(r, s) for r, s in tt[axis] if s["hit"] > 0]
                 if ok:
@@ -892,9 +941,24 @@ def fig2_snr(main, snr):
     fig.tight_layout()
     timed = axes[:, 1:]                      # every drawn method, ZF variants included, has its own entry there
     _fig_legend(fig, timed if any(ax.get_legend_handles_labels()[0] for ax in timed.ravel()) else axes, ncol=6)
+    tables = {}
+    if rows:
+        t2 = pd.DataFrame(rows)
+        acc_lab = {STYLE[m]["label"]: _joint_label(m) for m in acc_ms}
+        for scheme in schemes:
+            t = t2[t2.partition == PART_NAME[scheme]]
+            ta = t[t.method.isin(acc_lab)].assign(method=lambda v: v.method.map(acc_lab))
+            tables[f"{scheme}_final_accuracy"] = _pivot_panel(ta, "SNR (dB)", "final test acc (%)",
+                                                              list(acc_lab.values()))
+            for name, col in (("uplink_time_to_target", "UL time to target (s)"),
+                              ("training_time_to_target", "training time to target (s)")):
+                tt_ = _pivot_panel(t, "SNR (dB)", col, [STYLE[m]["label"] for m in ORDER], reached="reached")
+                if not tt_.empty:
+                    tt_.insert(1, "target val acc (%)", float(t["target val acc (%)"].iloc[0]))
+                tables[f"{scheme}_{name}"] = tt_
     _export_panels(fig, "2_snr", [(axes[i][j], f"{scheme}_{name}") for i, scheme in enumerate(schemes)
                                   for j, name in enumerate(("final_accuracy", "uplink_time_to_target",
-                                                            "training_time_to_target"))])
+                                                            "training_time_to_target"))], tables=tables)
     _save(fig, "fig2_snr")
     if rows:
         _write_table(pd.DataFrame(rows), "table_snr")
@@ -933,6 +997,7 @@ def fig2_snr(main, snr):
     # time at 20 dB), times each multiplier in BUDGET_MULTS (--budget-mult); one column each
     cols = [(axis, mult) for axis in ("uplink", "training") for mult in BUDGET_MULTS]
     rows = []
+    budget_of = {}                                   # (scheme, axis, mult) -> budget T of that panel
     fig, axes = plt.subplots(len(schemes), len(cols), figsize=(6 * len(cols), 4.5 * len(schemes)), squeeze=False)
     for i, scheme in enumerate(schemes):
         for j, (axis, mult) in enumerate(cols):
@@ -945,6 +1010,7 @@ def fig2_snr(main, snr):
                     continue
                 T = float(np.mean([g[xcol].iloc[-1] for g in _seed_runs(air)]))
             T *= mult
+            budget_of[(scheme, axis, mult)] = T
             for m in ORDER:
                 pts = []
                 for rho in rhos:
@@ -994,8 +1060,22 @@ def fig2_snr(main, snr):
     fig.legend(handles.values(), handles.keys(), loc="lower center", ncol=min(5, len(handles)), fontsize=8.5,
                bbox_to_anchor=(0.5, 0.0))
     fig.tight_layout(rect=(0, 0.07 if len(schemes) > 1 else 0.12, 1, 1))
+    tables = {}
+    if rows:
+        tb = pd.DataFrame(rows)
+        ef_lab = STYLE["airsfl_errfree"]["label"]
+        for (scheme, axis, mult), T in budget_of.items():
+            t = tb[(tb.partition == PART_NAME[scheme]) & (tb.axis == axis) & (tb["budget (s)"] == T)]
+            out = _pivot_panel(t[t.method != ef_lab], "SNR (dB)", "test acc at budget (%)",
+                               [STYLE[m]["label"] for m in ORDER])
+            if not out.empty:
+                ef_row = t[t.method == ef_lab]
+                if not ef_row.empty:
+                    out[ef_lab] = float(ef_row["test acc at budget (%)"].iloc[0])
+                out.insert(1, f"budget ({axis} s)", T)
+            tables[f"{scheme}_{axis}_budget_{mult:g}x"] = out
     _export_panels(fig, "2c", [(axes[i][j], f"{scheme}_{axis}_budget_{mult:g}x") for i, scheme in enumerate(schemes)
-                               for j, (axis, mult) in enumerate(cols)], hollow_note=True)
+                               for j, (axis, mult) in enumerate(cols)], hollow_note=True, tables=tables)
     _save(fig, "fig2c_acc_at_budget")
     if rows:
         _write_table(pd.DataFrame(rows), "table_budget")
@@ -1062,7 +1142,8 @@ def fig_sweep_curves(main, snr, pl):
                           f"Learning curves at every SNR ({_pl()}; digital learning is SNR-independent, its rate "
                           f"is not)",
                           schemes, [(f"rho = {r:g} dB", r) for r in rhos],
-                          lambda s, m, r: ef(s) if m == "airsfl_errfree" else _snr_runs(main, snr, s, m, r),
+                          lambda s, m, r: (_airsfl_error_free(_main20(main) if r == 20.0 else main, s)
+                                           if m == "airsfl_errfree" else _snr_runs(main, snr, s, m, r)),
                           axis, SWEEP_CURVES["xscale"])
     if not pl.empty:
         spreads = [0.0] + sorted(set(float(x) for x in pl.path_gain_spread_db))
@@ -1162,7 +1243,9 @@ def fig1e_linear_time(main, snr):
     snrs = LINEAR["snrs"] or ([20.0] + ([float(snr.rho_db.min())] if not snr.empty else []))
     fig, axes = plt.subplots(len(schemes), len(snrs), figsize=(6.6 * len(snrs), 4.7 * len(schemes)),
                              squeeze=False)
+    tables = {}
     for i, scheme in enumerate(schemes):
+        A = primary_target(main, scheme)
         xmax = LINEAR["xmax"]
         if xmax is None:                     # default: AirComp-FL's full run at 20 dB (fastest baseline)
             ends = [float(r.uplink_s.max()) for r in (_snr_runs(main, snr, scheme, m, 20.0)
@@ -1171,10 +1254,17 @@ def fig1e_linear_time(main, snr):
         for j, rho in enumerate(snrs):
             ax = axes[i][j]
             curves = [(m, _snr_runs(main, snr, scheme, m, rho)) for m in ORDER]
-            curves.append(("airsfl_errfree", _airsfl_error_free(main, scheme)))
+            curves.append(("airsfl_errfree", _airsfl_error_free(_main20(main) if rho == 20.0 else main, scheme)))
+            summary = []
             for m, run in curves:
                 if run.empty:
                     continue
+                s_ = ttt(run, A, "uplink_s")
+                summary.append({"method": STYLE[m]["label"], "seeds": s_["n"], "final test acc (%)": final_acc(run)[0],
+                                "UL s/round": float(run.ul_s_per_round.iloc[0]),
+                                "UL time of the full run (s)": float(np.mean([g.uplink_s.iloc[-1] for g in _seed_runs(run)])),
+                                "target val acc (%)": 100 * A if A else np.nan, "reached": f"{s_['hit']}/{s_['n']}",
+                                "UL time to target (s)": s_["t"]})
                 st = STYLE[m]
                 c = _plot_curve(ax, run, st, "uplink_s", first_round=0, markers=True,
                                 lw=1.6 if m == "airsfl_errfree" else None)
@@ -1186,13 +1276,19 @@ def fig1e_linear_time(main, snr):
             ax.set_xlabel(AXES["uplink"][1])
             ax.set_ylabel("Test accuracy (%)")
             ax.set_title(f"{PART_NAME[scheme]}, rho = {rho:g} dB", fontsize=10.5)
+            if summary:
+                t = pd.DataFrame(summary)
+                air = t[t.method == STYLE["airsfl"]["label"]]["UL time to target (s)"]
+                if len(air) and air.iloc[0] > 0:
+                    t["UL time to target / AirSFL"] = t["UL time to target (s)"] / float(air.iloc[0])
+                tables[f"{scheme}_snr{rho:g}"] = t
     fig.suptitle(f"Accuracy vs uplink time, linear axis, {_pl()} (same equal-period schedule for all methods: curves "
                  "differ by airtime per round and, at low SNR, by analog distortion; dotted = epoch budget used up)",
                  y=1.01, fontsize=10.5)
     fig.tight_layout()
     _fig_legend(fig, axes, ncol=4)
     _export_panels(fig, "1e", [(axes[i][j], f"{scheme}_snr{rho:g}") for i, scheme in enumerate(schemes)
-                               for j, rho in enumerate(snrs)])
+                               for j, rho in enumerate(snrs)], tables=tables)
     _save(fig, "fig1e_acc_vs_uplink_time_linear")
 
 
@@ -1522,8 +1618,10 @@ def fig6_time_to_target(main):
 def fig7_nsweep(main, nsweep):
     if nsweep.empty:
         return
-    allr = pd.concat([f for f in (main, nsweep) if not f.empty], ignore_index=True)
-    allr = allr[(allr.rho_db == 20.0) & (allr.tau == TAU0) & allr.cut.isin([CUT0, 0])]   # 0 = FL (no cut)
+    def frame(mn):
+        a = pd.concat([f for f in (mn, nsweep) if not f.empty], ignore_index=True)
+        return a[(a.rho_db == 20.0) & (a.tau == TAU0) & a.cut.isin([CUT0, 0])]   # 0 = FL (no cut)
+    allr, allr_t = frame(_main20(main)), frame(main)     # bars: --main-seeds at N = 30; targets: every seed
     Ns = tuple(sorted({int(n) for n in allr.N}))
     schemes = _schemes(allr)
     fig, axes = plt.subplots(2, len(schemes), figsize=(7.4 * len(schemes), 9.4), squeeze=False)
@@ -1532,10 +1630,11 @@ def fig7_nsweep(main, nsweep):
     rows = []
     for pi, scheme in enumerate(schemes):
         sub = allr[allr.partition == scheme]
+        sub_t = allr_t[allr_t.partition == scheme]
         if TARGETS:
             A = TARGETS[0]
         else:
-            tg = [rule_target(sub[sub.N == N], scheme) for N in Ns]
+            tg = [rule_target(sub_t[sub_t.N == N], scheme) for N in Ns]
             if any(t is None for t in tg):
                 continue
             A = min(tg)                      # common target reachable by every N
@@ -1554,6 +1653,7 @@ def fig7_nsweep(main, nsweep):
                     vals.append(s["t"])
                     if row == 0:
                         rows.append({"partition": PART_NAME[scheme], "N": N, "method": STYLE[m]["label"],
+                                     "seeds": s["n"],
                                      "UL s/round": float(dm.ul_s_per_round.iloc[0]),
                                      "training s/round": float(dm.e2e_s_per_round.iloc[0]),
                                      "target (%)": 100 * A, "reached": f"{s['hit']}/{s['n']}",
@@ -1575,8 +1675,18 @@ def fig7_nsweep(main, nsweep):
     axes[0][0].legend(fontsize=7.5, ncol=2, loc="upper left")
     fig.suptitle(f"Client count at fixed Nr=64 and W=1.8 MHz ({_pl()}): time to a common target", y=1.01, fontsize=11)
     fig.tight_layout()
+    tables = {}
+    if rows:
+        tn = pd.DataFrame(rows)
+        for scheme in schemes:
+            t = tn[tn.partition == PART_NAME[scheme]]
+            for axis, col in (("uplink", "UL time to target (s)"), ("training", "training time to target (s)")):
+                out = _pivot_panel(t, "N", col, [STYLE[m]["label"] for m in ORDER], reached="reached")
+                if not out.empty:
+                    out.insert(1, "target val acc (%)", float(t["target (%)"].iloc[0]))
+                tables[f"{scheme}_{axis}_time_to_target"] = out
     _export_panels(fig, "7", [(axes[row][pi], f"{scheme}_{axis}_time_to_target") for pi, scheme in enumerate(schemes)
-                              for row, axis in enumerate(("uplink", "training"))])
+                              for row, axis in enumerate(("uplink", "training"))], tables=tables)
     _save(fig, "fig7_nsweep")
     if rows:
         _write_table(pd.DataFrame(rows), "table_nsweep")
@@ -1924,6 +2034,10 @@ def main():
     p.add_argument("--panels", nargs="*", default=["1e", "2c", "2_snr", "7"], choices=["1e", "2c", "2_snr", "7"],
                    help="figures also saved panel by panel, one file per subfigure, into <results>/plots_fp<q>/"
                         "paper_results/<1e|2c|2_snr|7>/; --panels alone: none")
+    p.add_argument("--main-seeds", nargs="+", type=int, default=None,
+                   help="use only these seeds at the 20 dB (main) points of every figure, for all methods, e.g. 11 "
+                        "while the other seeds of main are missing (other SNRs / N keep all their seeds; the 95%% "
+                        "target always uses every seed)")
     p.add_argument("--also", nargs="+", default=[], choices=["fig3b", "fig11", "fig12"],
                    help="optional figures, off by default: fig3b (per-round uplink time vs cut, table_cuts), fig11 "
                         "(path-gain experiment: fig11, fig11b, table_pathloss; loads the pathloss runs) and fig12 "
@@ -1934,6 +2048,7 @@ def main():
                         "figures_snr<SNR>/ and tables_snr<SNR>/, e.g. --snr 20 -20")
     a = p.parse_args()
     ALSO.update(a.also)
+    MAIN_SEEDS["seeds"] = set(a.main_seeds) if a.main_seeds else None
     PANELS["figs"] = set(a.panels)
     BUDGET_MULTS[:] = a.budget_mult
     LINEAR.update(snrs=a.linear_snrs, xmax=a.linear_xmax)
@@ -1987,8 +2102,13 @@ def main():
         ENV0["q_bits"] = q
         x = sets[q]
         out = f"plots_fp{q}"                                # every output of one payload set in its own folder
+        TARGET_SRC["df"] = x["main"]                        # 95% target: all seeds of the set's digital SFL-V1
+        m20 = _main20(x["main"])                            # 20 dB-only figures: --main-seeds
         _report_missing(d, x, q)
-        _report_unpaired(x)
+        _report_unpaired({**x, "main": m20})
+        if MAIN_SEEDS["seeds"] is not None:
+            print(f"[plots] --main-seeds: every 20 dB (main) point uses seeds {sorted(MAIN_SEEDS['seeds'])} for all "
+                  f"methods; other SNRs / N keep all their seeds; the target uses every seed")
         _write_runs_used(x, os.path.join(RESULTS, out))
         for rho in a.snr:
             FIG = os.path.join(RESULTS, out, "figures" + ("" if rho == 20.0 else f"_snr{rho:g}"))
@@ -1999,18 +2119,18 @@ def main():
             if rho == 20.0:                  # nominal point: every figure, sweeps included
                 ENV0["rho_db"] = 20.0
                 fig3_breakdown()
-                fig4_overhead(x["main"])
-                fig1_and_table(x["main"])
-                fig2_snr(x["main"], x["snr"])
-                fig1e_linear_time(x["main"], x["snr"])
+                fig4_overhead(m20)
+                fig1_and_table(m20)
+                fig2_snr(x["main"], x["snr"])            # these take every seed and apply --main-seeds
+                fig1e_linear_time(x["main"], x["snr"])   # at their 20 dB points themselves
                 fig11_path_gains(x["main"], x["snr"], x["pathloss"])
                 fig_sweep_curves(x["main"], x["snr"], x["pathloss"])
-                fig5_nr(x["main"], x["nr"])
-                fig6_time_to_target(x["main"])
+                fig5_nr(m20, x["nr"])
+                fig6_time_to_target(m20)
                 fig7_nsweep(x["main"], x["nsweep"])
-                fig8_efficiency(x["main"])
-                fig9_cut_tau(x["main"], x["cuts"], x["tau"])
-                fig10_compute_regimes(x["main"])
+                fig8_efficiency(m20)
+                fig9_cut_tau(m20, x["cuts"], x["tau"])
+                fig10_compute_regimes(m20)
                 if "fig12" in ALSO:          # FP32 vs FP16 comparison: mixes the payloads by design
                     fig12_digital_transport({qq: sets[qq]["main"] for qq in (32, 16)})
                 continue
@@ -2030,7 +2150,7 @@ def main():
             fig6_time_to_target(main_rho)
             fig8_efficiency(main_rho)
             fig10_compute_regimes(main_rho)
-    ENV0["rho_db"], ENV0["q_bits"], PANELS["dir"] = 20.0, 16, None
+    ENV0["rho_db"], ENV0["q_bits"], PANELS["dir"], TARGET_SRC["df"] = 20.0, 16, None, None
     FIG, TAB = os.path.join(RESULTS, "plots_fp16", "figures"), os.path.join(RESULTS, "plots_fp16", "tables")
 
 

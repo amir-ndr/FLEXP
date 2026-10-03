@@ -5,4 +5,5 @@
 __pycache__/
 *.pyc
 slurm/logs/*
-!slurm/logs/.gitkeep
+!slurm/logs/.gitkeep# AirSFL experiment results (run CSVs, figures): kept out of git so "Discard All Changes" cannot delete them
+examples/AirSFL/results*/

@@ -189,10 +189,21 @@ from the SNR sweep at that SNR, digital ones retimed there) into `figures_snr-20
 Targets are the same for every SNR of one call; for an SNR where AirSFL's accuracy is lower,
 call it alone with its own `--targets` (it writes only its own folder).
 
+**Output folders**: every output of one payload set goes to its own folder,
+`<results>/plots_fp16/` (default) or `plots_fp32/` (`--digital-q 32`): `figures/`, `tables/`,
+`paper_results/`, the `--snr` folders (`figures_snr-20/`, ...) and `runs_used.csv` (every run file
+the set is drawn from, with its digital payload). AirSFL and AirComp-FL upload no digital tensors,
+so the same runs appear in both sets (their `q_bits` column is only the identity default 32).
+
 **Paper subfigures**: `plots.py` also saves every panel of fig1e, fig2c, fig2_snr and fig7 as its
-own PNG + PDF (own legend below the axes) into `<results>/paper_results/{1e,2c,2_snr,7}/`, named
-`<partition>_<panel>`, e.g. `2_snr/iid_final_accuracy.png`; FP16 set only (`--panels` chooses
-the figures, `--panels` alone turns it off).
+own PNG + PDF into `plots_fp16/paper_results/{1e,2c,2_snr,7}/`, named `<partition>_<panel>`,
+e.g. `2_snr/dirichlet_final_accuracy.png`: seed means only (no error bars or seed bands), own
+legend below the axes, and a `<name>.csv` with the plotted numbers (per point: seed means,
+`[reached]` = seeds that reached the target, `seeds`). `--panels` chooses the figures.
+
+**Seeds at 20 dB**: `--main-seeds 11` uses only those seeds at every 20 dB (main) point, for all
+methods, e.g. while the other seeds of `main` are missing; other SNRs and N keep all their
+seeds, and the 95% target always uses every seed of digital SFL-V1.
 
 **Learning curves of every sweep point**: `fig2d_curves_all_snr_<axis>` (every SNR) and
 `fig11b_curves_all_spreads_<axis>` (every spread) for all methods; `plots.py --sweep-curves
@@ -203,8 +214,10 @@ The two ZF digital baselines appear in every figure without runs of their own (d
 `digital_sflv1` / `sun_fdma_aircomp` runs of the same experiment, e.g. the hybrid at every
 SNR of `snr`). `plots.py --methods ...` selects the methods drawn. Default: AirSFL, AirComp-FL,
 the two hybrids and digital SFL-V1 (ZF, OFDMA); Digital FedAvg is no longer drawn (add
-`digital_fedavg` to `--methods` to bring it back). Its FP32 runs still set the 95% target
-(else the FP32 digital SFL-V1 runs, which learn identically).
+`digital_fedavg` to `--methods` to bring it back). The 95% target is 95% of the final validation
+accuracy of the set's digital SFL-V1 runs (all seeds; no channel noise). In the final-accuracy
+panel each ZF variant is drawn once with its OFDMA twin (identical learning). `plots.py` warns
+when the drawn methods do not have the same seeds at a point.
 
 `fig1e` draws the learning curves on a **linear** uplink-time axis (the style of Sun et al.,
 Fig. 2a/b) at 20 dB and at the lowest swept SNR: on the log axis of fig1 a per-round-time
