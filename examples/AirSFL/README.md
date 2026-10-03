@@ -189,6 +189,11 @@ from the SNR sweep at that SNR, digital ones retimed there) into `figures_snr-20
 Targets are the same for every SNR of one call; for an SNR where AirSFL's accuracy is lower,
 call it alone with its own `--targets` (it writes only its own folder).
 
+**Paper subfigures**: `plots.py` also saves every panel of fig1e, fig2c, fig2_snr and fig7 as its
+own PNG + PDF (own legend below the axes) into `<results>/paper_results/{1e,2c,2_snr,7}/`, named
+`<partition>_<panel>`, e.g. `2_snr/iid_final_accuracy.png`; FP16 set only (`--panels` chooses
+the figures, `--panels` alone turns it off).
+
 **Learning curves of every sweep point**: `fig2d_curves_all_snr_<axis>` (every SNR) and
 `fig11b_curves_all_spreads_<axis>` (every spread) for all methods; `plots.py --sweep-curves
 epochs uplink training` chooses the axes, `--curves-xscale linear` the time scale. At most 5

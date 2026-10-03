@@ -42,7 +42,8 @@ learning. Source-equivalent MB are counted at the drawn payload precision.
 Only CSVs of the current schema with the calibrated initial LR and augmentation setting
 (results/lr/chosen_lr.json, or --lr / --augment) and one epoch budget are loaded.
 
-Figures -> <results>/figures/, tables -> <results>/tables/:
+Figures -> <results>/figures/, tables -> <results>/tables/; fig1e, fig2c, fig2_snr and fig7 are also
+saved panel by panel (one file per subfigure) into <results>/paper_results/{1e,2c,2_snr,7}/ (--panels):
   fig1_acc_vs_uplink_time     test accuracy vs accumulated uplink time
   fig1c_acc_vs_training_time  test accuracy vs training time (uplink + computation)
   fig1b_acc_vs_epochs         test accuracy vs global-epoch equivalents (learning only)
@@ -52,7 +53,7 @@ Figures -> <results>/figures/, tables -> <results>/tables/:
                               digital SFL-V1 (ZF / OFDMA) at the lowest SNR and at 20 dB)
   fig2c_acc_at_budget         test accuracy reached within a fixed time budget vs SNR
   fig3_uplink_breakdown       per-round uplink phases vs N (analytic)
-  fig3b_uplink_vs_cut         per-round uplink time vs cut (analytic)
+  fig3b_uplink_vs_cut         per-round uplink time vs cut (analytic; only with --also fig3b)
   fig3c_round_time            per-round uplink + computation, and its composition (analytic)
   fig4_comm_overhead          source-equivalent MB vs airtime per round; GB to target
   fig5_nr                     AirSFL vs M-server antennas (if run)
@@ -61,7 +62,8 @@ Figures -> <results>/figures/, tables -> <results>/tables/:
   fig8_efficiency             time to target vs analog efficiency (0.4/0.6/0.7, ideal 1.0)
   fig9_cut_tau                time to target vs cut and vs tau (if run)
   fig10_compute_regimes       time to target: uplink only / edge-GPU / IoT-CPU (Sun et al.) devices
-  fig11_path_gains            unequal path gains (exp `pathloss`): accuracy, time to target, s/round vs spread
+  fig11_path_gains            unequal path gains (exp `pathloss`; only with --also fig11): accuracy, time to
+                              target, s/round vs spread (+ fig11b curves, table_pathloss)
   fig12_digital_transport     digital baselines: access (OFDMA / ZF) x payload (FP32 / FP16)
   fig2d_curves_all_snr_<axis>, fig11b_curves_all_spreads_<axis>
                               learning curves of all methods at every SNR / path-gain spread (--sweep-curves)
@@ -98,6 +100,9 @@ BUDGETS = {"uplink": None, "training": None}
 BUDGET_MULTS = [1.0]        # fig2c: budgets = base budget x each multiplier (--budget-mult)
 LINEAR = {"snrs": None, "xmax": None}   # fig1e: SNR panels and x range (--linear-snrs, --linear-xmax)
 SWEEP_CURVES = {"axes": ["epochs", "uplink"], "xscale": "log"}   # fig2d / fig11b (--sweep-curves, --curves-xscale)
+ALSO = set()                # optional figures (--also): fig3b (uplink vs cut), fig11 (path-gain experiment)
+# figures also saved panel by panel (--panels) into <results>/paper_results/<key>/ (FP16 set; FP32: paper_results_q32)
+PANELS = {"figs": {"1e", "2c", "2_snr", "7"}, "dir": None}
 
 STYLE = {
     "airsfl":            dict(label="AirSFL (proposed)", color="#d62728", marker="o", lw=2.6, ls="-"),
@@ -560,6 +565,47 @@ def _save(fig, name):
     print(f"[fig] {name}")
 
 
+def _export_panels(fig, key, named_axes, hollow_note=False):
+    """Also save every panel of a finished figure as its own file, <results>/<dir>/<key>/<name>.png
+    (+ .pdf): a copy of the figure keeps only that panel, exactly as drawn (title, axis labels,
+    markers), without the figure-wide title and legend, and gets its own legend below the axes."""
+    if PANELS["dir"] is None or key not in PANELS["figs"]:
+        return
+    import pickle
+    out = os.path.join(RESULTS, PANELS["dir"], key)
+    os.makedirs(out, exist_ok=True)
+    blob = pickle.dumps(fig)
+    n = 0
+    for ax0, name in named_axes:
+        if not ax0.has_data():
+            continue                                  # empty panel (e.g. no runs for that partition)
+        k = fig.axes.index(ax0)
+        f = pickle.loads(blob)
+        ax = f.axes[k]
+        for other in [a for a in f.axes if a is not ax]:
+            f.delaxes(other)
+        f.legends.clear()
+        if getattr(f, "_suptitle", None) is not None:
+            f._suptitle.set_visible(False)
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        h, lab = ax.get_legend_handles_labels()
+        if hollow_note and any(ln.get_linestyle() == "None" and str(ln.get_markerfacecolor()).lower() in ("white", "w")
+                               for ln in ax.get_lines()):
+            h.append(plt.Line2D([], [], marker="o", mfc="white", mec="k", ls=""))
+            lab.append("hollow marker: no evaluated checkpoint within the budget (initial model)")
+        if h:                                         # legend just below the x-axis label, never on the data
+            f.canvas.draw()
+            y0 = ax.get_tightbbox(f.canvas.get_renderer()).transformed(ax.transAxes.inverted()).y0
+            ax.legend(h, lab, loc="upper center", bbox_to_anchor=(0.5, y0 - 0.02), ncol=2, fontsize=8,
+                      frameon=False)
+        for ext in ("png", "pdf"):
+            f.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=200)
+        plt.close(f)
+        n += 1
+    print(f"[panels] {key}: {n} panels -> {out}")
+
+
 def _write_table(df, name, floatfmt=".4g"):
     os.makedirs(TAB, exist_ok=True)
     df.to_csv(os.path.join(TAB, f"{name}.csv"), index=False)
@@ -817,6 +863,9 @@ def fig2_snr(main, snr):
                                  "(x at the top = not reached)" if A else PART_NAME[scheme], fontsize=10.5)
     axes[0][0].legend(fontsize=8)
     fig.tight_layout()
+    _export_panels(fig, "2_snr", [(axes[i][j], f"{scheme}_{name}") for i, scheme in enumerate(schemes)
+                                  for j, name in enumerate(("final_accuracy", "uplink_time_to_target",
+                                                            "training_time_to_target"))])
     _save(fig, "fig2_snr")
     if rows:
         _write_table(pd.DataFrame(rows), "table_snr")
@@ -916,6 +965,8 @@ def fig2_snr(main, snr):
     fig.legend(handles.values(), handles.keys(), loc="lower center", ncol=min(5, len(handles)), fontsize=8.5,
                bbox_to_anchor=(0.5, 0.0))
     fig.tight_layout(rect=(0, 0.07 if len(schemes) > 1 else 0.12, 1, 1))
+    _export_panels(fig, "2c", [(axes[i][j], f"{scheme}_{axis}_budget_{mult:g}x") for i, scheme in enumerate(schemes)
+                               for j, (axis, mult) in enumerate(cols)], hollow_note=True)
     _save(fig, "fig2c_acc_at_budget")
     if rows:
         _write_table(pd.DataFrame(rows), "table_budget")
@@ -1111,6 +1162,8 @@ def fig1e_linear_time(main, snr):
                  y=1.01, fontsize=10.5)
     fig.tight_layout()
     _fig_legend(fig, axes, ncol=4)
+    _export_panels(fig, "1e", [(axes[i][j], f"{scheme}_snr{rho:g}") for i, scheme in enumerate(schemes)
+                               for j, rho in enumerate(snrs)])
     _save(fig, "fig1e_acc_vs_uplink_time_linear")
 
 
@@ -1195,38 +1248,39 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
     fig.tight_layout()
     _save(fig, "fig3_uplink_breakdown")
 
-    # 3b: per-round uplink time vs cut (N=30)
     r = _radio()
-    rows = []
-    fig, ax = plt.subplots(figsize=(11, 4.8))
-    wb = 0.8 / len(ORDER)
-    dims_all = profiled_dims(B0)
-    for j, m in enumerate(ORDER):
-        vals = []
-        for s in (1, 2, 3, 4):
-            b = uplink_time_breakdown(m, dims_all[s], r, tau, _rates(r))
-            c = _analytic_compute(m, stage=s)
-            vals.append(b["total"])
-            rows.append({"cut": s, "method": STYLE[m]["label"], "UL s/round": b["total"],
-                         "activation": b["activation"], "labels": b["labels"], "aggregation": b["aggregation"],
-                         "compute s/round (f_min=lo)": c["total"], "training s/round": b["total"] + c["total"],
-                         "d_c": dims_all[s]["d_c"], "d_s": dims_all[s]["d_s"], "d_a": dims_all[s]["d_a"],
-                         "tau*d_a < d_s": tau * dims_all[s]["d_a"] < dims_all[s]["d_s"],
-                         f"MB/round (FP{r.q_bits})": source_equivalent_mb_per_round(m, dims_all[s], r, tau,
-                                                                                    q_ref=r.q_bits)})
-        ax.bar(np.arange(4) + (j - (len(ORDER) - 1) / 2) * wb, vals, width=wb, color=STYLE[m]["color"],
-               edgecolor="k", lw=0.4, label=STYLE[m]["label"])
-    ax.set_yscale("log")
-    ax.set_ylim(0.5, 1e4)
-    ax.set_xticks(np.arange(4))
-    ax.set_xticklabels([f"cut {s}{' (default)' if s == stage else ''}\nd_a={dims_all[s]['d_a']/1e6:.2f}M\n"
-                        f"d_c={dims_all[s]['d_c']/1e6:.2f}M" for s in (1, 2, 3, 4)], fontsize=9)
-    ax.set_ylabel("Uplink seconds per round")
-    ax.set_title(f"Per-round uplink time vs cut (N=30, {ENV0['rho_db']:g} dB, {_pl()}): with equal analog efficiencies and\n"
-                 "negligible labels, AirSFL < AirComp-FL when tau*d_a < d_s", fontsize=10.5)
-    ax.legend(fontsize=8, ncol=4, loc="upper center")
-    _save(fig, "fig3b_uplink_vs_cut")
-    _write_table(pd.DataFrame(rows), "table_cuts")
+    # 3b: per-round uplink time vs cut (N=30) -- optional (plots.py --also fig3b)
+    if "fig3b" in ALSO:
+        rows = []
+        fig, ax = plt.subplots(figsize=(11, 4.8))
+        wb = 0.8 / len(ORDER)
+        dims_all = profiled_dims(B0)
+        for j, m in enumerate(ORDER):
+            vals = []
+            for s in (1, 2, 3, 4):
+                b = uplink_time_breakdown(m, dims_all[s], r, tau, _rates(r))
+                c = _analytic_compute(m, stage=s)
+                vals.append(b["total"])
+                rows.append({"cut": s, "method": STYLE[m]["label"], "UL s/round": b["total"],
+                             "activation": b["activation"], "labels": b["labels"], "aggregation": b["aggregation"],
+                             "compute s/round (f_min=lo)": c["total"], "training s/round": b["total"] + c["total"],
+                             "d_c": dims_all[s]["d_c"], "d_s": dims_all[s]["d_s"], "d_a": dims_all[s]["d_a"],
+                             "tau*d_a < d_s": tau * dims_all[s]["d_a"] < dims_all[s]["d_s"],
+                             f"MB/round (FP{r.q_bits})": source_equivalent_mb_per_round(m, dims_all[s], r, tau,
+                                                                                        q_ref=r.q_bits)})
+            ax.bar(np.arange(4) + (j - (len(ORDER) - 1) / 2) * wb, vals, width=wb, color=STYLE[m]["color"],
+                   edgecolor="k", lw=0.4, label=STYLE[m]["label"])
+        ax.set_yscale("log")
+        ax.set_ylim(0.5, 1e4)
+        ax.set_xticks(np.arange(4))
+        ax.set_xticklabels([f"cut {s}{' (default)' if s == stage else ''}\nd_a={dims_all[s]['d_a']/1e6:.2f}M\n"
+                            f"d_c={dims_all[s]['d_c']/1e6:.2f}M" for s in (1, 2, 3, 4)], fontsize=9)
+        ax.set_ylabel("Uplink seconds per round")
+        ax.set_title(f"Per-round uplink time vs cut (N=30, {ENV0['rho_db']:g} dB, {_pl()}): with equal analog efficiencies and\n"
+                     "negligible labels, AirSFL < AirComp-FL when tau*d_a < d_s", fontsize=10.5)
+        ax.legend(fontsize=8, ncol=4, loc="upper center")
+        _save(fig, "fig3b_uplink_vs_cut")
+        _write_table(pd.DataFrame(rows), "table_cuts")
 
     # 3c: per-round training time = uplink + computation, and its composition
     parts = [("client FP", "#c7e9c0"), ("activation UL", "#ff9896"), ("labels UL", "#ffbb78"),
@@ -1482,6 +1536,8 @@ def fig7_nsweep(main, nsweep):
     axes[0][0].legend(fontsize=7.5, ncol=2, loc="upper left")
     fig.suptitle(f"Client count at fixed Nr=64 and W=1.8 MHz ({_pl()}): time to a common target", y=1.01, fontsize=11)
     fig.tight_layout()
+    _export_panels(fig, "7", [(axes[row][pi], f"{scheme}_{axis}_time_to_target") for pi, scheme in enumerate(schemes)
+                              for row, axis in enumerate(("uplink", "training"))])
     _save(fig, "fig7_nsweep")
     if rows:
         _write_table(pd.DataFrame(rows), "table_nsweep")
@@ -1825,11 +1881,19 @@ def main():
                    help="load main/snr/... runs trained with this path-gain spread (dB; 0 = equal gains)")
     p.add_argument("--dirichlet-alpha", type=float, default=None,
                    help="Dirichlet concentration of the non-IID runs to load (default: the one in `main`)")
+    p.add_argument("--panels", nargs="*", default=["1e", "2c", "2_snr", "7"], choices=["1e", "2c", "2_snr", "7"],
+                   help="figures also saved panel by panel, one file per subfigure, into <results>/paper_results/"
+                        "<1e|2c|2_snr|7>/ (FP16 set; the FP32 set -> paper_results_q32/); --panels alone: none")
+    p.add_argument("--also", nargs="+", default=[], choices=["fig3b", "fig11"],
+                   help="optional figures, off by default: fig3b (per-round uplink time vs cut, table_cuts) and fig11 "
+                        "(path-gain experiment: fig11, fig11b, table_pathloss; loads the pathloss runs)")
     p.add_argument("--snr", nargs="+", type=float, default=[20.0],
                    help="operating SNR(s) of the main-point figures (fig1/1b/1c/1d, 3/3b/3c, 4, 6, 8, 10, table_main). "
                         "20 = the nominal set (all figures); any other swept SNR is rebuilt from the CSVs into "
                         "figures_snr<SNR>/ and tables_snr<SNR>/, e.g. --snr 20 -20")
     a = p.parse_args()
+    ALSO.update(a.also)
+    PANELS["figs"] = set(a.panels)
     BUDGET_MULTS[:] = a.budget_mult
     LINEAR.update(snrs=a.linear_snrs, xmax=a.linear_xmax)
     SWEEP_CURVES.update(axes=list(a.sweep_curves), xscale=a.curves_xscale)
@@ -1850,7 +1914,9 @@ def main():
     if a.server_tflops:
         COMPUTE["server_tflops"] = a.server_tflops
     skip = lambda e: ("path_gain_spread_db",) if e == "pathloss" else ()     # the spread is its sweep variable
-    d = {e: _filter(_read(e), skip(e)) for e in ("main", "snr", "nr", "nsweep", "cuts", "tau", "pathloss", "fp16")}
+    exps = ["main", "snr", "nr", "nsweep", "cuts", "tau", "fp16"] + (["pathloss"] if "fig11" in ALSO else [])
+    d = {e: _filter(_read(e), skip(e)) for e in exps}
+    d.setdefault("pathloss", pd.DataFrame())            # not loaded unless --also fig11
     budgets = sorted(set(d["main"].epochs_budget)) if not d["main"].empty else []
     FILTER["epochs_budget"] = a.epochs if a.epochs is not None else (
         float(d["main"].groupby("epochs_budget").run_id.nunique().idxmax()) if budgets else None)
@@ -1888,6 +1954,8 @@ def main():
             FIG = os.path.join(RESULTS, f"figures{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
             TAB = os.path.join(RESULTS, f"tables{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
             print(f"[plots] digital payload FP{q}, {rho:g} dB -> {FIG}, {TAB}")
+            # subfigure files of the nominal pass: FP16 -> paper_results/, FP32 -> paper_results_q32/
+            PANELS["dir"] = ("paper_results" + tag) if rho == 20.0 else None
             if rho == 20.0:                  # nominal point: every figure, sweeps included
                 ENV0["rho_db"] = 20.0
                 fig3_breakdown()
@@ -1921,7 +1989,7 @@ def main():
             fig6_time_to_target(main_rho)
             fig8_efficiency(main_rho)
             fig10_compute_regimes(main_rho)
-    ENV0["rho_db"], ENV0["q_bits"] = 20.0, 16
+    ENV0["rho_db"], ENV0["q_bits"], PANELS["dir"] = 20.0, 16, None
     FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
 
 

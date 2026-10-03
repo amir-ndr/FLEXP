@@ -35,7 +35,7 @@ copied, e.g. FP16 runs of --exp fp16 into main/), any changed setting produces a
   bench   seconds per round of both training engines (x deterministic / fast cuDNN)
   lr      LR calibration on the error-free digital reference (FedAvg, IID, FP32); the chosen
           initial LR is then used by ALL methods (refused if calibrated under another setup)
-  main    5 methods x {IID, Dirichlet-alpha (default 0.1, --dirichlet-alpha)} at 20 dB
+  main    4 methods (+ digital FedAvg with --methods) x {IID, Dirichlet-alpha (default 0.1)} at 20 dB
   snr     analog methods x SNR (default -20, -15, ..., 15 dB in 5 dB steps; 20 dB from main). Digital
           learning is SNR-independent (ideal decoding): only its time is recomputed in plots
   nsweep  5 methods x N in {20, 40} (N=30 from main)
@@ -482,7 +482,9 @@ def main():
     p = argparse.ArgumentParser(description="AirSFL vs baselines (CIFAR-10, ResNet-18 GN)")
     p.add_argument("--exp", nargs="+", default=["main"], choices=list(EXPERIMENTS))
     p.add_argument("--partition", nargs="+", default=["iid", "dirichlet"], choices=["iid", "dirichlet"])
-    p.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
+    p.add_argument("--methods", nargs="+", default=[m for m in METHODS if m != "digital_fedavg"], choices=METHODS,
+                   help="methods to train (default: all but digital FedAvg, which --exp lr still uses as the "
+                        "error-free reference; add digital_fedavg to train it)")
     p.add_argument("--epochs", type=float, default=TRAIN["epochs"], help="global-epoch equivalents")
     p.add_argument("--lr-epochs", type=float, default=LR_CAL_EPOCHS)
     p.add_argument("--lr", type=float, default=None, help="override the calibrated initial LR")
