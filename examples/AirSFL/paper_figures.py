@@ -39,6 +39,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# DATA setting (needs a rebuild, not --plot-only): target of fig3 (uplink time to target vs SNR)
+#   "common": the highest integer accuracy that EVERY drawn method reaches in EVERY seed at EVERY SNR, so
+#             every point has a value (no "not reached"); "rule": 95% of digital SFL-V1's final accuracy
+#             (the target of the other figures); or a number, e.g. 65 (= 65% validation accuracy)
+FIG3_TARGET = "common"
+
 # ---------------------------------------------------------------------------------------------------
 # FORMAT -- edit freely, then: python examples/AirSFL/paper_figures.py --results <folder> --plot-only
 # ---------------------------------------------------------------------------------------------------
@@ -105,7 +111,7 @@ def _seeds_txt(ns):
     return "" if not ns else (str(min(ns)) if min(ns) == max(ns) else f"{min(ns)}-{max(ns)}")
 
 
-def build_data(results, main_seeds, out):
+def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import plots as P
     P.MAIN_SEEDS["seeds"] = set(main_seeds) if main_seeds else None
@@ -145,8 +151,23 @@ def build_data(results, main_seeds, out):
             rows.append(row)
         return pd.DataFrame(rows)
 
-    def time_to_target_vs_snr(fig, scheme, xcol="training_time_s"):
-        A = P.primary_target(main, scheme)
+    def common_target(scheme):
+        """Highest integer accuracy every drawn method reaches (best validation checkpoint) in every seed
+        at every SNR."""
+        best = [float(g[g["round"] >= 1].val_acc.max()) for rho in rhos for m in TRAINED
+                for g in P._seed_runs(runs(scheme, m, rho))]
+        return math.floor(100 * min(best)) / 100
+
+    def target_of(scheme, setting):
+        if setting == "rule":
+            return P.primary_target(main, scheme)
+        if setting == "common":
+            return common_target(scheme)
+        v = float(setting)
+        return v / 100 if v > 1 else v
+
+    def time_to_target_vs_snr(fig, scheme, xcol="training_time_s", target="rule"):
+        A = target_of(scheme, target)
         rows = []
         for rho in rhos:
             row, ns = {"SNR (dB)": rho, "target val acc (%)": 100 * A}, []
@@ -239,11 +260,12 @@ def build_data(results, main_seeds, out):
             summary.to_csv(os.path.join(out, f"{name}_summary.csv"), index=False, float_format="%.6g")
         else:
             data = {"final_acc_vs_snr": final_acc_vs_snr,
-                    "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, xcol="uplink_s"),
+                    "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "uplink_s", fig3_target),
                     "training_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "training_time_s"),
                     "budget_vs_snr": budget_vs_snr, "time_to_target_vs_N": time_to_target_vs_N}[kind](name, scheme)
         data.to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.6g")
-        print(f"[data] {name}.csv")
+        tg = f" (target {data['target val acc (%)'].iloc[0]:g}%)" if "target val acc (%)" in data else ""
+        print(f"[data] {name}.csv{tg}")
     prov = pd.DataFrame(prov)
     prov.to_csv(os.path.join(out, "provenance.csv"), index=False)
     pay = prov[prov["digital payload"].str.startswith("FP")]["digital payload"].unique()
@@ -308,6 +330,7 @@ def plot_final_acc_vs_snr(df, out, name):
 
 def plot_time_to_target_vs_snr(df, out, name, axis="Training"):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    unreached = False
     for m in TRAINED:
         c = COLUMN[m]
         if c not in df:
@@ -322,16 +345,18 @@ def plot_time_to_target_vs_snr(df, out, name, axis="Training"):
             hit, n = (int(v) for v in r[f"{c} [reached]"].split("/"))
             if hit == 0:
                 _not_reached(ax, r["SNR (dB)"], st["color"])
+                unreached = True
             elif hit < n:
                 ax.annotate(f"{hit}/{n}", (r["SNR (dB)"], r[c]), textcoords="offset points", xytext=(4, 4),
                             fontsize=7, color=st["color"])
     ax.set_yscale("log")
-    lo, hi = ax.get_ylim()
-    ax.set_ylim(lo, hi * 10)                           # headroom: "not reached" x sits above the data
+    if unreached:                                      # headroom: the "not reached" x sits above the data
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi * 10)
     ax.set_xlabel(FORMAT["snr_label"])
     ax.set_ylabel(f"{axis} time to target (s)")
     _finish(fig, ax, out, name, f"{_part(name)}: {axis.lower()} time to {df['target val acc (%)'].iloc[0]:.0f}% "
-                                f"val. acc. (x = not reached)")
+                                f"val. acc." + (" (x = not reached)" if unreached else ""))
 
 
 def plot_budget_vs_snr(df, out, name):
@@ -439,10 +464,13 @@ def main():
     p.add_argument("--main-seeds", nargs="+", type=int, default=None,
                    help="seeds of the 20 dB (main) points, e.g. 11 while seeds 22/33 of main are missing")
     p.add_argument("--plot-only", action="store_true", help="redraw from finalz/*.csv (after a FORMAT change)")
+    p.add_argument("--fig3-target", default=FIG3_TARGET,
+                   help='fig3 target: "common" (default: highest accuracy every method reaches in every seed at every '
+                        'SNR), "rule" (95%% of digital SFL-V1, as the other figures) or a number such as 65')
     a = p.parse_args()
     out = os.path.join(os.path.abspath(a.results), "finalz")
     if not a.plot_only:
-        build_data(a.results, a.main_seeds, out)
+        build_data(a.results, a.main_seeds, out, a.fig3_target)
     plot_all(out)
 
 
