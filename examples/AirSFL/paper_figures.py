@@ -5,7 +5,7 @@ only (no error bars, no seed bands), written to <results>/finalz/ together with 
   fig1_noniid_final_accuracy_vs_snr            final test accuracy vs SNR (a ZF variant learns exactly
                                                like its OFDMA twin, so each pair is drawn once)
   fig2_noniid_accuracy_vs_uplink_time_20dB     test accuracy vs accumulated uplink time (linear), 20 dB
-  fig3_noniid_training_time_to_target_vs_snr   training time (uplink + computation) to the target vs SNR
+  fig3_noniid_uplink_time_to_target_vs_snr     uplink time to the target vs SNR
   fig4_noniid_accuracy_within_uplink_budget    test accuracy within AirSFL's full-run uplink time vs SNR
   fig5_noniid_uplink_time_to_target_vs_N       uplink time to a common target vs number of clients
   fig6_iid_accuracy_vs_uplink_time_20dB        as fig2, IID
@@ -55,6 +55,14 @@ FORMAT = dict(
     marker_size=6,
     curve_markers=8,             # markers per learning curve (fig2 / fig6)
     extend_curves=True,          # dotted line at the final accuracy after a run's epoch budget is used up
+    # fig2 / fig6 inset: the slow baselines over their WHOLE run (the main axis stops at AirComp-FL's run)
+    inset_methods=("sun_fdma_aircomp", "digital_sflv1"),   # () = no inset
+    inset_bounds={                                          # (left, bottom, width, height) in axes fractions
+        "fig2_noniid_accuracy_vs_uplink_time_20dB": (0.42, 0.45, 0.48, 0.30),
+        "fig6_iid_accuracy_vs_uplink_time_20dB": (0.42, 0.55, 0.48, 0.26),
+    },
+    inset_font=7.5,
+    inset_title="Full training",                            # "" = no title
     snr_label="Reference SNR $\\rho$ (dB)",
 )
 
@@ -80,7 +88,7 @@ TRAINED = list(METHODS)
 FIGS = {   # file name -> (partition, kind)
     "fig1_noniid_final_accuracy_vs_snr": ("dirichlet", "final_acc_vs_snr"),
     "fig2_noniid_accuracy_vs_uplink_time_20dB": ("dirichlet", "curves_20dB"),
-    "fig3_noniid_training_time_to_target_vs_snr": ("dirichlet", "time_to_target_vs_snr"),
+    "fig3_noniid_uplink_time_to_target_vs_snr": ("dirichlet", "uplink_time_to_target_vs_snr"),
     "fig4_noniid_accuracy_within_uplink_budget": ("dirichlet", "budget_vs_snr"),
     "fig5_noniid_uplink_time_to_target_vs_N": ("dirichlet", "time_to_target_vs_N"),
     "fig6_iid_accuracy_vs_uplink_time_20dB": ("iid", "curves_20dB"),
@@ -230,7 +238,9 @@ def build_data(results, main_seeds, out):
             data, summary = curves_20dB(name, scheme)
             summary.to_csv(os.path.join(out, f"{name}_summary.csv"), index=False, float_format="%.6g")
         else:
-            data = {"final_acc_vs_snr": final_acc_vs_snr, "time_to_target_vs_snr": time_to_target_vs_snr,
+            data = {"final_acc_vs_snr": final_acc_vs_snr,
+                    "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, xcol="uplink_s"),
+                    "training_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "training_time_s"),
                     "budget_vs_snr": budget_vs_snr, "time_to_target_vs_N": time_to_target_vs_N}[kind](name, scheme)
         data.to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.6g")
         print(f"[data] {name}.csv")
@@ -382,12 +392,37 @@ def plot_curves(df, out, name):
         ax.set_xlim(0, xmax)
     ax.set_xlabel("Accumulated uplink communication time (s)")
     ax.set_ylabel("Test accuracy (%)")
+    if FORMAT["inset_methods"] and name in FORMAT["inset_bounds"]:
+        _inset_full_runs(ax, df, FORMAT["inset_bounds"][name])
     _finish(fig, ax, out, name, f"{_part(name)}, $\\rho$ = 20 dB")
+
+
+def _inset_full_runs(ax, df, bounds):
+    """Small box inside the axes with the whole run of the slow baselines (same colors and line styles
+    as the main plot; uplink time in thousands of seconds: 0, 50k, 100k, 150k)."""
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+    ins = ax.inset_axes(bounds)
+    for m in FORMAT["inset_methods"]:
+        c = df[df.method == COLUMN[m]].sort_values("round")
+        if c.empty:
+            continue
+        st = _style(m)
+        ins.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=max(1.0, 0.7 * st["lw"]))
+    ins.set_xlim(0, None)
+    ins.xaxis.set_major_locator(MaxNLocator(4))
+    ins.xaxis.set_major_formatter(FuncFormatter(lambda v, _: "0" if v == 0 else f"{v / 1000:g}k"))
+    ins.yaxis.set_major_locator(MaxNLocator(4))
+    ins.tick_params(labelsize=FORMAT["inset_font"])
+    ins.grid(True, alpha=FORMAT["grid_alpha"])
+    if FORMAT["inset_title"]:
+        ins.set_title(FORMAT["inset_title"], fontsize=FORMAT["inset_font"], pad=2)
 
 
 def plot_all(out):
     plt.rcParams.update({"font.size": FORMAT["font"]})
-    draw = {"final_acc_vs_snr": plot_final_acc_vs_snr, "time_to_target_vs_snr": plot_time_to_target_vs_snr,
+    draw = {"final_acc_vs_snr": plot_final_acc_vs_snr,
+            "uplink_time_to_target_vs_snr": lambda d, o, n: plot_time_to_target_vs_snr(d, o, n, axis="Uplink"),
+            "training_time_to_target_vs_snr": lambda d, o, n: plot_time_to_target_vs_snr(d, o, n, axis="Training"),
             "budget_vs_snr": plot_budget_vs_snr, "time_to_target_vs_N": plot_time_to_target_vs_N,
             "curves_20dB": plot_curves}
     for name, (_, kind) in FIGS.items():
