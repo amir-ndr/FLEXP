@@ -1991,6 +1991,55 @@ def fig12_digital_transport(sets):
     _write_table(pd.DataFrame(rows), "table_digital_transport")
 
 
+def load_results(results=None, lr=None, augment=None, epochs=None, dirichlet_alpha=None, path_gain_spread=0.0,
+                 client_tflops=None, server_tflops=None):
+    """Read every experiment of a results folder and apply the campaign filters (calibrated LR and
+    augmentation from lr/chosen_lr.json, one epoch budget, one Dirichlet alpha, the path-gain
+    spread), the optional computation recompute and the derived ZF baselines. Returns
+    ({experiment: DataFrame}, recomputed?). Sets RESULTS / FILTER / COMPUTE / PART_NAME. Used by
+    main() and by paper_figures.py."""
+    global RESULTS, FIG, TAB
+    FILTER["path_gain_spread_db"] = float(path_gain_spread)
+    if results:
+        RESULTS = os.path.abspath(results)
+        FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
+    cal_path = os.path.join(RESULTS, "lr", "chosen_lr.json")
+    cal = json.load(open(cal_path)) if os.path.exists(cal_path) else {}
+    FILTER["base_lr"] = lr if lr is not None else (float(cal["lr"]) if "lr" in cal else None)
+    FILTER["augment"] = (augment == "on") if augment else cal.get("augment")
+    recompute = client_tflops is not None or server_tflops is not None
+    if client_tflops:
+        COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"] = client_tflops
+    if server_tflops:
+        COMPUTE["server_tflops"] = server_tflops
+    skip = lambda e: ("path_gain_spread_db",) if e == "pathloss" else ()     # the spread is its sweep variable
+    exps = ["main", "snr", "nr", "nsweep", "cuts", "tau", "fp16"] + (["pathloss"] if "fig11" in ALSO else [])
+    d = {e: _filter(_read(e), skip(e)) for e in exps}
+    d.setdefault("pathloss", pd.DataFrame())            # not loaded unless --also fig11
+    budgets = sorted(set(d["main"].epochs_budget)) if not d["main"].empty else []
+    FILTER["epochs_budget"] = epochs if epochs is not None else (
+        float(d["main"].groupby("epochs_budget").run_id.nunique().idxmax()) if budgets else None)
+    if len(budgets) > 1 and epochs is None:
+        print(f"[plots] WARNING: `main` holds epoch budgets {budgets}; using {FILTER['epochs_budget']} "
+              f"(choose with --epochs)")
+    d = {e: _filter(df, skip(e)) for e, df in d.items()}
+    m0 = d["main"]
+    dir_alphas = (pd.to_numeric(m0.loc[m0.partition == "dirichlet", "dirichlet_alpha"], errors="coerce").dropna()
+                  if not m0.empty and "dirichlet_alpha" in m0 else pd.Series(dtype=float))
+    alpha = dirichlet_alpha if dirichlet_alpha is not None else (
+        float(dir_alphas.round(6).mode().iloc[0]) if len(dir_alphas) else None)
+    if len(set(dir_alphas.round(6))) > 1 and dirichlet_alpha is None:
+        print(f"[plots] WARNING: `main` holds Dirichlet alphas {sorted(set(dir_alphas.round(6)))}; using {alpha:g} "
+              f"(choose with --dirichlet-alpha)")
+    if alpha is not None:
+        d = {e: _keep_alpha(df, alpha) for e, df in d.items()}
+        PART_NAME["dirichlet"] = f"Non-IID (Dir-{alpha:g})"
+    if recompute:
+        d = {e: _apply_compute(df) for e, df in d.items()}
+    d = {e: _derive(df) for e, df in d.items()}
+    return d, recompute
+
+
 def main():
     import argparse
     global RESULTS, FIG, TAB, TARGETS
@@ -2053,47 +2102,11 @@ def main():
     BUDGET_MULTS[:] = a.budget_mult
     LINEAR.update(snrs=a.linear_snrs, xmax=a.linear_xmax)
     SWEEP_CURVES.update(axes=list(a.sweep_curves), xscale=a.curves_xscale)
-    FILTER["path_gain_spread_db"] = float(a.path_gain_spread)
-    if a.results:
-        RESULTS = os.path.abspath(a.results)
-        FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
     TARGETS = a.targets
     ORDER[:] = [m for m in ALL_METHODS + EXTRA_METHODS if m in a.methods]
     BUDGETS["uplink"], BUDGETS["training"] = a.budget_uplink, a.budget_training
-    cal_path = os.path.join(RESULTS, "lr", "chosen_lr.json")
-    cal = json.load(open(cal_path)) if os.path.exists(cal_path) else {}
-    FILTER["base_lr"] = a.lr if a.lr is not None else (float(cal["lr"]) if "lr" in cal else None)
-    FILTER["augment"] = (a.augment == "on") if a.augment else cal.get("augment")
-    recompute = a.client_tflops is not None or a.server_tflops is not None
-    if a.client_tflops:
-        COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"] = a.client_tflops
-    if a.server_tflops:
-        COMPUTE["server_tflops"] = a.server_tflops
-    skip = lambda e: ("path_gain_spread_db",) if e == "pathloss" else ()     # the spread is its sweep variable
-    exps = ["main", "snr", "nr", "nsweep", "cuts", "tau", "fp16"] + (["pathloss"] if "fig11" in ALSO else [])
-    d = {e: _filter(_read(e), skip(e)) for e in exps}
-    d.setdefault("pathloss", pd.DataFrame())            # not loaded unless --also fig11
-    budgets = sorted(set(d["main"].epochs_budget)) if not d["main"].empty else []
-    FILTER["epochs_budget"] = a.epochs if a.epochs is not None else (
-        float(d["main"].groupby("epochs_budget").run_id.nunique().idxmax()) if budgets else None)
-    if len(budgets) > 1 and a.epochs is None:
-        print(f"[plots] WARNING: `main` holds epoch budgets {budgets}; using {FILTER['epochs_budget']} "
-              f"(choose with --epochs)")
-    d = {e: _filter(df, skip(e)) for e, df in d.items()}
-    m0 = d["main"]
-    dir_alphas = (pd.to_numeric(m0.loc[m0.partition == "dirichlet", "dirichlet_alpha"], errors="coerce").dropna()
-                  if not m0.empty and "dirichlet_alpha" in m0 else pd.Series(dtype=float))
-    alpha = a.dirichlet_alpha if a.dirichlet_alpha is not None else (
-        float(dir_alphas.round(6).mode().iloc[0]) if len(dir_alphas) else None)
-    if len(set(dir_alphas.round(6))) > 1 and a.dirichlet_alpha is None:
-        print(f"[plots] WARNING: `main` holds Dirichlet alphas {sorted(set(dir_alphas.round(6)))}; using {alpha:g} "
-              f"(choose with --dirichlet-alpha)")
-    if alpha is not None:
-        d = {e: _keep_alpha(df, alpha) for e, df in d.items()}
-        PART_NAME["dirichlet"] = f"Non-IID (Dir-{alpha:g})"
-    if recompute:
-        d = {e: _apply_compute(df) for e, df in d.items()}
-    d = {e: _derive(df) for e, df in d.items()}
+    d, recompute = load_results(a.results, a.lr, a.augment, a.epochs, a.dirichlet_alpha, a.path_gain_spread,
+                                a.client_tflops, a.server_tflops)
     print(f"[plots] results={RESULTS} | filter {FILTER} | compute {COMPUTE} "
           f"({'recomputed' if recompute else 'as stored'}) | targets = "
           f"{TARGETS or 'rule (95% of the error-free reference)'} | methods {ORDER}")
