@@ -30,20 +30,22 @@ real runs in flsim.airsfl.checks). --methods selects which methods are drawn.
 
 Digital payload (--digital-q, default 16 = FP16): the methods that upload tensors digitally
 (digital SFL-V1, the hybrid, digital FedAvg and their ZF variants) are drawn from their runs
-with that payload (FP16: really rounded uploads, timed with q = 16 bits) -- FP16 -> figures/,
-tables/; FP32 (--digital-q 32) -> figures_q32/, tables_q32/; --digital-q 16 32 draws both.
-FP16 runs come from each experiment's folder and, for main / snr, also from fp16/ (--exp fp16).
-AirSFL and AirComp-FL upload only labels digitally: the same runs serve both payloads. In both
-sets the exact FP32 digital SFL-V1 is the error-free reference and the FP32 FedAvg the
-reference of the target rule (the drawn runs if the FP32 ones are absent). A point whose
-payload runs are missing is listed and left out -- never filled with the other payload's
-learning. Source-equivalent MB are counted at the drawn payload precision.
+with that payload (FP16: really rounded uploads, timed with q = 16 bits). Each payload set is
+self-contained and written to its own folder: FP16 -> <results>/plots_fp16/, FP32 (--digital-q
+32) -> <results>/plots_fp32/, each with figures/, tables/, paper_results/, the --snr folders and
+runs_used.csv (every run file drawn). FP16 runs come from each experiment's folder and, for
+main / snr, also from fp16/ (--exp fp16). AirSFL and AirComp-FL upload no digital tensors
+(AirSFL only labels), so the same runs serve both payloads (their q_bits column is only the
+identity default 32). The error-free curve and the target rule use the set's own digital SFL-V1
+runs. A point whose payload runs are missing is listed and left out -- never filled with the
+other payload's learning. Source-equivalent MB are counted at the drawn payload precision.
 
 Only CSVs of the current schema with the calibrated initial LR and augmentation setting
 (results/lr/chosen_lr.json, or --lr / --augment) and one epoch budget are loaded.
 
-Figures -> <results>/figures/, tables -> <results>/tables/; fig1e, fig2c, fig2_snr and fig7 are also
-saved panel by panel (one file per subfigure) into <results>/paper_results/{1e,2c,2_snr,7}/ (--panels):
+Figures -> <results>/plots_fp16/figures/, tables -> <results>/plots_fp16/tables/ (FP32 set: plots_fp32/);
+fig1e, fig2c, fig2_snr and fig7 are also saved panel by panel (one file per subfigure) into
+<results>/plots_fp16/paper_results/{1e,2c,2_snr,7}/ (--panels):
   fig1_acc_vs_uplink_time     test accuracy vs accumulated uplink time
   fig1c_acc_vs_training_time  test accuracy vs training time (uplink + computation)
   fig1b_acc_vs_epochs         test accuracy vs global-epoch equivalents (learning only)
@@ -64,7 +66,7 @@ saved panel by panel (one file per subfigure) into <results>/paper_results/{1e,2
   fig10_compute_regimes       time to target: uplink only / edge-GPU / IoT-CPU (Sun et al.) devices
   fig11_path_gains            unequal path gains (exp `pathloss`; only with --also fig11): accuracy, time to
                               target, s/round vs spread (+ fig11b curves, table_pathloss)
-  fig12_digital_transport     digital baselines: access (OFDMA / ZF) x payload (FP32 / FP16)
+  fig12_digital_transport     digital baselines: access (OFDMA / ZF) x payload (FP32 / FP16) (--also fig12)
   fig2d_curves_all_snr_<axis>, fig11b_curves_all_spreads_<axis>
                               learning curves of all methods at every SNR / path-gain spread (--sweep-curves)
   fig1d_acc_vs_training_time_iot  accuracy vs training time with IoT-CPU devices
@@ -139,7 +141,6 @@ DIGITAL = ("digital_sflv1", "digital_fedavg", "digital_sflv1_zf", "digital_fedav
 ENV0 = dict(N=30, Nr=64, Nr_F=64, S=120, eps_D=0.6, eps_U=0.6, eps_A=0.6, rho_db=20.0, batch_size=16, q_bits=16)
 FP16_PARENTS = ("digital_sflv1", "sun_fdma_aircomp", "digital_fedavg")   # trained methods with digital payloads
 PAYLOAD_METHODS = FP16_PARENTS + tuple(DERIVED)       # drawn from their runs with the chosen payload
-REFS = ("errfree_ref", "target_ref")                  # FP32 digital SFL-V1 / FedAvg kept as references
 TAU0, CUT0, B0 = 5, 2, 16
 AXES = {"uplink": ("uplink_s", "Accumulated uplink communication time (s)"),
         "training": ("training_time_s", "Training time: uplink + computation (s)")}
@@ -158,7 +159,7 @@ def _read(exp):
         d = pd.read_csv(f)
         if "schema" not in d or int(d["schema"].iloc[0]) != SCHEMA:
             continue                                    # older experiment generation: ignore
-        dfs.append(d)
+        dfs.append(d.assign(source_file=os.path.relpath(f, RESULTS)))
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
@@ -295,11 +296,10 @@ def _select_payload(d, q):
     """The data sets drawn with a q-bit digital payload. Methods that upload tensors digitally
     (PAYLOAD_METHODS) keep only their q-bit runs: for q = 16 those in each experiment's folder
     plus, for main / snr, the runs of --exp fp16 (20 dB -> main, other SNRs -> snr); a run found
-    in two folders (same run_id) counts once. AirSFL / AirComp-FL keep their runs (trained with
-    the FP32 identity; their training and timing do not depend on q). Each experiment's FP32
-    digital SFL-V1 / FedAvg runs are added as "errfree_ref" / "target_ref" -- the exact
-    error-free reference and the reference of the target rule -- so both payload sets share
-    the same targets and the same upper bound."""
+    in two folders (same run_id) counts once. AirSFL / AirComp-FL keep their runs: they upload no
+    digital tensors (AirSFL only labels), so one run serves both payloads (its q_bits column is just
+    the identity default 32). Each set is self-contained: its error-free curve and target rule use
+    that set's own digital SFL-V1 runs (FP16 rounding, -74 dB, leaves the final accuracy unchanged)."""
     fp = d.get("fp16", pd.DataFrame())
     out = {}
     for e, df in d.items():
@@ -317,11 +317,6 @@ def _select_payload(d, q):
         if q == 16 and not fp.empty and e in ("main", "snr"):
             f = fp[fp.method.isin(PAYLOAD_METHODS) & (_q_col(fp) == 16)]
             parts.append(f[f.rho_db == 20.0] if e == "main" else f[f.rho_db != 20.0])
-        exact = df[qc == 32]
-        for m, ref in (("digital_sflv1", "errfree_ref"), ("digital_fedavg", "target_ref")):
-            r = exact[exact.method == m]
-            if not r.empty:
-                parts.append(r.assign(method=ref, run_id=r.run_id.astype(str) + "|" + ref))
         parts = [x for x in parts if not x.empty]
         sel = pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0]
         out[e] = sel.drop_duplicates(subset=["run_id", "round"]).reset_index(drop=True)
@@ -335,13 +330,14 @@ def _report_missing(d, sel, q):
     """List the trained digital-payload runs that exist with another payload but not with q:
     those points are left out of the q-bit figures (never replaced by the other payload)."""
     groups = {}
+    drawn = [m for m in FP16_PARENTS if m in ORDER or any(DERIVED.get(x) == m for x in ORDER)]
     for e, df in d.items():
         if e == "fp16" or df.empty:
             continue
         cols = [c for c in _KEY if c in df]
         keys = lambda x: set(map(tuple, x[cols].drop_duplicates().itertuples(index=False, name=None)))
-        have = sel[e][sel[e].method.isin(FP16_PARENTS)] if not sel[e].empty else sel[e]
-        want = df[df.method.isin(FP16_PARENTS) & (_q_col(df) != q)]
+        have = sel[e][sel[e].method.isin(drawn)] if not sel[e].empty else sel[e]
+        want = df[df.method.isin(drawn) & (_q_col(df) != q)]
         for k in sorted(keys(want) - (keys(have) if not have.empty else set())):
             r = dict(zip(cols, k))
             groups.setdefault((e, r["method"]), []).append(
@@ -355,16 +351,47 @@ def _report_missing(d, sel, q):
               f"the FP{q} figures (train them with run_airsfl.py --digital-q {q}; finished runs are skipped):")
         for (e, m), pts in sorted(groups.items()):
             print(f"    {e:9s} {m:17s} {len(pts):3d} run(s): " + "; ".join(pts[:6]) + (" ..." if len(pts) > 6 else ""))
-    main = sel.get("main", pd.DataFrame())
-    if q == 32 or main.empty:
-        return                                  # FP32 set: a missing FP32 run is already listed above
-    seeds = lambda m: set(zip(main.partition[main.method == m], main.seed[main.method == m].astype(int)))
-    for ref, src, what in (("errfree_ref", "digital_sflv1", "error-free curve"),
-                           ("target_ref", "digital_fedavg", "target rule")):
-        gap = sorted(seeds("airsfl") - seeds(ref))
-        if gap:
-            print(f"[plots] FP32 {src} run (main) missing for {gap}: the {what} uses the other seeds "
-                  f"(train it with run_airsfl.py --digital-q 32)")
+
+
+def _write_runs_used(x, out):
+    """<out>/runs_used.csv: every run file the figures of one payload set are drawn from."""
+    frames = []
+    for e, df in x.items():
+        if df.empty or "source_file" not in df:
+            continue
+        g = df[df.method.isin([m for m in ORDER if m not in DERIVED])]
+        cols = [c for c in ("method", "partition", "seed", "rho_db", "N", "run_id", "source_file") if c in g]
+        g = g[cols].drop_duplicates("run_id").assign(experiment=e)
+        g["digital payload"] = [f"FP{_q_of(r)}" if r["method"] in PAYLOAD_METHODS else
+                                ("labels only" if r["method"] in SPLIT_METHODS else "none")
+                                for _, r in df.loc[g.index].iterrows()]
+        frames.append(g)
+    if frames:
+        os.makedirs(out, exist_ok=True)
+        t = pd.concat(frames, ignore_index=True).sort_values(["experiment", "method", "partition", "rho_db", "N", "seed"])
+        t.to_csv(os.path.join(out, "runs_used.csv"), index=False)
+        print(f"[plots] {len(t)} runs -> {os.path.join(out, 'runs_used.csv')}")
+
+
+def _report_unpaired(x):
+    """Warn when the drawn methods do not have the same seeds at the same point: their means would mix
+    seeds (partitions), and paired ratios use only the common ones."""
+    lines = []
+    for e in ("main", "snr", "nsweep"):
+        df = x.get(e, pd.DataFrame())
+        if df.empty:
+            continue
+        keep = [m for m in ORDER if m not in DERIVED]
+        df = df[df.method.isin(keep)]
+        for (part, rho, N), g in df.groupby(["partition", "rho_db", "N"]):
+            seeds = {m: tuple(sorted(set(g.seed[g.method == m].astype(int)))) for m in sorted(set(g.method))}
+            if len(set(seeds.values())) > 1:
+                lines.append(f"    {e:7s} {part:9s} {rho:g} dB N={int(N)}: "
+                             + ", ".join(f"{m} {list(v)}" for m, v in seeds.items()))
+    if lines:
+        print("[plots] WARNING: methods with different seeds at the same point (means mix partitions; paired "
+              "ratios use the common seeds):")
+        print("\n".join(lines))
 
 
 def _payload_of(m, run):
@@ -407,10 +434,9 @@ def _airsfl_error_free(main, scheme):
     """Noise-free AirSFL = digital SFL-V1's learning trajectory (bitwise identical, see checks)
     placed on AirSFL's per-round uplink time: the error-free upper bound. The computation per
     round of the two is identical for a seed (same cut, same client draws), so each seed keeps
-    its own. `main` holds one operating SNR (20 dB, or the one chosen with --snr). The exact FP32
-    digital SFL-V1 runs ("errfree_ref", _select_payload) are used whatever the drawn payload."""
-    ref = "errfree_ref" if (main.method == "errfree_ref").any() else "digital_sflv1"
-    dig = main[(main.partition == scheme) & (main.method == ref)]
+    its own. `main` holds one operating SNR (20 dB, or the one chosen with --snr) and one payload set
+    (its own digital SFL-V1 runs)."""
+    dig = main[(main.partition == scheme) & (main.method == "digital_sflv1")]
     air = main[(main.partition == scheme) & (main.method == "airsfl")]
     if dig.empty or air.empty:
         return pd.DataFrame()
@@ -421,13 +447,11 @@ def _airsfl_error_free(main, scheme):
 def _main_at(main, snr, rho):
     """The operating-point data set at SNR rho, from the CSVs: analog methods from the SNR sweep
     at rho (ZF hybrid derived from its runs), digital methods (SNR-independent learning)
-    retimed at rho, plus the error-free / target references. rho = 20 dB is `main` itself."""
+    retimed at rho. rho = 20 dB is `main` itself."""
     if rho == 20.0:
         return main
     frames = [r for scheme in _schemes(main) for m in ALL_METHODS
               for r in [_snr_runs(main, snr, scheme, m, rho)] if not r.empty]
-    frames.append(main[main.method.isin(REFS)])
-    frames = [f for f in frames if not f.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -468,11 +492,11 @@ def _seed_txt(n):
 
 
 def rule_target(df, scheme):
-    """95% rule on the error-free reference: the FP32 FedAvg runs, else the FP32 digital SFL-V1 runs
-    (identical learning: exact transport makes SFL-V1 full-model SGD), else the drawn ones."""
+    """95% rule on the error-free reference: the set's digital SFL-V1 runs (no channel noise), else
+    its digital FedAvg runs (same learning: exact transport makes SFL-V1 full-model SGD)."""
     sub = df[df.partition == scheme]
     have = set(sub.method)
-    m = next((k for k in ("target_ref", "digital_fedavg", "errfree_ref", "digital_sflv1") if k in have), None)
+    m = next((k for k in ("digital_sflv1", "digital_fedavg") if k in have), None)
     ref = sub[sub.method == m] if m else sub.iloc[0:0]
     if ref.empty:
         return None
@@ -794,6 +818,10 @@ def fig2_snr(main, snr):
     rhos = sorted(set([20.0] + ([] if snr.empty else list(snr.rho_db.unique()))))
     rows = []
     fig, axes = plt.subplots(len(schemes), 3, figsize=(17, 4.4 * len(schemes)), squeeze=False)
+    # final accuracy: a ZF variant learns exactly like its OFDMA parent, so the pair is drawn once with a
+    # joint label; the series are shifted slightly sideways so their seed bars do not hide each other
+    acc_ms = [m for m in ORDER if not (m in DERIVED and DERIVED[m] in ORDER)]
+    dodge = {m: (k - (len(acc_ms) - 1) / 2) * 0.35 for k, m in enumerate(acc_ms)}
     for i, scheme in enumerate(schemes):
         A = primary_target(main, scheme)
         allacc = []
@@ -822,10 +850,10 @@ def fig2_snr(main, snr):
                              "target val acc (%)": 100 * A if A else np.nan, "reached": f"{su['hit']}/{su['n']}",
                              "UL time to target (s)": su["t"], "training time to target (s)": sr["t"],
                              "activation NSR (dB)": nsr, "aggregation NSR (dB)": agg})
-            if acc:
+            if acc and m in dodge:
                 r, a, lo, hi = map(np.array, zip(*acc))
-                axes[i][0].errorbar(r, a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"],
-                                    ls=st["ls"], lw=st["lw"], capsize=3, label=st["label"])
+                axes[i][0].errorbar(r + dodge[m], a, yerr=[a - lo, hi - a], color=st["color"], marker=st["marker"],
+                                    ls=st["ls"], lw=st["lw"], capsize=3, label=_joint_label(m))
             for j, axis in ((1, "uplink"), (2, "training")):
                 ok = [(r, s) for r, s in tt[axis] if s["hit"] > 0]
                 if ok:
@@ -851,7 +879,7 @@ def fig2_snr(main, snr):
         axes[i][0].set_xlabel("Reference SNR rho (dB)")
         axes[i][0].set_ylabel("Final test accuracy (%)")
         axes[i][0].set_title(f"{PART_NAME[scheme]}: final accuracy vs SNR (bars = seed min-max)\n"
-                             f"digital (FP{ENV0['q_bits']}) learning is SNR-independent; ZF variants = their OFDMA twins",
+                             f"digital (FP{ENV0['q_bits']}) learning is SNR-independent; ZF = OFDMA twin (drawn once)",
                              fontsize=10.5)
         for j, axis in ((1, "uplink"), (2, "training")):
             axes[i][j].set_yscale("log")
@@ -861,8 +889,9 @@ def fig2_snr(main, snr):
             axes[i][j].set_ylabel(f"{'Uplink' if axis == 'uplink' else 'Training'} time to target (s)")
             axes[i][j].set_title(f"{PART_NAME[scheme]}: {axis} time to {100*A:.0f}% val. acc.\n"
                                  "(x at the top = not reached)" if A else PART_NAME[scheme], fontsize=10.5)
-    axes[0][0].legend(fontsize=8)
     fig.tight_layout()
+    timed = axes[:, 1:]                      # every drawn method, ZF variants included, has its own entry there
+    _fig_legend(fig, timed if any(ax.get_legend_handles_labels()[0] for ax in timed.ravel()) else axes, ncol=6)
     _export_panels(fig, "2_snr", [(axes[i][j], f"{scheme}_{name}") for i, scheme in enumerate(schemes)
                                   for j, name in enumerate(("final_accuracy", "uplink_time_to_target",
                                                             "training_time_to_target"))])
@@ -1177,6 +1206,16 @@ def _analytic_compute(m, N=30, stage=CUT0, tau=TAU0, u_min=0.0):
     lo, hi = COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"]
     return compute_time_breakdown(m, split_flops(stage if m in SPLIT_METHODS else None), N, B0, tau,
                                   (lo + (hi - lo) * u_min) * 1e12, COMPUTE["server_tflops"] * 1e12)
+
+
+JOINT_LABEL = {"digital_sflv1": "Digital SFL-V1 (OFDMA / ZF)", "sun_fdma_aircomp": "Hybrid FDMA / ZF-AirComp SFL",
+               "digital_fedavg": "Digital FedAvg (OFDMA / ZF)"}
+
+
+def _joint_label(m):
+    """Label of a method drawn once for itself and its ZF twin (identical learning)."""
+    twin = any(DERIVED[d] == m and d in ORDER for d in DERIVED)
+    return JOINT_LABEL.get(m, STYLE[m]["label"]) if twin else STYLE[m]["label"]
 
 
 def _xlabels(ms):
@@ -1864,8 +1903,9 @@ def main():
                         "OFDMA); add digital_fedavg (and digital_fedavg_zf) to draw digital FedAvg. The ZF variants "
                         "are derived from the digital_sflv1 / sun_fdma_aircomp / digital_fedavg runs)")
     p.add_argument("--digital-q", nargs="+", type=int, default=[16], choices=[16, 32],
-                   help="digital payload(s) of the drawn figure sets: 16 = the FP16 runs (default) -> figures/, "
-                        "tables/; 32 = the FP32 runs -> figures_q32/, tables_q32/ (--digital-q 16 32: both)")
+                   help="digital payload(s) of the drawn figure sets: 16 = the FP16 runs (default) -> plots_fp16/, "
+                        "32 = the FP32 runs -> plots_fp32/ (--digital-q 16 32: both); each folder holds figures/, "
+                        "tables/, paper_results/, the --snr folders and runs_used.csv")
     p.add_argument("--budget-mult", nargs="+", type=float, default=[1.0],
                    help="fig2c: budgets = base budget x each value, e.g. 1 3 10 (base = AirSFL's full run)")
     p.add_argument("--linear-snrs", nargs="+", type=float, default=None,
@@ -1882,11 +1922,12 @@ def main():
     p.add_argument("--dirichlet-alpha", type=float, default=None,
                    help="Dirichlet concentration of the non-IID runs to load (default: the one in `main`)")
     p.add_argument("--panels", nargs="*", default=["1e", "2c", "2_snr", "7"], choices=["1e", "2c", "2_snr", "7"],
-                   help="figures also saved panel by panel, one file per subfigure, into <results>/paper_results/"
-                        "<1e|2c|2_snr|7>/ (FP16 set; the FP32 set -> paper_results_q32/); --panels alone: none")
-    p.add_argument("--also", nargs="+", default=[], choices=["fig3b", "fig11"],
-                   help="optional figures, off by default: fig3b (per-round uplink time vs cut, table_cuts) and fig11 "
-                        "(path-gain experiment: fig11, fig11b, table_pathloss; loads the pathloss runs)")
+                   help="figures also saved panel by panel, one file per subfigure, into <results>/plots_fp<q>/"
+                        "paper_results/<1e|2c|2_snr|7>/; --panels alone: none")
+    p.add_argument("--also", nargs="+", default=[], choices=["fig3b", "fig11", "fig12"],
+                   help="optional figures, off by default: fig3b (per-round uplink time vs cut, table_cuts), fig11 "
+                        "(path-gain experiment: fig11, fig11b, table_pathloss; loads the pathloss runs) and fig12 "
+                        "(FP32 vs FP16 digital payload comparison, table_digital_transport)")
     p.add_argument("--snr", nargs="+", type=float, default=[20.0],
                    help="operating SNR(s) of the main-point figures (fig1/1b/1c/1d, 3/3b/3c, 4, 6, 8, 10, table_main). "
                         "20 = the nominal set (all figures); any other swept SNR is rebuilt from the CSVs into "
@@ -1945,17 +1986,16 @@ def main():
     for q in a.digital_q:
         ENV0["q_bits"] = q
         x = sets[q]
-        tag = "" if q == 16 else f"_q{q}"                   # FP16 (default) -> figures/, FP32 -> figures_q32/
+        out = f"plots_fp{q}"                                # every output of one payload set in its own folder
         _report_missing(d, x, q)
-        if not x["main"].empty and not (x["main"].method == "errfree_ref").any():
-            print(f"[plots] FP{q} set: no FP32 digital SFL-V1 run -> the error-free curve and the target rule use "
-                  f"the drawn digital runs")
+        _report_unpaired(x)
+        _write_runs_used(x, os.path.join(RESULTS, out))
         for rho in a.snr:
-            FIG = os.path.join(RESULTS, f"figures{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
-            TAB = os.path.join(RESULTS, f"tables{tag}" + ("" if rho == 20.0 else f"_snr{rho:g}"))
+            FIG = os.path.join(RESULTS, out, "figures" + ("" if rho == 20.0 else f"_snr{rho:g}"))
+            TAB = os.path.join(RESULTS, out, "tables" + ("" if rho == 20.0 else f"_snr{rho:g}"))
             print(f"[plots] digital payload FP{q}, {rho:g} dB -> {FIG}, {TAB}")
-            # subfigure files of the nominal pass: FP16 -> paper_results/, FP32 -> paper_results_q32/
-            PANELS["dir"] = ("paper_results" + tag) if rho == 20.0 else None
+            # subfigure files of the nominal pass -> plots_fp<q>/paper_results/<figure>/
+            PANELS["dir"] = os.path.join(out, "paper_results") if rho == 20.0 else None
             if rho == 20.0:                  # nominal point: every figure, sweeps included
                 ENV0["rho_db"] = 20.0
                 fig3_breakdown()
@@ -1971,7 +2011,8 @@ def main():
                 fig8_efficiency(x["main"])
                 fig9_cut_tau(x["main"], x["cuts"], x["tau"])
                 fig10_compute_regimes(x["main"])
-                fig12_digital_transport({qq: sets[qq]["main"] for qq in (32, 16)})
+                if "fig12" in ALSO:          # FP32 vs FP16 comparison: mixes the payloads by design
+                    fig12_digital_transport({qq: sets[qq]["main"] for qq in (32, 16)})
                 continue
             # another operating SNR: the main-point figures rebuilt from the CSVs (analog methods from
             # the SNR sweep at rho, digital methods retimed at rho) into figures_snr<rho>/, tables_snr<rho>/.
@@ -1990,7 +2031,7 @@ def main():
             fig8_efficiency(main_rho)
             fig10_compute_regimes(main_rho)
     ENV0["rho_db"], ENV0["q_bits"], PANELS["dir"] = 20.0, 16, None
-    FIG, TAB = os.path.join(RESULTS, "figures"), os.path.join(RESULTS, "tables")
+    FIG, TAB = os.path.join(RESULTS, "plots_fp16", "figures"), os.path.join(RESULTS, "plots_fp16", "tables")
 
 
 if __name__ == "__main__":
