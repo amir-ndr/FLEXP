@@ -70,32 +70,59 @@ FORMAT = dict(
     inset_font=7.5,
     inset_title="Full training",                            # "" = no title
     snr_label="Reference SNR $\\rho$ (dB)",
+    # figures drawn without title and legend: a shared legend figure (legend.png / .pdf) goes with them
+    shared_legend_figs=("fig2_noniid_accuracy_vs_uplink_time_20dB", "fig6_iid_accuracy_vs_uplink_time_20dB"),
+    # figures with their own legend INSIDE the axes: loc, columns, anchor (axes fractions) and extra headroom on
+    # the y axis (factor on the log range top / on the linear span) so the legend covers no curve
+    inside_legend={
+        "fig1_noniid_final_accuracy_vs_snr": dict(loc="lower right"),
+        "fig3_noniid_uplink_time_to_target_vs_snr": dict(loc="upper center", ncol=3, headroom=8.0),
+        "fig4_noniid_accuracy_within_uplink_budget": dict(loc="lower right", ncol=2, bbox=(0.99, 0.16)),
+        "fig4_noniid_accuracy_within_uplink_budget_2000": dict(loc="lower right", ncol=2, bbox=(0.99, 0.16)),
+        "fig5_noniid_uplink_time_to_target_vs_N": dict(loc="upper center", ncol=3, headroom=6.0),
+        "fig7_iid_uplink_time_to_target_vs_N": dict(loc="upper center", ncol=3, headroom=6.0),
+    },
+    inside_legend_frame=False,   # False = transparent legend (no box); True = white box
+    inside_legend_font=10.5,     # font size of the legends inside the axes
+    no_title_figs=("fig1_noniid_final_accuracy_vs_snr", "fig2_noniid_accuracy_vs_uplink_time_20dB",
+                   "fig3_noniid_uplink_time_to_target_vs_snr", "fig4_noniid_accuracy_within_uplink_budget",
+                   "fig4_noniid_accuracy_within_uplink_budget_2000", "fig5_noniid_uplink_time_to_target_vs_N", "fig6_iid_accuracy_vs_uplink_time_20dB",
+                   "fig7_iid_uplink_time_to_target_vs_N"),
+    # fig1: a ZF variant has exactly the accuracy of its OFDMA twin. "merge" draws each pair once under a joint
+    # label (SFL-O / SFL-Z); "overlay" draws both (Z dash-dot with its own marker on top of O)
+    fig1_twins="merge",
+    legend_figure=dict(cols=6, font=9, width=7.0,      # one row across a two-column figure* (inches)
+                       order=("airsfl", "digital_sflv1", "digital_sflv1_zf", "sun_fdma_aircomp",
+                              "hybrid_zf_aircomp", "aircomp_fl"),
+                       labels={"airsfl": "AirSFL"}),           # label overrides for the legend figure only
 )
 
-# drawing order; label, color, marker, line style, line width (per method)
+# drawing order; label, color, marker, line style, line width (per method). Paper names: SFL-O / SFL-Z =
+# digital SFL-V1 over OFDMA / multi-user ZF; Hybrid-O / Hybrid-Z = digital smashed data over OFDMA / ZF with
+# AirComp aggregation; AirComp-FL = full model trained locally, AirComp aggregation
 METHODS = {
-    "airsfl":            dict(label="AirSFL (proposed)",       color="#d62728", marker="o", ls="-",  lw=2.6),
-    "aircomp_fl":        dict(label="AirComp-FL",              color="#2ca02c", marker="D", ls="-",  lw=1.8),
-    "hybrid_zf_aircomp": dict(label="Hybrid ZF-AirComp SFL",   color="#8c564b", marker="X", ls="-.", lw=1.8),
-    "sun_fdma_aircomp":  dict(label="Hybrid FDMA-AirComp SFL", color="#9467bd", marker="^", ls="-",  lw=1.8),
-    "digital_sflv1_zf":  dict(label="Digital SFL-V1 (ZF)",     color="#17becf", marker="P", ls="-.", lw=1.8),
-    "digital_sflv1":     dict(label="Digital SFL-V1 (OFDMA)",  color="#1f77b4", marker="s", ls="-",  lw=1.8),
+    "airsfl":            dict(label="AirSFL (proposed)", color="#d62728", marker="o", ls="-",  lw=2.6),
+    "aircomp_fl":        dict(label="AirComp-FL",        color="#2ca02c", marker="D", ls="-",  lw=1.8),
+    "hybrid_zf_aircomp": dict(label="Hybrid-Z",          color="#8c564b", marker="X", ls="-.", lw=1.8),
+    "sun_fdma_aircomp":  dict(label="Hybrid-O",          color="#9467bd", marker="^", ls="-",  lw=1.8),
+    "digital_sflv1_zf":  dict(label="SFL-Z",             color="#17becf", marker="P", ls="-.", lw=1.8),
+    "digital_sflv1":     dict(label="SFL-O",             color="#1f77b4", marker="s", ls="-",  lw=1.8),
 }
 # fig1 draws each ZF variant once with its OFDMA twin (identical learning), under this label
-JOINT = {"sun_fdma_aircomp": "Hybrid FDMA / ZF-AirComp SFL", "digital_sflv1": "Digital SFL-V1 (OFDMA / ZF)"}
+JOINT = {"sun_fdma_aircomp": "Hybrid-O / Hybrid-Z", "digital_sflv1": "SFL-O / SFL-Z"}
 TWINS = {"hybrid_zf_aircomp": "sun_fdma_aircomp", "digital_sflv1_zf": "digital_sflv1"}
 
 # CSV column name of each method (fixed: the plot step finds the data by these names)
-COLUMN = {"airsfl": "AirSFL", "aircomp_fl": "AirComp-FL", "hybrid_zf_aircomp": "Hybrid ZF-AirComp",
-          "sun_fdma_aircomp": "Hybrid FDMA-AirComp", "digital_sflv1_zf": "Digital SFL-V1 (ZF)",
-          "digital_sflv1": "Digital SFL-V1 (OFDMA)"}
+COLUMN = {"airsfl": "AirSFL", "aircomp_fl": "AirComp-FL", "hybrid_zf_aircomp": "Hybrid-Z",
+          "sun_fdma_aircomp": "Hybrid-O", "digital_sflv1_zf": "SFL-Z", "digital_sflv1": "SFL-O"}
 TRAINED = list(METHODS)
 
-FIGS = {   # file name -> (partition, kind)
+FIGS = {   # file name -> (partition, kind[, options])
     "fig1_noniid_final_accuracy_vs_snr": ("dirichlet", "final_acc_vs_snr"),
     "fig2_noniid_accuracy_vs_uplink_time_20dB": ("dirichlet", "curves_20dB"),
     "fig3_noniid_uplink_time_to_target_vs_snr": ("dirichlet", "uplink_time_to_target_vs_snr"),
-    "fig4_noniid_accuracy_within_uplink_budget": ("dirichlet", "budget_vs_snr"),
+    "fig4_noniid_accuracy_within_uplink_budget": ("dirichlet", "budget_vs_snr"),    # budget = AirSFL's full run
+    "fig4_noniid_accuracy_within_uplink_budget_2000": ("dirichlet", "budget_vs_snr", {"budget_s": 2000.0}),
     "fig5_noniid_uplink_time_to_target_vs_N": ("dirichlet", "time_to_target_vs_N"),
     "fig6_iid_accuracy_vs_uplink_time_20dB": ("iid", "curves_20dB"),
     "fig7_iid_uplink_time_to_target_vs_N": ("iid", "time_to_target_vs_N"),
@@ -184,12 +211,17 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
             rows.append(row)
         return pd.DataFrame(rows)
 
-    def budget_vs_snr(fig, scheme, xcol="uplink_s"):
-        air = runs(scheme, "airsfl", 20.0)
-        T = float(np.mean([g[xcol].iloc[-1] for g in P._seed_runs(air)]))   # AirSFL's full run at 20 dB
+    def budget_vs_snr(fig, scheme, xcol="uplink_s", budget_s=None):
+        """Test accuracy of the last evaluated checkpoint within an uplink budget T (per seed, then mean):
+        T = budget_s, or AirSFL's full-run uplink time at 20 dB when not given."""
+        if budget_s is None:
+            air = runs(scheme, "airsfl", 20.0)
+            T, source = float(np.mean([g[xcol].iloc[-1] for g in P._seed_runs(air)])), "AirSFL's full run"
+        else:
+            T, source = float(budget_s), "fixed"
         rows = []
         for rho in rhos:
-            row, ns, hollow = {"SNR (dB)": rho, "budget (uplink s)": T}, [], []
+            row, ns, hollow = {"SNR (dB)": rho, "budget (uplink s)": T, "budget": source}, [], []
             for m in TRAINED:
                 r = runs(scheme, m, rho)
                 if r.empty:
@@ -254,7 +286,9 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
             summary["UL time to target / AirSFL"] = summary["UL time to target (s)"] / air_t
         return pd.concat(curves, ignore_index=True), summary
 
-    for name, (scheme, kind) in FIGS.items():
+    for name, spec in FIGS.items():
+        scheme, kind = spec[:2]
+        opts = spec[2] if len(spec) > 2 else {}
         if kind == "curves_20dB":
             data, summary = curves_20dB(name, scheme)
             summary.to_csv(os.path.join(out, f"{name}_summary.csv"), index=False, float_format="%.6g")
@@ -262,7 +296,8 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
             data = {"final_acc_vs_snr": final_acc_vs_snr,
                     "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "uplink_s", fig3_target),
                     "training_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "training_time_s"),
-                    "budget_vs_snr": budget_vs_snr, "time_to_target_vs_N": time_to_target_vs_N}[kind](name, scheme)
+                    "budget_vs_snr": lambda f, sc: budget_vs_snr(f, sc, budget_s=opts.get("budget_s")),
+                    "time_to_target_vs_N": time_to_target_vs_N}[kind](name, scheme)
         data.to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.6g")
         tg = f" (target {data['target val acc (%)'].iloc[0]:g}%)" if "target val acc (%)" in data else ""
         print(f"[data] {name}.csv{tg}")
@@ -297,14 +332,33 @@ def _legend(ax, fig):
 
 
 def _finish(fig, ax, out, name, title):
-    if FORMAT["title"] and title:
+    if FORMAT["title"] and title and name not in FORMAT["no_title_figs"]:
         ax.set_title(title, fontsize=FORMAT["font"])
     ax.grid(True, alpha=FORMAT["grid_alpha"])
-    _legend(ax, fig)
+    if name in FORMAT["inside_legend"]:                 # own legend inside the axes
+        _inside_legend(ax, FORMAT["inside_legend"][name])
+    elif name not in FORMAT["shared_legend_figs"]:      # shared ones: no legend, legend.png goes with them
+        _legend(ax, fig)
     for ext in FORMAT["file_types"]:
         fig.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=FORMAT["dpi"])
     plt.close(fig)
     print(f"[fig] {name}")
+
+
+def _inside_legend(ax, spec):
+    """Legend inside the axes, entries in the order of legend.png and with its labels (e.g. "AirSFL")."""
+    if spec.get("headroom"):                           # make room above the data
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi * spec["headroom"] if ax.get_yscale() == "log" else lo + (hi - lo) * spec["headroom"])
+    lf = FORMAT["legend_figure"]
+    key = {METHODS[m]["label"]: m for m in METHODS}
+    key.update({v: m for m, v in JOINT.items()})
+    rank = {m: i for i, m in enumerate(lf["order"])}
+    h, lab = ax.get_legend_handles_labels()
+    pairs = sorted(zip(h, lab), key=lambda p: rank.get(key.get(p[1]), len(rank)))
+    ax.legend([p[0] for p in pairs], [lf.get("labels", {}).get(key.get(p[1]), p[1]) for p in pairs],
+              loc=spec.get("loc", "best"), ncol=spec.get("ncol", 1), bbox_to_anchor=spec.get("bbox"),
+              fontsize=FORMAT["inside_legend_font"], frameon=FORMAT["inside_legend_frame"], framealpha=0.9)
 
 
 def _not_reached(ax, x, color):
@@ -317,12 +371,15 @@ def _part(name):
 
 def plot_final_acc_vs_snr(df, out, name):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
-    for m in TRAINED:
-        if m in TWINS or COLUMN[m] not in df:
-            continue                                   # a ZF variant = its OFDMA twin: drawn once
+    overlay = FORMAT["fig1_twins"] == "overlay"
+    order = [m for m in TRAINED if m not in TWINS] + ([m for m in TRAINED if m in TWINS] if overlay else [])
+    for m in order:                                    # OFDMA first, ZF twins (identical values) on top
+        if COLUMN[m] not in df:
+            continue
         st = _style(m)
         ax.plot(df["SNR (dB)"], df[COLUMN[m]], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"], label=JOINT.get(m, st["label"]))
+                ms=FORMAT["marker_size"] - (1 if m in TWINS else 0),
+                label=st["label"] if overlay else JOINT.get(m, st["label"]))
     ax.set_xlabel(FORMAT["snr_label"])
     ax.set_ylabel("Final test accuracy (%)")
     _finish(fig, ax, out, name, f"{_part(name)}: final accuracy vs SNR")
@@ -354,7 +411,7 @@ def plot_time_to_target_vs_snr(df, out, name, axis="Training"):
         lo, hi = ax.get_ylim()
         ax.set_ylim(lo, hi * 10)
     ax.set_xlabel(FORMAT["snr_label"])
-    ax.set_ylabel(f"{axis} time to target (s)")
+    ax.set_ylabel("Uplink communication time to target (s)" if axis == "Uplink" else f"{axis} time to target (s)")
     _finish(fig, ax, out, name, f"{_part(name)}: {axis.lower()} time to {df['target val acc (%)'].iloc[0]:.0f}% "
                                 f"val. acc." + (" (x = not reached)" if unreached else ""))
 
@@ -375,8 +432,9 @@ def plot_budget_vs_snr(df, out, name):
                     ms=FORMAT["marker_size"] + 2, ls="")
     ax.set_xlabel(FORMAT["snr_label"])
     ax.set_ylabel("Test accuracy within the budget (%)")
+    own = "budget" in df and str(df["budget"].iloc[0]) == "AirSFL's full run"
     _finish(fig, ax, out, name, f"{_part(name)}: accuracy after {df['budget (uplink s)'].iloc[0]:.0f} s of uplink "
-                                f"time (AirSFL's run)")
+                                f"time" + (" (AirSFL's run)" if own else ""))
 
 
 def plot_time_to_target_vs_N(df, out, name):
@@ -384,6 +442,7 @@ def plot_time_to_target_vs_N(df, out, name):
     ms = [m for m in TRAINED if COLUMN[m] in df]
     x = np.arange(len(df))
     w = 0.84 / len(ms)
+    unreached = False
     for j, m in enumerate(ms):
         st, c = _style(m), COLUMN[m]
         xs = x + (j - (len(ms) - 1) / 2) * w
@@ -391,12 +450,14 @@ def plot_time_to_target_vs_N(df, out, name):
         for xi, v in zip(xs, df[c]):
             if np.isnan(v):
                 ax.text(xi, 0.02, "×", ha="center", color=st["color"], fontsize=10, transform=ax.get_xaxis_transform())
+                unreached = True
     ax.set_yscale("log")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"N={int(n)}" for n in df["N"]])
-    ax.set_ylabel("Uplink time to target (s)")
-    _finish(fig, ax, out, name, f"{_part(name)}: uplink time to {df['target val acc (%)'].iloc[0]:.0f}% "
-                                f"(× = not reached)")
+    ax.set_xticklabels([str(int(n)) for n in df["N"]])
+    ax.set_xlabel("Number of clients $N$")
+    ax.set_ylabel("Uplink communication time to target (s)")
+    _finish(fig, ax, out, name, f"{_part(name)}: uplink time to {df['target val acc (%)'].iloc[0]:.0f}% val. acc."
+                                + (" (× = not reached)" if unreached else ""))
 
 
 def plot_curves(df, out, name):
@@ -450,12 +511,31 @@ def plot_all(out):
             "training_time_to_target_vs_snr": lambda d, o, n: plot_time_to_target_vs_snr(d, o, n, axis="Training"),
             "budget_vs_snr": plot_budget_vs_snr, "time_to_target_vs_N": plot_time_to_target_vs_N,
             "curves_20dB": plot_curves}
-    for name, (_, kind) in FIGS.items():
+    for name, spec in FIGS.items():
+        kind = spec[1]
         path = os.path.join(out, f"{name}.csv")
         if not os.path.exists(path):
             print(f"[fig] {name}: {path} missing (run without --plot-only first)")
             continue
         draw[kind](pd.read_csv(path), out, name)
+    if FORMAT["shared_legend_figs"]:
+        plot_legend(out)
+
+
+def plot_legend(out, name="legend"):
+    """Stand-alone legend of all methods (line style, color and marker as in the figures), for the
+    figures drawn without one (FORMAT["shared_legend_figs"])."""
+    lf = FORMAT["legend_figure"]
+    handles = [plt.Line2D([], [], color=METHODS[m]["color"], ls=METHODS[m]["ls"], lw=METHODS[m]["lw"],
+                          marker=METHODS[m]["marker"], ms=FORMAT["marker_size"] - 1) for m in lf["order"]]
+    fig = plt.figure(figsize=(lf["width"], 0.4))
+    fig.legend(handles, [lf.get("labels", {}).get(m, METHODS[m]["label"]) for m in lf["order"]], loc="center",
+               ncol=lf["cols"],
+               fontsize=lf["font"], frameon=False, handlelength=2.6, columnspacing=1.4)
+    for ext in FORMAT["file_types"]:
+        fig.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=FORMAT["dpi"])
+    plt.close(fig)
+    print(f"[fig] {name}")
 
 
 def main():
