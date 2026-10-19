@@ -31,9 +31,13 @@
 # (resubmit a timed-out job with the same variables), shared runs are trained once.
 # Job arrays: the run list is split over (array tasks x WORKERS) disjoint slices.
 #
-# COST (training-free estimate, median seed): local training per (seed, delta) of SAFSL ~4000,
-# ParallelSFL ~3000, CSA-SFL ~1400, FL / SFLv2 ~160 MNIST-epochs -> SAFSL and ParallelSFL dominate.
-# GPU throughput is not measured yet: run one seed first and read the wall_s column / logs.
+# COST scales with TIME_BUDGET: the async/clustered methods keep training fast devices for the whole
+# simulated window. Per run at 50,000 s (seeds 1-5): ParallelSFL ~4,200, SAFSL ~3,650, CSA-SFL ~1,400,
+# FL/SFLv2 ~400 MNIST-epochs of local training (346k / 215k / 347k / 19k batched GPU steps); seeds 1-5 of
+# main = ~100,000 MNIST-epochs (~12-16 h on 4 Quadro RTX 6000). 20,000 s needs 2.5x less, 10,000 s 5x less.
+# All methods but FL reach 97% well before 20,000 s. A finished run with a LONGER budget covers a
+# shorter one (skipped, no training; plots.py cuts every run at the common budget), so lowering
+# TIME_BUDGET later never retrains. --tf32 needs an Ampere+ GPU (A30/A100/L40S), not the RTX 6000.
 #
 # MAIN, FIRST SEED (both deltas, 2 GPUs x 3 processes), then the figures:
 #   J=$(sbatch --parsable --array=0-1 --export=ALL,SEEDS=1 slurm/run_csasfl_mnist.slurm)

@@ -55,6 +55,34 @@ def load(results: str) -> pd.DataFrame:
     return df
 
 
+CONFIG_COLS = ["method", "variant", "delta", "seed", "K", "E", "B", "lr", "T", "t0", "sigma_s", "N", "H"]
+
+
+def common_budget(df: pd.DataFrame, budget=None) -> pd.DataFrame:
+    """One run per configuration and seed (the longest time budget wins), every run cut at the
+    common budget: its rows up to the first round at or past it -- exactly the run that budget
+    would have produced, since the budget only decides when a run stops. Default budget: the
+    smallest one present (all runs then cover the same simulated-time window)."""
+    tbs = df.groupby("file")["time_budget"].first().fillna(0.0)
+    if budget is None:
+        budget = float(tbs[tbs > 0].min()) if (tbs > 0).any() else 0.0
+    key = df[CONFIG_COLS].astype(str).agg("|".join, axis=1)
+    longest = (df.assign(_k=key, _tb=df["time_budget"].fillna(0.0).replace(0.0, np.inf))
+                 .groupby("_k")[["_tb", "file"]].apply(lambda g: g.sort_values("_tb").iloc[-1]["file"]))
+    df = df[df["file"].isin(set(longest))]
+    if budget > 0:
+        parts = []
+        for _, g in df.groupby("file"):
+            g = g.sort_values("round")
+            past = np.flatnonzero(g["sim_time_s"].to_numpy() >= budget)
+            parts.append(g.iloc[:past[0] + 1] if len(past) else g)
+        df = pd.concat(parts, ignore_index=True)
+        df["time_budget"] = budget
+        n_cut = int((tbs > budget).sum())
+        print(f"[plots] common time budget {budget:g} s" + (f" ({n_cut} longer runs cut)" if n_cut else ""))
+    return df
+
+
 def runs_of(df, **sel):
     m = np.ones(len(df), dtype=bool)
     for k, v in sel.items():
@@ -163,10 +191,12 @@ def main():
     p.add_argument("--targets", nargs="+", type=float, default=[0.90, 0.95, 0.97])
     p.add_argument("--tmax", type=float, default=None, help="x limit (s) of the linear time panels")
     p.add_argument("--noniid", type=float, default=0.1)
+    p.add_argument("--time-budget", type=float, default=None,
+                   help="cut every run at this simulated time (s); default: the smallest budget among the runs")
     p.add_argument("--N", type=int, default=7, help="default N (fixed in the H sweep)")
     p.add_argument("--H", type=int, default=20, help="default H (fixed in the N sweep)")
     args = p.parse_args()
-    df = load(args.results)
+    df = common_budget(load(args.results), args.time_budget)
     out = os.path.join(args.results, "figures")
     os.makedirs(out, exist_ok=True)
     report = ""

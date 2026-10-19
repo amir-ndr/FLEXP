@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import dataclasses
+import glob
 import hashlib
 import json
 import os
@@ -64,9 +65,11 @@ NONIID = 0.1
 N_SWEEP = [3, 5, 7, 9, 11]
 H_SWEEP = [10, 20, 30, 40, 50]
 ABLATION = [("gradient", "weighted"), ("gradient", "uniform"), ("random", "weighted")]
-# relative GPU time per run under the 50,000 s budget (training-free estimate, median over seeds:
-# MNIST-epochs of local training SAFSL ~4000, ParallelSFL ~3000, CSA-SFL ~1400, FL/SFLv2 ~160)
-COST = {"safsl": 4.0, "parallelsfl": 3.0, "csasfl": 1.5, "sflv2": 0.4, "fl": 0.2}
+# relative GPU time per run (sharding). Training-free count, seeds 1-5, 50,000 s budget: lock-steps
+# (each one batched GPU step) / MNIST-epochs of local training per run -- ParallelSFL 346k / 4160,
+# CSA-SFL 347k / 1400 (only ~4 devices per step: launch-overhead bound), SAFSL 215k / 3650,
+# FL & SFLv2 19k / 400 (SFLv2: + a 50-device sequential server loop per step).
+COST = {"parallelsfl": 4.0, "safsl": 3.5, "csasfl": 3.0, "sflv2": 0.8, "fl": 0.4}
 
 
 def build_runs(args) -> list:
@@ -142,6 +145,28 @@ def is_complete(path: str, T: int, time_budget: float = 0.0) -> bool:
                             or (time_budget > 0 and float(df["sim_time_s"].max()) >= time_budget))
 
 
+def covering_run(cfg: RunConfig, rdir: str):
+    """A finished run of the same configuration with a LONGER (or no) time budget. The budget
+    only decides when a run stops -- nothing before that depends on it -- so the first rows of
+    the longer run, up to the first round at or past cfg.time_budget, ARE this run (plots.py
+    cuts every run at the common budget)."""
+    if cfg.time_budget <= 0:
+        return None
+    mine = manifest(cfg)
+    mine.pop("time_budget")
+    for js in sorted(glob.glob(os.path.join(rdir, f"{cfg.method}_d{cfg.delta:g}_s{cfg.seed}_*.json"))):
+        with open(js) as f:
+            other = json.load(f)
+        tb = float(other.get("time_budget", 0.0))
+        if not (tb <= 0 or tb > cfg.time_budget):
+            continue
+        if {k: v for k, v in other.items() if k not in ("time_budget", "run_id", "experiments")} != mine:
+            continue
+        if is_complete(js[:-5] + ".csv", int(other["T"]), tb):
+            return os.path.basename(js)[:-5]
+    return None
+
+
 def run_one(cfg: RunConfig, exps: list, data: dict, args) -> str:
     name = run_name(cfg)
     rdir = os.path.join(RESULTS, "runs")
@@ -150,6 +175,10 @@ def run_one(cfg: RunConfig, exps: list, data: dict, args) -> str:
     if is_complete(csv_path, cfg.T, cfg.time_budget):
         print(f"[skip] {name} (complete)")
         return csv_path
+    cover = covering_run(cfg, rdir)
+    if cover is not None:
+        print(f"[skip] {name}: covered by the finished longer-budget run {cover}")
+        return os.path.join(rdir, cover + ".csv")
     with open(os.path.join(rdir, name + ".json"), "w") as f:
         json.dump({"run_id": run_id(cfg), "experiments": exps, **manifest(cfg)}, f, indent=1, sort_keys=True)
     spec = layer_spec()
