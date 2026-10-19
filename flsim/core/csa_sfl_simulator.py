@@ -26,7 +26,9 @@ Faithful to the paper (see flsim.algorithms.csa_sfl for the two PS mechanisms):
     The new global model is assigned ONLY to the completed cluster (its
     staleness resets to 0); all other clusters keep training, staleness += 1.
   * Dynamic clustering: cosine-distance K-means on device-side gradients, redone
-    every H global rounds (a synchronous gradient-recollection halt).
+    every H global rounds (a synchronous gradient-recollection halt; each device's
+    gradient on its own current version). Only AFFECTED clusters (membership
+    changed) restart from the current global model; unaffected ones resume.
 
 Timing (fair with the SAFSL / SFLv2 baselines — same SplitCostModel base)
 -------------------------------------------------------------------------
@@ -213,22 +215,35 @@ class CSASFLSimulator:
             t += 1
 
             # ---- dynamic re-clustering every H global rounds (gradient mode only;
-            #      random one-time clustering never re-clusters) ----
+            #      random one-time clustering never re-clusters). Paper Algorithm 1:
+            #      all clusters halt for the gradient recollection (each device on
+            #      its OWN current version = its cluster's start model); a new
+            #      cluster with exactly the members of an old one is unaffected and
+            #      resumes its ongoing round (completion pushed back by the halt,
+            #      start/buffer/t_n kept); every other cluster is affected and
+            #      restarts from the current global model (buffer <- w^t, t_m <- t).
             if t < T and self.algo.clustering == "gradient" and t % Hr == 0:
-                clusters, gc_dur, gc_traf, gc_energy = self._form_clusters()
+                gc_dur, gc_traf, gc_energy = self._collect_gradients_cost()
+                owner = {cid: start[m] for m, c in enumerate(clusters) for cid in c}
+                new_clusters = self.algo.cluster_by_gradient(self._collect_gradients(owner), self.rng)
+                cum_traffic += gc_traf; cum_energy += gc_energy
+                pending = {m: when for when, _, m in heap}          # each cluster's scheduled completion
+                old_index = {tuple(sorted(c)): m for m, c in enumerate(clusters)}
+                g_pair = self._clone_pair(self.global_bottom.state_dict(), self.global_server.state_dict())
+                new_start, new_buffer, new_refresh, heap = [], [], [], []
+                for m_new, c in enumerate(new_clusters):
+                    m = old_index.get(tuple(sorted(c)))
+                    if m is not None:                               # unaffected
+                        new_start.append(start[m]); new_buffer.append(buffer[m])
+                        new_refresh.append(last_refresh[m])
+                        when = pending[m] + gc_dur
+                    else:                                           # affected
+                        new_start.append(self._clone_pair(*g_pair)); new_buffer.append(self._clone_pair(*g_pair))
+                        new_refresh.append(t)
+                        when = cum_time + gc_dur + self._cluster_duration_cost(c)[0]
+                    heapq.heappush(heap, (when, seq, m_new)); seq += 1
+                clusters, start, buffer, last_refresh = new_clusters, new_start, new_buffer, new_refresh
                 N = len(clusters)
-                cum_time += gc_dur; cum_traffic += gc_traf; cum_energy += gc_energy
-                g_bottom = {k: v.clone() for k, v in self.global_bottom.state_dict().items()}
-                g_server = {k: v.clone() for k, v in self.global_server.state_dict().items()}
-                # all (re-formed) clusters restart from the current global model
-                start = [self._clone_pair(g_bottom, g_server) for _ in clusters]
-                buffer = [self._clone_pair(g_bottom, g_server) for _ in clusters]
-                last_refresh = [t for _ in clusters]
-                heap = []
-                for m in range(N):
-                    dur_m = self._cluster_duration_cost(clusters[m])[0]
-                    heapq.heappush(heap, (cum_time + dur_m, seq, m)); seq += 1
-                prev_time = cum_time
 
         print("[CSASFLSimulator] Done.")
         return self.history
@@ -313,9 +328,11 @@ class CSASFLSimulator:
     # Gradient collection for clustering (one co-training pass per device)
     # ==================================================================
 
-    def _collect_gradients(self) -> dict:
-        """Device-side gradient g_k for every device, from one co-training pass on
-        the CURRENT global model (paper's initial/periodic gradient recollection)."""
+    def _collect_gradients(self, owner: dict = None) -> dict:
+        """Device-side gradient g_k for every device from one co-training mini-batch,
+        through ITS OWN current submodel: owner[cid] = (bottom_state, server_state)
+        of the version its cluster trains from (None = the current global model,
+        which is every device's version at the initial clustering)."""
         cfg = self.config.learning
         b = int(cfg.batch_size)
         criterion = nn.CrossEntropyLoss()
@@ -323,6 +340,9 @@ class CSASFLSimulator:
         grads = {}
         for c in self.clients:
             bm = copy.deepcopy(self.global_bottom).to(self.device); bm.train()
+            if owner is not None:
+                bm.load_state_dict(owner[c.client_id][0])
+                server.load_state_dict(owner[c.client_id][1])
             loader = DataLoader(Subset(c.dataset, c.indices), batch_size=b, shuffle=True)
             x, y = next(iter(loader))
             x, y = x.to(self.device), y.to(self.device)

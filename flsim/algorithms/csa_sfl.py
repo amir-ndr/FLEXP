@@ -5,13 +5,16 @@ Learning) parameters + the two PS-side mechanisms.
 This class is a lightweight strategy/params holder. The event-driven
 semi-asynchronous orchestration (per-cluster server-side submodels, buffered +
 staleness-weighted global aggregation, cluster completion scheduling, dynamic
-re-clustering) lives in flsim.core.csa_sfl_simulator.CSASFLSimulator.
+re-clustering) lives in flsim.core.csa_sfl_simulator.CSASFLSimulator (the
+channel-cost experiment, examples/parallelsfl_experiment.py) and in
+flsim.csasfl.methods.run_csasfl (the paper's MNIST setup, examples/CSASFL/).
 
 The two mechanisms it owns, both run on the PS:
   1. cluster_by_gradient — dynamic device clustering by GRADIENT SIMILARITY:
      cosine-distance K-means on the device-side gradients g_k (paper's
-     "min_{C} sum_n sum_{k in C_n} (1 - cos(g_k, mu_n))"). Coherent-gradient
-     devices are grouped, reducing intra-cluster update inconsistency.
+     "min_{C} sum_n sum_{k in C_n} (1 - cos(g_k, mu_n))", mu_n = mean of the
+     cluster's g_k). Coherent-gradient devices are grouped, reducing
+     intra-cluster update inconsistency.
   2. agg_weights — data-size-aware AND staleness-aware inter-cluster weights
      phi_{n,t} = |D_n|/(1+tau_n) / sum_n' |D_n'|/(1+tau_n')  (paper Eq. phi),
      giving fresher (small tau) and larger (big |D_n|) clusters more influence.
@@ -20,11 +23,11 @@ Arguments (N, H, E, T) — as requested:
     N (num_clusters)     — number of clusters the K devices are partitioned into.
     H (recluster_every)  — re-collect gradients and re-cluster every H GLOBAL
                            aggregation rounds (paper's "every H rounds").
-    E (local_iters)      — intra-cluster local work: E mini-batch co-training
-                           iterations per cluster training pass. Kept as
-                           ITERATIONS (not full epochs) so CSA-SFL's per-round
-                           local work equals the other baselines' H mini-batch
-                           steps in the comparison experiment (fair timing).
+    E (local_iters)      — intra-cluster local work per cluster training pass.
+                           CSASFLSimulator reads it as E mini-batch ITERATIONS
+                           (so its local work equals the other baselines' H
+                           steps in parallelsfl_experiment.py); the paper's
+                           setup (flsim.csasfl) reads it as E local EPOCHS.
     T (global_rounds)    — number of global aggregation rounds (cluster
                            completions) to simulate.
 """
@@ -80,14 +83,19 @@ class CSASFL:
 
     def cluster_by_gradient(self, gradients: dict, rng: np.random.RandomState) -> list:
         """
-        Cosine-distance K-means over device-side gradients.
+        Cosine-distance K-means over device-side gradients (paper Eq. clustering):
+            min_{C_1..C_N} sum_n sum_{k in C_n} (1 - cos(g_k, mu_n)),   mu_n = (1/|C_n|) sum_{k in C_n} g_k,
+        i.e. the centroid is the MEAN OF THE RAW GRADIENTS (not of their unit vectors). Lloyd
+        iterations: assign every device to the centroid of largest cosine, recompute mu_n as
+        defined; since this centroid is not the exact minimizer of the cosine objective, the
+        partition with the lowest objective value seen is returned.
 
         Args:
             gradients: {client_id -> 1-D np.ndarray} device-side gradient g_k.
             rng:       seeded RNG for reproducible centroid initialization.
 
         Returns:
-            list[list[client_id]] — N non-empty clusters (empties are refilled).
+            list[list[client_id]] — N non-empty clusters.
         """
         cids = list(gradients.keys())
         G = np.stack([np.asarray(gradients[c], dtype=np.float64) for c in cids])
@@ -96,28 +104,42 @@ class CSASFL:
         U = G / norms                                   # unit vectors; cos(a,b) = <a_hat, b_hat>
         N = min(self.N, len(cids))
 
-        centroids = self._init_centroids(U, N, rng)     # (N, d), unit rows
-        labels = np.full(len(cids), -1, dtype=int)
-        for it in range(self.kmeans_iters):
-            sims = U @ centroids.T                       # cosine similarity to each centroid
-            new_labels = sims.argmax(axis=1)             # assign = max cos = min (1-cos)
-            if it > 0 and np.array_equal(new_labels, labels):
+        C = self._init_centroids(U, N, rng)             # (N, d) unit centroid directions
+        labels = (U @ C.T).argmax(axis=1)
+        best_obj, best = np.inf, None
+        for _ in range(self.kmeans_iters):
+            labels = self._fill_empty(labels, U, C, N)
+            mu = np.stack([G[labels == n].mean(axis=0) for n in range(N)])     # mu_n (paper)
+            mn = np.linalg.norm(mu, axis=1, keepdims=True)
+            C = mu / np.where(mn > 0, mn, 1.0)
+            obj = float(np.sum(1.0 - np.einsum("ij,ij->i", U, C[labels])))     # sum_k (1 - cos(g_k, mu_{n(k)}))
+            if obj < best_obj - 1e-12:
+                best_obj, best = obj, labels.copy()
+            new_labels = (U @ C.T).argmax(axis=1)       # assign = max cos = min (1 - cos)
+            if np.array_equal(new_labels, labels):
                 break
             labels = new_labels
-            for n in range(N):
-                members = U[labels == n]
-                if len(members) == 0:
-                    # re-seed an empty centroid to the current worst-fit point
-                    centroids[n] = U[sims.max(axis=1).argmin()]
-                else:
-                    m = members.mean(axis=0)
-                    mn = np.linalg.norm(m)
-                    centroids[n] = m / mn if mn > 0 else m
+        self.last_objective = best_obj
 
         clusters = [[] for _ in range(N)]
         for i, c in enumerate(cids):
-            clusters[int(labels[i])].append(c)
-        return self._fix_empty(clusters)
+            clusters[int(best[i])].append(c)
+        return [c for c in clusters if c]
+
+    @staticmethod
+    def _fill_empty(labels: np.ndarray, U: np.ndarray, C: np.ndarray, N: int) -> np.ndarray:
+        """Give every empty cluster the worst-fitting device of a cluster with > 1 member."""
+        labels = labels.copy()
+        for n in range(N):
+            if np.any(labels == n):
+                continue
+            fit = np.einsum("ij,ij->i", U, C[labels])               # cos to its own centroid
+            sizes = np.bincount(labels, minlength=N)
+            for i in np.argsort(fit):
+                if sizes[labels[i]] > 1:
+                    labels[i] = n
+                    break
+        return labels
 
     def _init_centroids(self, U: np.ndarray, N: int, rng) -> np.ndarray:
         """k-means++-style seeding on the unit sphere (cosine distance = 1-cos)."""
@@ -129,18 +151,6 @@ class CSASFL:
             probs = dist / s if s > 0 else np.full(len(U), 1.0 / len(U))
             chosen.append(int(rng.choice(len(U), p=probs)))
         return U[chosen].copy()
-
-    @staticmethod
-    def _fix_empty(clusters: list) -> list:
-        """Guarantee no empty cluster: move a member from the largest cluster."""
-        clusters = [list(c) for c in clusters]
-        while any(len(c) == 0 for c in clusters):
-            biggest = max(clusters, key=len)
-            if len(biggest) <= 1:
-                break
-            empty = next(c for c in clusters if len(c) == 0)
-            empty.append(biggest.pop())
-        return [c for c in clusters if len(c) > 0]
 
     # ------------------------------------------------------------------
     # Mechanism 2 — data-size-aware AND staleness-aware aggregation weights

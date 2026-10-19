@@ -162,7 +162,7 @@ class ParallelSFL(ParallelSFLAlgorithm):
         while any(remaining):
             # Line 5: top worker = max ingress bandwidth in the set with most workers.
             biggest = max((s for s in remaining if s), key=len)
-            top_local = max(biggest, key=lambda gi: workers[gi].ingress_bw_hz)
+            top_local = max(biggest, key=lambda gi: self._top_key(workers[gi]))
             biggest.remove(top_local)
             top = workers[top_local]
 
@@ -233,6 +233,11 @@ class ParallelSFL(ParallelSFLAlgorithm):
     # ------------------------------------------------------------------
     # Algorithm-1 helpers
     # ------------------------------------------------------------------
+
+    def _top_key(self, w: WorkerInfo):
+        """Line 5's top-worker criterion: the largest ingress bandwidth B_i (override to break
+        ties differently, e.g. by compute when all links are equal)."""
+        return w.ingress_bw_hz
 
     @staticmethod
     def _t_i(w: WorkerInfo, top: WorkerInfo) -> float:

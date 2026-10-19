@@ -12,6 +12,7 @@ from flsim.models.cifar_cnn import CifarCNN
 from flsim.models.alexnet import AlexNet
 from flsim.models.vgg import VGG16, VGG19
 from flsim.models.resnet import ResNet18, ResNet34
+from flsim.csasfl.model import LeNet12
 
 # Registry of all available models: name → constructor
 _MODEL_REGISTRY = {
@@ -22,6 +23,7 @@ _MODEL_REGISTRY = {
     "vgg19":      VGG19,
     "resnet18":   ResNet18,
     "resnet34":   ResNet34,
+    "lenet12":    LeNet12,     # CSA-SFL paper's 12-layer chain LeNet (MNIST)
 }
 
 

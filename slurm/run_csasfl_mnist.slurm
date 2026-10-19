@@ -1,0 +1,158 @@
+#!/bin/bash
+# slurm/run_csasfl_mnist.slurm — "mnist_exp": the CSA-SFL paper's simulation setup on a GPU node
+# (examples/CSASFL/run_mnist_exp.py, then examples/CSASFL/plots.py).
+#
+# CSA-SFL vs FL / SFLv2 / SAFSL / ParallelSFL on MNIST + 12-layer LeNet (split 8), K = 50 devices,
+# s_k ~ LogNormal(0, 2^2), t_0 = 0.2 s, E = 5, B = 64, eta = 0.01, N = 7, H = 20. Every method trains
+# until its simulated clock reaches the same TIME_BUDGET (default 50,000 s ~ 2000 CSA-SFL rounds,
+# ~1000 SAFSL / ~2000 ParallelSFL / ~30 FL-SFLv2 rounds, median over seeds); ROUNDS caps own rounds.
+# Experiments (EXP, any subset):
+#   main      5 methods x delta {0.1, 10}                       (comparison)
+#   nsweep    CSA-SFL x N {3,5,7,9,11}, delta 0.1, H 20         (paper Fig. a/b)
+#   hsweep    CSA-SFL x H {10,20,30,40,50}, delta 0.1, N 7      (paper Fig. c)
+#   ablation  CSA-SFL full / uniform phi / random clustering, delta 0.1
+#   plots     only rebuild the figures/tables from the finished runs
+# Environment variables (all optional):
+#   EXP          default "main"  (sweeps/ablation: EXP="nsweep hsweep ablation")
+#   SEEDS        paired seeds, default "1 2 3 4 5" (the paper averages 20 runs: SEEDS="$(seq -s ' ' 1 20)")
+#   METHODS      subset of "fl sflv2 safsl parallelsfl csasfl" for EXP=main
+#   DELTAS       default "0.1 10"
+#   TIME_BUDGET  simulated seconds every method trains for, default 50000 (0 = exactly ROUNDS rounds)
+#   ROUNDS       cap on each method's own global rounds, default 5000
+#   RESULTS    results root, default examples/CSASFL/results_mnist_exp
+#   WORKERS    concurrent run processes sharing this job's GPU (default 3); each takes a
+#              cost-balanced slice of the run list (MNIST/LeNet groups do not fill a GPU alone)
+#   EXTRA      other run_mnist_exp.py flags, e.g. "--tf32" (TF32 tensor cores: ~2-3x faster
+#              convolutions on A100/A30, default exact FP32), "--vmap-chunk 16" (less GPU memory)
+#   PLOT_EXTRA other plots.py flags, e.g. "--targets 0.9 0.95 0.97 --tmax 20000"
+# GPU use: MNIST lives on the GPU, every group of devices trains in lock-step through one batched
+# vmap kernel, cuDNN autotuning on; a run out of GPU memory restarts with chunked vmap, then the
+# loop engine. Every run is identified by a hash of its configuration: finished runs are skipped
+# (resubmit a timed-out job with the same variables), shared runs are trained once.
+# Job arrays: the run list is split over (array tasks x WORKERS) disjoint slices.
+#
+# COST (training-free estimate, median seed): local training per (seed, delta) of SAFSL ~4000,
+# ParallelSFL ~3000, CSA-SFL ~1400, FL / SFLv2 ~160 MNIST-epochs -> SAFSL and ParallelSFL dominate.
+# GPU throughput is not measured yet: run one seed first and read the wall_s column / logs.
+#
+# MAIN, FIRST SEED (both deltas, 2 GPUs x 3 processes), then the figures:
+#   J=$(sbatch --parsable --array=0-1 --export=ALL,SEEDS=1 slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,EXP=plots --time=00:30:00 slurm/run_csasfl_mnist.slurm
+# MAIN, SEEDS 1-5 (the default; finished runs are skipped, resubmit the same line after a time-out):
+#   J=$(sbatch --parsable --array=0-3 slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,EXP=plots --time=00:30:00 slurm/run_csasfl_mnist.slurm
+#
+# EDIT the two sections marked below for your cluster before submitting:
+#   1. #SBATCH directives (partition / gres / account names differ per site)
+#   2. Environment setup (module names / conda env / venv path)
+
+#SBATCH --job-name=csasfl_mnist
+#SBATCH --gres=gpu:1            # Quadro RTX 6000 node; other node types offer a100 / a30 / L4 / L40S
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=48:00:00
+#SBATCH --output=slurm/logs/%x_%A_%a.out
+#SBATCH --error=slurm/logs/%x_%A_%a.err
+# Optional extras — uncomment and edit if your cluster requires/supports them:
+# #SBATCH --account=your_account
+# #SBATCH --qos=your_qos
+# #SBATCH --mail-type=END,FAIL
+# #SBATCH --mail-user=you@example.com
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 1. Environment setup — EDIT for your cluster
+# ---------------------------------------------------------------------------
+source /global/home/hpc6175/venvs/env1/bin/activate
+
+# Run from the repo root regardless of where sbatch was invoked from.
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+mkdir -p slurm/logs
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+
+# Workaround: this cluster's ldconfig cache points libcuda.so.1 at
+# /usr/lib64/nvidia/libcuda.so.1, which doesn't exist on these GPU nodes —
+# the real file lives at /usr/lib64/libcuda.so.1. Only shadow libcuda.so.1
+# (prepending /usr/lib64 wholesale breaks the CVMFS libc of system binaries).
+CUDA_SHIM_DIR="${SLURM_TMPDIR:-/tmp}/cuda_shim_${SLURM_JOB_ID:-manual}"
+mkdir -p "$CUDA_SHIM_DIR"
+ln -sf /usr/lib64/libcuda.so.1 "$CUDA_SHIM_DIR/libcuda.so.1"
+export LD_LIBRARY_PATH="$CUDA_SHIM_DIR:${LD_LIBRARY_PATH:-}"
+
+RESULTS="${RESULTS:-examples/CSASFL/results_mnist_exp}"
+PLOT_ARGS=(--results "${RESULTS}")
+[[ -n "${PLOT_EXTRA:-}" ]] && PLOT_ARGS+=(${PLOT_EXTRA})
+EXP="${EXP:-main}"
+
+if [[ "${EXP}" == "plots" ]]; then
+    python examples/CSASFL/plots.py "${PLOT_ARGS[@]}"
+    echo "Job finished at $(date)"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Record which GPU this job landed on (one file per job) and fail loudly if
+#    torch cannot see it (a silent CPU fallback would take days).
+# ---------------------------------------------------------------------------
+GPU_INFO_FILE="slurm/logs/gpu_${SLURM_JOB_ID:-manual}.txt"
+{
+    echo "Job ID:  ${SLURM_JOB_ID:-N/A} (array task ${SLURM_ARRAY_TASK_ID:-none})"
+    echo "Node:    $(hostname)"
+    echo "Date:    $(date)"
+    echo "---- nvidia-smi GPU query ----"
+    nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version,compute_cap --format=csv
+} > "$GPU_INFO_FILE" 2>&1 || echo "nvidia-smi not available on this node" > "$GPU_INFO_FILE"
+echo "===== GPU info (also saved to $GPU_INFO_FILE) ====="
+cat "$GPU_INFO_FILE"
+echo "===================================================="
+
+python -c "
+import sys, torch
+ok = torch.cuda.is_available()
+print('torch:', torch.__version__, '| CUDA available:', ok,
+      '| device:', torch.cuda.get_device_name(0) if ok else 'cpu (no GPU visible to torch!)',
+      '| torch.func (vmap engine):', hasattr(torch, 'func'))
+sys.exit(0 if ok else 1)
+"
+
+# ---------------------------------------------------------------------------
+# 3. Run: WORKERS processes on this GPU, each a disjoint slice of the run list
+# ---------------------------------------------------------------------------
+SEEDS="${SEEDS:-1 2 3 4 5}"
+DELTAS="${DELTAS:-0.1 10}"
+WORKERS="${WORKERS:-3}"
+ARGS=(--exp ${EXP} --seeds ${SEEDS} --deltas ${DELTAS} --results "${RESULTS}")
+[[ -n "${METHODS:-}" ]] && ARGS+=(--methods ${METHODS})
+[[ -n "${ROUNDS:-}" ]]  && ARGS+=(--rounds ${ROUNDS})
+[[ -n "${TIME_BUDGET:-}" ]] && ARGS+=(--time-budget ${TIME_BUDGET})
+[[ -n "${EXTRA:-}" ]]   && ARGS+=(${EXTRA})
+
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    TASK=$(( SLURM_ARRAY_TASK_ID - ${SLURM_ARRAY_TASK_MIN:-0} ))
+    NTASK=$(( ${SLURM_ARRAY_TASK_MAX:-0} - ${SLURM_ARRAY_TASK_MIN:-0} + 1 ))
+else
+    TASK=0; NTASK=1
+fi
+NSHARD=$(( NTASK * WORKERS ))
+echo "mnist_exp: ${ARGS[*]} | array task ${TASK}/${NTASK} x ${WORKERS} workers = shards of ${NSHARD}"
+python examples/CSASFL/run_mnist_exp.py "${ARGS[@]}" --list --shard "$(( TASK * WORKERS ))/${NSHARD}" | head -3 || true
+
+PIDS=()
+for (( w = 0; w < WORKERS; w++ )); do
+    SH=$(( TASK * WORKERS + w ))
+    LOG="slurm/logs/csasfl_mnist_${SLURM_JOB_ID:-manual}_shard${SH}of${NSHARD}.log"
+    OMP_NUM_THREADS=2 python examples/CSASFL/run_mnist_exp.py "${ARGS[@]}" --shard "${SH}/${NSHARD}" > "$LOG" 2>&1 &
+    PIDS+=($!)
+    echo "  shard ${SH}/${NSHARD} -> pid $! (log $LOG)"
+done
+FAIL=0
+for pid in "${PIDS[@]}"; do
+    wait "$pid" || FAIL=1
+done
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv || true
+[[ $FAIL -ne 0 ]] && echo "WARNING: at least one shard failed (see the shard logs); figures use the finished runs"
+
+python examples/CSASFL/plots.py "${PLOT_ARGS[@]}" || echo "plots skipped (no complete runs yet?)"
+echo "Job finished at $(date)"
+exit $FAIL
