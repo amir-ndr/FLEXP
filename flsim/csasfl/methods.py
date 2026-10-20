@@ -98,6 +98,14 @@ class RunConfig:
     H: int = 20                      # re-clustering interval (global rounds)
     clustering: str = "gradient"     # gradient | random (ablation)
     aggregation: str = "weighted"    # weighted | uniform (ablation)
+    # CSA-SFL improvements (defaults = the paper's algorithm; see run_csasfl)
+    sys_lambda: float = 0.0          # (1) system-aware clustering weight (0 = paper)
+    local_work: str = "epochs"       # (2) epochs (paper: E full epochs) | deadline (work capped at slot L) |
+                                     #     slot (capped AND every cluster round lasts >= L)
+    deadline_q: float = 0.5          # (2) slot L = deadline_q-quantile of all devices' t_k
+    agg_mode: str = "buffer"         # (3) buffer (paper Eq. global_update) | delta (each update applied once)
+    staleness: str = "rounds"        # (3) rounds (paper tau = t - t_n) | sweeps (tau = (t - t_n) / N)
+    recluster: str = "halt"          # (4) halt (paper: halt, re-probe, restart affected) | lazy
     # SAFSL
     safsl_buffer_frac: float = 0.8   # aggregate the 0.8K earliest arrivals
     safsl_gamma: float = 1.0
@@ -105,12 +113,34 @@ class RunConfig:
     psfl_lambda: float = 0.5
     psfl_max_cluster: int = 8
 
+    IMPROVEMENT_DEFAULTS = {"sys_lambda": 0.0, "local_work": "epochs", "deadline_q": 0.5,
+                            "agg_mode": "buffer", "staleness": "rounds", "recluster": "halt"}
+
+    def improvements(self) -> dict:
+        """The CSA-SFL improvement options that differ from the paper's algorithm."""
+        return {k: getattr(self, k) for k, v in self.IMPROVEMENT_DEFAULTS.items() if getattr(self, k) != v}
+
     def variant(self) -> str:
         if self.method != "csasfl":
             return "-"
-        return {("gradient", "weighted"): "full", ("gradient", "uniform"): "uniform_agg",
+        base = {("gradient", "weighted"): "full", ("gradient", "uniform"): "uniform_agg",
                 ("random", "weighted"): "random_cluster"}.get((self.clustering, self.aggregation),
-                                                               f"{self.clustering}_{self.aggregation}")
+                                                              f"{self.clustering}_{self.aggregation}")
+        imp = self.improvements()
+        tags = []
+        if "sys_lambda" in imp:
+            tags.append(f"sys{self.sys_lambda:g}")
+        if self.local_work == "deadline":
+            tags.append(f"dl{self.deadline_q:g}")
+        if self.local_work == "slot":
+            tags.append(f"slot{self.deadline_q:g}")
+        if self.agg_mode == "delta":
+            tags.append("delta")
+        if self.staleness == "sweeps":
+            tags.append("sw")
+        if self.recluster == "lazy":
+            tags.append("lazy")
+        return base + "".join("+" + t for t in tags)
 
 
 class _Slot:
@@ -155,13 +185,16 @@ class Context:
     # schedules + lock-step group training
     # ------------------------------------------------------------------
 
-    def schedule(self, members, iters=None):
+    def schedule(self, members, iters=None, caps=None):
         """Stack the members' batch schedules, longest first. Epoch mode (iters None): E
-        epochs of each device's own data; iteration mode: iters[i] full batches for member i.
+        epochs of each device's own data, optionally cut to the first caps[i] batches (CSA-SFL
+        deadline mode); iteration mode: iters[i] full batches for member i.
         Returns (order, I (n,L,B), M (n,L,B), active counts per step)."""
         cfg = self.cfg
         if iters is None:
             sch = [self.streams[k].epochs(cfg.E, cfg.B) for k in members]
+            if caps is not None:
+                sch = [(I_[:int(c)], M_[:int(c)]) for (I_, M_), c in zip(sch, caps)]
         else:
             sch = [self.streams[k].iters(int(n), cfg.B) for k, n in zip(members, iters)]
         lens = np.array([s[0].shape[0] for s in sch])
@@ -384,13 +417,54 @@ def run_parallelsfl(ctx: Context):
 # ======================================================================
 
 def run_csasfl(ctx: Context):
+    """CSA-SFL (paper Algorithm 1) with the optional improvements of RunConfig (all off = paper):
+      (1) sys_lambda > 0   clustering on gradient direction AND local-round time
+                           (CSASFL.cluster_system_aware; z_k = standardized log of the device's round time)
+      (2) local_work = deadline   global time slot L = deadline_q-quantile of all t_k: device k makes
+                           n_k = min(E ceil(|D_k|/B), max(1, floor(L s_k / t_0))) mini-batch steps (the first
+                           n_k of its E-epoch schedule), cluster time = max_k n_k t_0 / s_k; device sides are
+                           combined FedNova-style  w^c = w^c_0 - tau_eff sum_k p_k (w^c_0 - w^c_k) / n_k,
+                           p_k = |D_k|/|D_n|, tau_eff = sum_k p_k n_k  (= Eq. intra_agg when all n_k are equal)
+          local_work = slot      the same work cap, and every cluster round lasts at least L:
+                           cluster time = max(L, max_k n_k t_0 / s_k). All clusters then complete at the same
+                           cadence (no flood of tiny fast-cluster rounds, no update-frequency bias)
+      (3) agg_mode = delta  each cluster update applied once to the CURRENT global:
+                           w^{t+1} = w^t + psi_n (w_bar_n - w^{t_n}),  psi_n = |D_n|/|D| * 1/(1+tau_n)
+                           (uniform ablation: psi_n = 1/N); no buffer of old models
+          staleness = sweeps   tau_n = (t - t_n) / N (in buffer or delta mode)
+      (4) recluster = lazy  every H rounds the PS re-clusters from the device updates it already holds
+                           (g_k = (w^c_start - w^c_k)/n_k of the device's last round; the initial probe before
+                           that) -- no halt, no probe traffic; an unchanged cluster keeps running, every other
+                           in-flight cluster finishes its round normally (its update is aggregated) and then
+                           dissolves; a new cluster starts from the current global as soon as all its members
+                           are free. No work is ever discarded."""
     cfg, K, E, B, t0 = ctx.cfg, ctx.cfg.K, ctx.cfg.E, ctx.cfg.B, ctx.cfg.t0
     algo = CSASFL(num_clusters=cfg.N, recluster_every=cfg.H, local_iters=E, global_rounds=cfg.T,
                   clustering=cfg.clustering, aggregation=cfg.aggregation)
     dims, s, sizes = ctx.dims, ctx.speeds, ctx.sizes
-    dur = lambda mem: float(max(ctx.tk[k] for k in mem))
+    for opt, ok in (("local_work", ("epochs", "deadline", "slot")), ("agg_mode", ("buffer", "delta")),
+                    ("staleness", ("rounds", "sweeps")), ("recluster", ("halt", "lazy"))):
+        if getattr(cfg, opt) not in ok:
+            raise ValueError(f"{opt} must be one of {ok}, got {getattr(cfg, opt)!r}")
+    deadline = cfg.local_work in ("deadline", "slot")          # local work capped by the slot L
+    floor = cfg.local_work == "slot"                            # ... and rounds last at least L
+    lazy = cfg.recluster == "lazy"
+    nb_full = np.array([E * batches(int(n), B) for n in sizes])
+    if deadline:
+        L_slot = float(np.quantile(ctx.tk, cfg.deadline_q))
+        # (+1e-9: a device whose t_k equals L exactly must keep all its batches despite float rounding)
+        nb_cap = np.minimum(nb_full, np.maximum(1, np.floor(L_slot * s / t0 + 1e-9).astype(np.int64)))
+        rt = nb_cap * t0 / s                                    # per-device round time
+    else:
+        L_slot, nb_cap, rt = None, nb_full, ctx.tk
+    lt = np.log(rt)
+    zsys = {k: float(v) for k, v in enumerate((lt - lt.mean()) / max(lt.std(), 1e-12))}
+    dur = ((lambda mem: max(L_slot, float(max(rt[k] for k in mem)))) if floor
+           else (lambda mem: float(max(rt[k] for k in mem))))
     D_of = lambda mem: float(sizes[list(mem)].sum())
+    D_tot = float(sizes.sum())
     heap, seq = [], [0]
+    last_dir = None                                             # (K, d_c) last update direction (lazy)
 
     def schedule(sl, t_start):
         sl.began, sl.done = t_start, t_start + dur(sl.members)
@@ -398,9 +472,14 @@ def run_csasfl(ctx: Context):
         seq[0] += 1
         heapq.heappush(heap, (sl.done, seq[0], sl.sid, sl.token))
 
+    def cluster(grads):
+        if cfg.sys_lambda > 0:
+            return algo.cluster_system_aware(grads, zsys, cfg.sys_lambda, ctx.rng)
+        return algo.cluster_by_gradient(grads, ctx.rng)
+
     def probe(owner):
         """Device-side gradients g_k of every device on its own current version (owner[k] =
-        its cluster's (w^c, w^s)); returns ({k: g_k}, halt time, bytes)."""
+        its cluster's (w^c, w^s)); returns ({k: g_k}, (K, d_c) tensor, halt time, bytes)."""
         P = [ctx.streams[k].probe(B) for k in range(K)]
         I, M = torch.stack([p[0] for p in P]), torch.stack([p[1] for p in P])
         dev2d = torch.stack([owner[k][0] for k in range(K)])
@@ -410,26 +489,43 @@ def run_csasfl(ctx: Context):
         grads = {k: G[k].double().cpu().numpy() for k in range(K)}
         halt = float(max(t0 / s[k] for k in range(K)))
         nbytes = sum(dims.probe(min(B, int(sizes[k]))) for k in range(K))
-        return grads, halt, nbytes
+        return grads, G, halt, nbytes
 
     def train(sl):
+        """One intra-cluster round from sl.start. Returns ((w^c_bar, w^s), loss, {k: samples})."""
         mem = sl.members
-        sched = ctx.schedule(mem)
+        sched = ctx.schedule(mem, caps=[nb_cap[k] for k in mem] if deadline else None)
         m_sorted = [mem[i] for i in sched[0]]
         Dk = ctx.D_t[m_sorted]
         dev = sl.start[0].repeat(len(mem), 1)
         srv = sl.start[1].clone()
         loss = ctx.run_group(dev, srv, "shared", sched, wts=Dk)            # Eq. server_update / device_update
-        dev_bar = (Dk / Dk.sum()) @ dev                                    # Eq. intra_agg
-        return (dev_bar, srv), loss                                        # Eq. form
+        steps = torch.tensor([float(nb_cap[k]) for k in m_sorted], device=ctx.device)
+        if deadline:                                                       # FedNova-normalized Eq. intra_agg
+            p = Dk / Dk.sum()
+            d_k = (sl.start[0][None, :] - dev) / steps[:, None]
+            dev_bar = sl.start[0] - (p * steps).sum() * (p @ d_k)
+            samples = sched[2].sum(dim=(1, 2)).tolist()
+            samp = {k: float(n) for k, n in zip(m_sorted, samples)}
+        else:
+            dev_bar = (Dk / Dk.sum()) @ dev                                # Eq. intra_agg
+            samp = {k: E * int(sizes[k]) for k in mem}
+        if lazy:                                                           # g_k for the next lazy re-clustering
+            last_dir[m_sorted] = (sl.start[0][None, :] - dev) / steps[:, None]
+        return (dev_bar, srv), loss, samp                                  # Eq. form
+
+    def stale_of(x, t):
+        return (t - x.t_ref) / cfg.N if cfg.staleness == "sweeps" else t - x.t_ref
 
     g = (ctx.dev0, ctx.srv0)
     comm = K * dims.device_model()                       # every device downloads w^{c,0}
     now = 0.0
     if algo.clustering == "gradient":
-        grads, h0, b0 = probe({k: g for k in range(K)})
-        clusters = algo.cluster_by_gradient(grads, ctx.rng)
+        grads, G0, h0, b0 = probe({k: g for k in range(K)})
+        clusters = cluster(grads)
         now, comm = now + h0, comm + b0
+        if lazy:
+            last_dir = G0.clone()
     else:
         clusters = algo.random_clusters(range(K), ctx.rng)
     slots = {}
@@ -437,33 +533,52 @@ def run_csasfl(ctx: Context):
         sl = _Slot(C, D_of(C), g, 0)
         slots[sl.sid] = sl
         schedule(sl, now)
-    ctx.record(0, now, comm, comm, g[0], g[1], float("nan"), num_clusters=len(slots))
+    ctx.record(0, now, comm, comm, g[0], g[1], float("nan"), num_clusters=len(slots),
+               slot_s=L_slot if deadline else np.nan)
 
+    pending, idle = [], set()                            # lazy re-clustering state
+    trace = getattr(ctx, "trace", None)                  # verification hook (flsim.csasfl.checks)
+    skipped = 0
     t = 0
     prev = now
     while t < cfg.T and heap:
         when, _, sid, tok = heapq.heappop(heap)
         sl = slots.get(sid)
         if sl is None or tok != sl.token:
+            skipped += 1
             continue                                     # event of a cluster dissolved / rescheduled
         now = when
-        sl.buf, loss = train(sl)
+        g_before = g
+        upd, loss, samp = train(sl)
         order = list(slots.values())
-        stale = [t - x.t_ref for x in order]
-        phi = algo.agg_weights([x.D for x in order], stale)                                 # Eq. phi
-        g = (ctx.wavg([x.buf[0] for x in order], phi), ctx.wavg([x.buf[1] for x in order], phi))  # Eq. global_update
+        stale = [stale_of(x, t) for x in order]
         i_n = order.index(sl)
-        tau_n, phi_n = int(stale[i_n]), float(phi[i_n])
-        wait = float(np.mean([sl.done - sl.began - ctx.tk[k] for k in sl.members]))     # intra-cluster straggler wait
-        rb = sum(dims.split_round(E * int(sizes[k])) for k in sl.members)              # its exchange + upload + broadcast
+        if cfg.agg_mode == "buffer":
+            sl.buf = upd
+            phi = algo.agg_weights([x.D for x in order], stale)                                 # Eq. phi
+            g = (ctx.wavg([x.buf[0] for x in order], phi), ctx.wavg([x.buf[1] for x in order], phi))  # Eq. global_update
+            w_n = float(phi[i_n])
+        else:                                                    # (3) update applied once
+            w_n = (1.0 / len(order) if algo.aggregation == "uniform"
+                   else sl.D / D_tot / (1.0 + stale[i_n]))
+            g = (g[0] + w_n * (upd[0] - sl.start[0]), g[1] + w_n * (upd[1] - sl.start[1]))
+            sl.buf = upd
+        tau_n = float(stale[i_n])
+        if trace is not None:
+            trace.append({"t": t, "now": now, "g_before": g_before, "g_after": g, "upd": upd, "start": sl.start,
+                          "w_n": w_n, "D_n": sl.D, "tau_n": tau_n, "members": list(sl.members),
+                          "bufs": [x.buf for x in order], "phi": (list(phi) if cfg.agg_mode == "buffer" else None),
+                          "stale": list(stale), "samp": dict(samp), "began": sl.began, "done": sl.done})
+        wait = float(np.mean([sl.done - sl.began - rt[k] for k in sl.members]))        # intra-cluster straggler wait
+        rb = sum(dims.split_round(samp[k]) for k in sl.members)                      # its exchange + upload + broadcast
         sl.start, sl.t_ref = g, t + 1
         n_aff = 0
         recl = algo.clustering == "gradient" and (t + 1) % algo.H == 0 and t + 1 < cfg.T
-        if recl:
+        if recl and not lazy:
             owner = {k: x.start for x in slots.values() for k in x.members}
-            grads, h, pb = probe(owner)
+            grads, _, h, pb = probe(owner)
             rb += pb
-            new_clusters = algo.cluster_by_gradient(grads, ctx.rng)
+            new_clusters = cluster(grads)
             old = {tuple(x.members): x for x in slots.values()}
             new_slots, kept = {}, set()
             for C in new_clusters:
@@ -487,17 +602,48 @@ def run_csasfl(ctx: Context):
                 if x.sid not in kept and x is not sl:
                     el = max(0.0, now - x.began)
                     for k in x.members:
-                        nb = min(E * batches(int(sizes[k]), B), int(math.floor(el * s[k] / t0)))
+                        nb = min(int(nb_cap[k]), int(math.floor(el * s[k] / t0)))
                         rb += dims.smashed(min(E * int(sizes[k]), nb * B))
             slots = new_slots
         else:
-            schedule(sl, now)
+            if recl:                                      # (4) lazy: new partition from the held updates
+                grads = {k: last_dir[k].double().cpu().numpy() for k in range(K)}
+                new_clusters = cluster(grads)
+                by_members = {tuple(x.members): x for x in slots.values()}
+                kept, pending = set(), []
+                for C in new_clusters:
+                    key = tuple(sorted(int(k) for k in C))
+                    if key in by_members:
+                        kept.add(by_members[key].sid)
+                    else:
+                        pending.append(key)
+                for x in slots.values():
+                    x.dissolve = x.sid not in kept
+                n_aff = len(pending)
+            if getattr(sl, "dissolve", False):            # finished its round under an old partition
+                del slots[sl.sid]
+                idle |= set(sl.members)
+            else:
+                schedule(sl, now)
+            for C in list(pending):                       # start every new cluster whose members are free
+                if all(k in idle for k in C):
+                    x = _Slot(C, D_of(C), g, t + 1)
+                    slots[x.sid] = x
+                    schedule(x, now)
+                    idle -= set(C)
+                    pending.remove(C)
+                    rb += sum(1 for k in C if k not in sl.members) * dims.device_model()
         comm += rb
+        if trace is not None:
+            trace[-1].update(active=[(x.sid, tuple(x.members), bool(getattr(x, "dissolve", False)), x.began, x.done)
+                                     for x in slots.values()], idle=set(idle), pending=list(pending),
+                             skipped=skipped, rb=rb, recl=recl)
         ok = ctx.record(t + 1, now, comm, rb, g[0], g[1], loss, round_latency_s=now - prev,
-                        cluster_id=sl.sid, cluster_size=len(sl.members), staleness=tau_n, phi=phi_n,
-                        staleness_mean=float(np.mean(stale)), staleness_max=int(max(stale)),
+                        cluster_id=sl.sid, cluster_size=len(sl.members), staleness=tau_n, phi=w_n,
+                        staleness_mean=float(np.mean(stale)), staleness_max=float(max(stale)),
                         cluster_time_s=dur(sl.members),
-                        avg_wait_s=wait, recluster=int(recl), n_affected=n_aff, num_clusters=len(slots))
+                        avg_wait_s=wait, recluster=int(recl), n_affected=n_aff, num_clusters=len(slots),
+                        pending=len(pending), idle_devices=len(idle))
         prev = now
         t += 1
         if not ok or ctx.over(now):

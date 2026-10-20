@@ -11,6 +11,9 @@
 #   nsweep    CSA-SFL x N {3,5,7,9,11}, delta 0.1, H 20         (paper Fig. a/b)
 #   hsweep    CSA-SFL x H {10,20,30,40,50}, delta 0.1, N 7      (paper Fig. c)
 #   ablation  CSA-SFL full / uniform phi / random clustering, delta 0.1
+#   variants  CSA-SFL improvement screen: paper / +system-aware clustering / +time slot /
+#             +update-based aggregation (sweeps staleness) / +lazy re-clustering / all four / all but (1)
+#             (EXTRA: --variants ..., --variant-deltas 0.1 10, --sys-lambda 1, --deadline-q 0.5)
 #   plots     only rebuild the figures/tables from the finished runs
 # Environment variables (all optional):
 #   EXP          default "main"  (sweeps/ablation: EXP="nsweep hsweep ablation")
@@ -18,7 +21,7 @@
 #   METHODS      subset of "fl sflv2 safsl parallelsfl csasfl" for EXP=main
 #   DELTAS       default "0.1 10"
 #   TIME_BUDGET  simulated seconds every method trains for, default 50000 (0 = exactly ROUNDS rounds)
-#   ROUNDS       cap on each method's own global rounds, default 5000
+#   ROUNDS       safety cap on each method's own global rounds, default 50000 (time-stopped runs are reused)
 #   RESULTS    results root, default examples/CSASFL/results_mnist_exp
 #   WORKERS    concurrent run processes sharing this job's GPU (default 3); each takes a
 #              cost-balanced slice of the run list (MNIST/LeNet groups do not fill a GPU alone)
@@ -42,6 +45,11 @@
 # MAIN, FIRST SEED (both deltas, 2 GPUs x 3 processes), then the figures:
 #   J=$(sbatch --parsable --array=0-1 --export=ALL,SEEDS=1 slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,EXP=plots --time=00:30:00 slurm/run_csasfl_mnist.slurm
+# CSA-SFL IMPROVEMENT SCREEN (seeds 1-2, both deltas, 10,000 s; the paper variant and the baselines are
+# reused from the finished main runs). An efficient CSA-SFL keeps devices busy, so it trains ~5x more per
+# simulated second than the paper version (time-slot variants ~1,900 MNIST-epochs per run at 10,000 s):
+#   J=$(sbatch --parsable --array=0-3 --export=ALL,EXP=variants,TIME_BUDGET=10000,SEEDS="1 2",EXTRA="--variant-deltas 0.1 10" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,EXP=plots,PLOT_EXTRA="--time-budget 10000" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # MAIN, SEEDS 1-5 (the default; finished runs are skipped, resubmit the same line after a time-out):
 #   J=$(sbatch --parsable --array=0-3 slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,EXP=plots --time=00:30:00 slurm/run_csasfl_mnist.slurm

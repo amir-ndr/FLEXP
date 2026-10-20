@@ -10,7 +10,7 @@ Setup (paper; every value a default of flsim.csasfl.methods.RunConfig):
   delta in {0.1, 10}, >= 10 samples per device; SGD eta = 0.01, E = 5 local epochs, B = 64;
   CSA-SFL N = 7, H = 20. Stopping: every method trains until its simulated clock reaches the same
   --time-budget (default 50,000 s, ~2000 CSA-SFL rounds; the paper's T = 150 CSA-SFL rounds is
-  far too short at sigma_s = 2), --rounds caps each method's own rounds (default 5000; with
+  far too short at sigma_s = 2), --rounds caps each method's own rounds (default 50000; with
   --time-budget 0 every method runs exactly --rounds rounds). Communication = actual FP32
   tensors (device-model down/up, smashed data + labels up, smashed gradients down), cumulative MB;
   the 10k test set is evaluated after every global round. See flsim/csasfl/ for the exact
@@ -22,6 +22,9 @@ Experiments (--exp, any subset; every run is stored once in <results>/runs/):
   hsweep    CSA-SFL x H in --hs (default 10 20 30 40 50), N = 7, delta = 0.1
   ablation  CSA-SFL full / w/o weighted aggregation (phi = 1/N) / w/o gradient clustering (random
             one-time clustering), delta = 0.1
+  variants  CSA-SFL improvement screen (flsim.csasfl.methods.run_csasfl): paper / +system-aware
+            clustering / +time slot / +update-based aggregation with sweeps staleness / +lazy
+            re-clustering / all four / all but system-aware clustering, at --variant-deltas (default 0.1)
 Each run is identified by a hash of its complete configuration; a finished run (all T rounds or
 diverged) is skipped, so a timed-out job is resubmitted unchanged, and the run shared by several
 experiments (CSA-SFL N=7 H=20 delta=0.1 is in all four) is trained once. Paired seeds: the same
@@ -65,11 +68,49 @@ NONIID = 0.1
 N_SWEEP = [3, 5, 7, 9, 11]
 H_SWEEP = [10, 20, 30, 40, 50]
 ABLATION = [("gradient", "weighted"), ("gradient", "uniform"), ("random", "weighted")]
+# CSA-SFL improvement screen (--exp variants). Each improvement alone, all four, and all but (1):
+#   sys       (1) clustering on gradient direction + local-round time, lambda = --sys-lambda
+#   slot      (2) time slot L = --deadline-q quantile of t_k: work capped at L, every round lasts >= L,
+#                 FedNova-normalized device sides  ("deadline" = the cap without the >= L floor; with
+#                 system-aware clustering it floods the PS with tiny fast-cluster rounds, so not in the default)
+#   delta     (3) each cluster update applied once + staleness in sweeps (t - t_n)/N
+#   lazy      (4) re-clustering from held updates, no halt, no discarded work
+VARIANT_NAMES = ["paper", "sys", "slot", "deadline", "delta", "lazy", "all", "all_nosys"]
+DEFAULT_VARIANTS = ["paper", "sys", "slot", "delta", "lazy", "all", "all_nosys"]
+
+
+def variant_overrides(name: str, args) -> dict:
+    one = {"sys": {"sys_lambda": args.sys_lambda},
+           "slot": {"local_work": "slot", "deadline_q": args.deadline_q},
+           "deadline": {"local_work": "deadline", "deadline_q": args.deadline_q},
+           "delta": {"agg_mode": "delta", "staleness": "sweeps"},
+           "lazy": {"recluster": "lazy"}}
+    if name == "paper":
+        return {}
+    if name in ("all", "all_nosys"):
+        keys = ["sys", "slot", "delta", "lazy"] if name == "all" else ["slot", "delta", "lazy"]
+        return {k: v for key in keys for k, v in one[key].items()}
+    return dict(one[name])
+
+
 # relative GPU time per run (sharding). Training-free count, seeds 1-5, 50,000 s budget: lock-steps
 # (each one batched GPU step) / MNIST-epochs of local training per run -- ParallelSFL 346k / 4160,
 # CSA-SFL 347k / 1400 (only ~4 devices per step: launch-overhead bound), SAFSL 215k / 3650,
 # FL & SFLv2 19k / 400 (SFLv2: + a 50-device sequential server loop per step).
 COST = {"parallelsfl": 4.0, "safsl": 3.5, "csasfl": 3.0, "sflv2": 0.8, "fl": 0.4}
+
+
+def run_cost(cfg: RunConfig) -> float:
+    """COST of the method, scaled for the CSA-SFL improvement variants by their measured local
+    training per simulated second relative to the paper (system-aware clustering alone ~12x,
+    time slot / deadline ~5x)."""
+    c = COST.get(cfg.method, 1.0)
+    if cfg.method == "csasfl":
+        if cfg.local_work != "epochs":
+            c *= 5.0
+        elif cfg.sys_lambda > 0:
+            c *= 12.0
+    return c
 
 
 def build_runs(args) -> list:
@@ -97,11 +138,19 @@ def build_runs(args) -> list:
         if "ablation" in args.exp:
             for cl, ag in ABLATION:
                 add("ablation", method="csasfl", delta=NONIID, seed=seed, clustering=cl, aggregation=ag)
+        if "variants" in args.exp:
+            for delta in args.variant_deltas:
+                for name in args.variants:
+                    add("variants", method="csasfl", delta=delta, seed=seed, **variant_overrides(name, args))
     return [(sorted(e), c) for e, c in out.values()]
 
 
 def manifest(cfg: RunConfig) -> dict:
     d = dataclasses.asdict(cfg)
+    # improvement options enter the identity only when they differ from the paper (finished runs keep their hash)
+    for k, v in RunConfig.IMPROVEMENT_DEFAULTS.items():
+        if cfg.method != "csasfl" or d[k] == v:
+            d.pop(k)
     if cfg.method != "csasfl":                   # CSA-SFL-only knobs do not change a baseline's run
         for k in ("N", "H", "clustering", "aggregation"):
             d.pop(k)
@@ -124,11 +173,11 @@ def run_name(cfg: RunConfig) -> str:
 
 def shard(runs: list, i: int, n: int) -> list:
     """Cost-balanced (LPT) deterministic split of the run list into n slices; slice i."""
-    order = sorted(range(len(runs)), key=lambda j: (-COST.get(runs[j][1].method, 1.0), j))
+    order = sorted(range(len(runs)), key=lambda j: (-run_cost(runs[j][1]), j))
     load, own = [0.0] * n, [[] for _ in range(n)]
     for j in order:
         s = int(np.argmin(load))
-        load[s] += COST.get(runs[j][1].method, 1.0)
+        load[s] += run_cost(runs[j][1])
         own[s].append(j)
     return [runs[j] for j in sorted(own[i])]
 
@@ -146,23 +195,29 @@ def is_complete(path: str, T: int, time_budget: float = 0.0) -> bool:
 
 
 def covering_run(cfg: RunConfig, rdir: str):
-    """A finished run of the same configuration with a LONGER (or no) time budget. The budget
-    only decides when a run stops -- nothing before that depends on it -- so the first rows of
-    the longer run, up to the first round at or past cfg.time_budget, ARE this run (plots.py
-    cuts every run at the common budget)."""
-    if cfg.time_budget <= 0:
-        return None
+    """A finished run of the same configuration that already contains this run. The time budget
+    and the round cap T only decide WHEN a run stops (nothing before that depends on them), so
+    another run covers this one if its rows reach this run's stopping point: the first round at
+    or past cfg.time_budget, round cfg.T, or divergence. plots.py cuts every run at the common
+    budget."""
     mine = manifest(cfg)
-    mine.pop("time_budget")
+    for k in ("time_budget", "T"):
+        mine.pop(k)
     for js in sorted(glob.glob(os.path.join(rdir, f"{cfg.method}_d{cfg.delta:g}_s{cfg.seed}_*.json"))):
+        if os.path.basename(js)[:-5] == run_name(cfg):
+            continue
         with open(js) as f:
             other = json.load(f)
-        tb = float(other.get("time_budget", 0.0))
-        if not (tb <= 0 or tb > cfg.time_budget):
+        if {k: v for k, v in other.items() if k not in ("time_budget", "T", "run_id", "experiments")} != mine:
             continue
-        if {k: v for k, v in other.items() if k not in ("time_budget", "run_id", "experiments")} != mine:
+        path = js[:-5] + ".csv"
+        if not is_complete(path, int(other["T"]), float(other.get("time_budget", 0.0))):
             continue
-        if is_complete(js[:-5] + ".csv", int(other["T"]), tb):
+        df = pd.read_csv(path)
+        stop = (df["round"] >= cfg.T) | df["diverged"].astype(bool)
+        if cfg.time_budget > 0:
+            stop |= df["sim_time_s"] >= cfg.time_budget
+        if stop.any():
             return os.path.basename(js)[:-5]
     return None
 
@@ -225,13 +280,20 @@ def run_one(cfg: RunConfig, exps: list, data: dict, args) -> str:
 def main():
     global RESULTS
     p = argparse.ArgumentParser(description="mnist_exp: CSA-SFL paper setup (comparison, N/H sweeps, ablation)")
-    p.add_argument("--exp", nargs="+", default=["main"], choices=["main", "nsweep", "hsweep", "ablation"])
+    p.add_argument("--exp", nargs="+", default=["main"], choices=["main", "nsweep", "hsweep", "ablation", "variants"])
+    p.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANT_NAMES,
+                   help="CSA-SFL improvement variants of --exp variants")
+    p.add_argument("--variant-deltas", nargs="+", type=float, default=[NONIID], help="deltas of --exp variants")
+    p.add_argument("--sys-lambda", type=float, default=1.0, help="(1) weight of the system term in the clustering")
+    p.add_argument("--deadline-q", type=float, default=0.5, help="(2) time slot L = this quantile of the devices' t_k")
     p.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS, help="methods of --exp main")
     p.add_argument("--deltas", nargs="+", type=float, default=DELTAS, help="Dirichlet deltas of --exp main")
     p.add_argument("--seeds", nargs="+", type=int, default=[1], help="paired seeds (paper: 20 runs, e.g. 1..20)")
     p.add_argument("--ns", nargs="+", type=int, default=N_SWEEP)
     p.add_argument("--hs", nargs="+", type=int, default=H_SWEEP)
-    p.add_argument("--rounds", type=int, default=5000, help="cap on every method's own global rounds")
+    p.add_argument("--rounds", type=int, default=50000,
+                   help="safety cap on every method's own global rounds (the time budget normally stops a run first; "
+                        "runs that stopped by time under a smaller cap are reused)")
     p.add_argument("--time-budget", type=float, default=50000.0,
                    help="stop every method once its simulated time reaches this (s); 0 = exactly --rounds rounds")
     p.add_argument("--K", type=int, default=50)

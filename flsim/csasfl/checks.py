@@ -14,6 +14,8 @@ flsim/csasfl/checks.py: correctness checks for the CSA-SFL paper setup (run befo
   7 partition   disjoint cover of the training set, >= min_per_device, delta controls skew
   8 runs        tiny CSA-SFL / SAFSL / FL / SFLv2 / ParallelSFL runs: event-loop invariants
                 (time non-decreasing, staleness, re-clustering every H, comm formulas)
+  9 variants    (python -m flsim.csasfl.checks --variants, ~10 min) the four CSA-SFL improvement
+                options, each formula / invariant verified exactly through run_csasfl's trace hook
 """
 
 import math
@@ -205,8 +207,81 @@ def main():
     check("ParallelSFL: T rounds, tau in [1, tau_max]",
           len(rows) == 13 and all(1 <= r["tau_min"] <= r["tau_max"] for r in rows[1:]))
 
+    if "--variants" in sys.argv:
+        check_variants(small, spec, cpu)
     print(f"\n{'ALL CHECKS PASSED' if not _fails else f'{len(_fails)} FAILED: {_fails}'}")
     return 1 if _fails else 0
+
+
+def check_variants(small, spec, cpu):
+    """9 CSA-SFL improvement options (RunConfig sys_lambda / local_work / agg_mode / staleness /
+    recluster), verified exactly on small runs through the trace hook of run_csasfl."""
+    from flsim.csasfl.methods import Context, run_csasfl
+    from flsim.csasfl.system import batches
+    print("9 CSA-SFL improvements (--variants)")
+    base = dict(method="csasfl", delta=0.1, seed=2, K=12, E=2, B=32, lr=0.01, T=24, time_budget=0.0, N=3, H=4)
+
+    def go(**kw):
+        cfg = RunConfig(**{**base, **kw})
+        ctx = Context(cfg, small, Engine(spec, 8, 0.01, cpu, "vmap" if _HAS_FUNC else "loop"), log=lambda *a: None)
+        ctx.trace = []
+        return cfg, ctx, run_csasfl(ctx), ctx.trace
+
+    close = lambda a, b, tol=1e-5: float((a - b).abs().max()) <= tol * max(1.0, float(b.abs().max()))
+    # (1) system-aware clustering
+    r0 = np.random.RandomState(0)
+    gr = {k: r0.randn(300) + (k % 3) * r0.randn(300) for k in range(30)}
+    z = {k: float(r0.randn()) for k in range(30)}
+    c1 = CSASFL(num_clusters=4).cluster_by_gradient(gr, np.random.RandomState(5))
+    c2 = CSASFL(num_clusters=4).cluster_system_aware(gr, z, 0.0, np.random.RandomState(5))
+    check("(1) lam = 0 reproduces the paper's clustering", sorted(map(sorted, c1)) == sorted(map(sorted, c2)))
+    c3 = CSASFL(num_clusters=4).cluster_system_aware(gr, z, 1e6, np.random.RandomState(5))
+    spans = sorted((min(z[k] for k in c), max(z[k] for k in c)) for c in c3)
+    check("(1) lam -> inf gives speed tiers", all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)))
+    # (2) deadline local work
+    cfg, ctx, rows, tr = go(local_work="deadline", deadline_q=0.5)
+    L, sp = float(np.quantile(ctx.tk, 0.5)), ctx.speeds
+    ncap = {k: min(2 * batches(int(ctx.sizes[k]), 32), max(1, int(math.floor(L * sp[k] / 0.2 + 1e-9)))) for k in range(12)}
+    check("(2) cluster time = max_k n_k t0/s_k (n_k = steps that fit in the slot, >= 1, <= E epochs)",
+          all(math.isclose(e["done"] - e["began"], max(ncap[k] * 0.2 / sp[k] for k in e["members"]), rel_tol=1e-9) for e in tr))
+    cfg, ctx, rows, tr = go(local_work="slot", deadline_q=0.5)
+    check("(2) slot: same work cap, and cluster time = max(L, max_k n_k t0/s_k) (every round lasts >= L)",
+          all(math.isclose(e["done"] - e["began"], max(L, max(ncap[k] * 0.2 / sp[k] for k in e["members"])), rel_tol=1e-9)
+              for e in tr) and min(e["done"] - e["began"] for e in tr) >= L - 1e-9)
+    p = torch.rand(5); p /= p.sum(); w0 = torch.randn(20); W = torch.randn(5, 20); st = torch.full((5,), 7.0)
+    check("(2) FedNova combination = Eq. intra_agg when all step counts are equal",
+          close(w0 - (p * st).sum() * (p @ ((w0[None] - W) / st[:, None])), p @ W, 1e-6))
+    _, _, ra, _ = go(local_work="deadline", deadline_q=1.0, H=1000)
+    _, _, rb, _ = go(H=1000)
+    check("(2) deadline q=1 (nobody cut), no re-clustering: times and traffic = paper",
+          len(ra) == len(rb) and all(math.isclose(a["sim_time_s"], b["sim_time_s"], rel_tol=1e-12)
+                                     and math.isclose(a["comm_mb"], b["comm_mb"], rel_tol=1e-12) for a, b in zip(ra, rb)))
+    # (3) update-based aggregation + sweeps staleness
+    cfg, ctx, rows, tr = go(agg_mode="delta", staleness="sweeps")
+    Dt = float(ctx.sizes.sum())
+    check("(3) w^(t+1) = w^t + psi_n (w_bar_n - w^(t_n)) at every round",
+          all(close(e["g_after"][i], e["g_before"][i] + e["w_n"] * (e["upd"][i] - e["start"][i])) for e in tr for i in (0, 1)))
+    check("(3) psi_n = |D_n|/|D| / (1 + (t - t_n)/N)",
+          all(math.isclose(e["w_n"], e["D_n"] / Dt / (1 + e["tau_n"]), rel_tol=1e-12) for e in tr)
+          and all(abs(e["tau_n"] * 3 - round(e["tau_n"] * 3)) < 1e-12 for e in tr))
+    cfg, ctx, rows, tr = go(staleness="sweeps")
+    check("(3) buffer mode with sweeps staleness keeps Eq. global_update: w = sum phi_m b_m",
+          all(close(e["g_after"][0], sum(f * bb[0] for f, bb in zip(e["phi"], e["bufs"]))) for e in tr))
+    # (4) lazy re-clustering, alone and with everything else
+    for kw in ({}, {"agg_mode": "delta", "staleness": "sweeps", "sys_lambda": 1.0, "local_work": "slot"}):
+        cfg, ctx, rows, tr = go(recluster="lazy", T=40, **kw)
+        tag = "lazy" + ("+all" if kw else "")
+        part = all(len(m) == len(set(m)) and set(m).isdisjoint(e["idle"]) and set(m) | e["idle"] == set(range(12))
+                   for e in tr for m in [[x for _, ms, _, _, _ in e["active"] for x in ms]])
+        wait_ok = all(set(x for C in e["pending"] for x in C) <= (e["idle"] | {x for _, ms, dz, _, _ in e["active"] if dz for x in ms})
+                      for e in tr)
+        dm = ctx.dims.device_model()
+        extra = [e["rb"] - sum(ctx.dims.split_round(e["samp"][k]) for k in e["members"]) for e in tr]
+        check(f"(4) [{tag}] no work discarded, partition consistent, pending waits only for free/finishing devices",
+              tr[-1]["skipped"] == 0 and part and wait_ok)
+        check(f"(4) [{tag}] no halts and no probe traffic after the start",
+              all(x >= -1e-6 and abs(x / dm - round(x / dm)) < 1e-9 for x in extra)
+              and sum(r["recluster"] for r in rows[1:]) > 0 and set(k for e in tr for k in e["members"]) == set(range(12)))
 
 
 if __name__ == "__main__":

@@ -126,6 +126,68 @@ class CSASFL:
             clusters[int(best[i])].append(c)
         return [c for c in clusters if c]
 
+    def cluster_system_aware(self, gradients: dict, system: dict, lam: float,
+                             rng: np.random.RandomState) -> list:
+        """
+        Gradient + system-behaviour K-means (improvement 1; lam = 0 is the paper's clustering,
+        use cluster_by_gradient for it). Each device k carries its gradient g_k and a scalar
+        system feature z_k (the caller passes the standardized log of its local-round time), and
+            min sum_n sum_{k in C_n} [ (1 - cos(g_k, mu_n)) + lam * (z_k - c_n)^2 ],
+            mu_n = mean of the cluster's g_k (paper),  c_n = mean of the cluster's z_k,
+        so devices are grouped by update direction AND by how long their local round takes,
+        which bounds the intra-cluster straggler wait. Lloyd iterations with k-means++ seeding
+        on the same cost; the partition with the lowest objective seen is returned.
+        """
+        cids = list(gradients.keys())
+        G = np.stack([np.asarray(gradients[c], dtype=np.float64) for c in cids])
+        norms = np.linalg.norm(G, axis=1, keepdims=True)
+        norms[norms == 0.0] = 1.0
+        U = G / norms
+        z = np.array([float(system[c]) for c in cids])
+        N = min(self.N, len(cids))
+        lam = float(lam)
+
+        # k-means++ seeding on the joint point-to-point cost
+        chosen = [int(rng.randint(len(U)))]
+        for _ in range(1, N):
+            dist = np.min(np.stack([(1.0 - U @ U[j]) + lam * (z - z[j]) ** 2 for j in chosen]), axis=0)
+            dist = np.clip(dist, 0.0, None)
+            s = dist.sum()
+            chosen.append(int(rng.choice(len(U), p=dist / s if s > 0 else np.full(len(U), 1.0 / len(U)))))
+        C, c = U[chosen].copy(), z[chosen].copy()
+
+        def cost(C, c):                                          # (K, N) assignment cost
+            return (1.0 - U @ C.T) + lam * (z[:, None] - c[None, :]) ** 2
+
+        labels = cost(C, c).argmin(axis=1)
+        best_obj, best = np.inf, None
+        for _ in range(self.kmeans_iters):
+            for n in range(N):                                   # refill an empty cluster with the worst-fit device
+                if np.any(labels == n):
+                    continue
+                own = cost(C, c)[np.arange(len(U)), labels]
+                sizes = np.bincount(labels, minlength=N)
+                for i in np.argsort(-own):
+                    if sizes[labels[i]] > 1:
+                        labels[i] = n
+                        break
+            mu = np.stack([G[labels == n].mean(axis=0) for n in range(N)])
+            mn = np.linalg.norm(mu, axis=1, keepdims=True)
+            C = mu / np.where(mn > 0, mn, 1.0)
+            c = np.array([z[labels == n].mean() for n in range(N)])
+            obj = float(cost(C, c)[np.arange(len(U)), labels].sum())
+            if obj < best_obj - 1e-12:
+                best_obj, best = obj, labels.copy()
+            new_labels = cost(C, c).argmin(axis=1)
+            if np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+        self.last_objective = best_obj
+        clusters = [[] for _ in range(N)]
+        for i, cid in enumerate(cids):
+            clusters[int(best[i])].append(cid)
+        return [cl for cl in clusters if cl]
+
     @staticmethod
     def _fill_empty(labels: np.ndarray, U: np.ndarray, C: np.ndarray, N: int) -> np.ndarray:
         """Give every empty cluster the worst-fitting device of a cluster with > 1 member."""

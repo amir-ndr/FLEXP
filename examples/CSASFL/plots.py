@@ -55,7 +55,7 @@ def load(results: str) -> pd.DataFrame:
     return df
 
 
-CONFIG_COLS = ["method", "variant", "delta", "seed", "K", "E", "B", "lr", "T", "t0", "sigma_s", "N", "H"]
+CONFIG_COLS = ["method", "variant", "delta", "seed", "K", "E", "B", "lr", "t0", "sigma_s", "N", "H"]  # not T: a cap
 
 
 def common_budget(df: pd.DataFrame, budget=None) -> pd.DataFrame:
@@ -81,6 +81,32 @@ def common_budget(df: pd.DataFrame, budget=None) -> pd.DataFrame:
         n_cut = int((tbs > budget).sum())
         print(f"[plots] common time budget {budget:g} s" + (f" ({n_cut} longer runs cut)" if n_cut else ""))
     return df
+
+
+def variant_label(v: str) -> str:
+    """'full+sys1+dl0.5+delta+sw+lazy' -> readable legend label."""
+    tags = v.split("+")[1:]
+    if not tags:
+        return "CSA-SFL (paper)"
+    names = []
+    for tg in tags:
+        if tg.startswith("sys"):
+            names.append(f"sys-aware clust. (lam={tg[3:]})")
+        elif tg.startswith("dl"):
+            names.append(f"deadline (q={tg[2:]})")
+        elif tg.startswith("slot"):
+            names.append(f"time slot (q={tg[4:]})")
+        elif tg == "delta":
+            names.append("update agg.")
+        elif tg == "sw":
+            names.append("sweeps staleness")
+        elif tg == "lazy":
+            names.append("lazy re-clust.")
+    if len(tags) >= 5:
+        return "CSA-SFL + all 4 improvements"
+    if len(tags) == 4 and not any(t.startswith("sys") for t in tags):
+        return "CSA-SFL + all but sys-aware clust."
+    return "+ " + ", ".join(names)
 
 
 def runs_of(df, **sel):
@@ -266,7 +292,7 @@ def main():
 
     # ---- ablation ----
     ab = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid)]
-    if ab["variant"].nunique() > 1:
+    if ab["variant"].isin(["uniform_agg", "random_cluster"]).any():
         groups = {VARIANT_LABEL.get(v, v): runs_of(ab, variant=v, N=args.N, H=args.H)
                   for v in ["full", "uniform_agg", "random_cluster"] if (ab["variant"] == v).any()}
         styles = {VARIANT_LABEL["full"]: {"color": COLOR["csasfl"], "lw": 2.4},
@@ -278,6 +304,32 @@ def main():
         t = summary_rows(groups, args.targets)
         t.to_csv(os.path.join(out, "ablation_table.csv"), index=False)
         report += fmt_table(t, "ablation", args.targets)
+
+    # ---- CSA-SFL improvement variants (run_mnist_exp.py --exp variants) ----
+    cv = df[(df["method"] == "csasfl") & np.isclose(df["N"], args.N) & np.isclose(df["H"], args.H)
+            & df["variant"].astype(str).str.startswith("full")]
+    for delta in sorted(cv["delta"].unique()):
+        names = sorted(cv[np.isclose(cv["delta"], delta)]["variant"].unique(), key=lambda v: (v.count("+"), v))
+        if len(names) < 2:
+            continue
+        groups = {variant_label(v): runs_of(cv, delta=delta, variant=v) for v in names}
+        ref = {LABEL[m]: runs_of(df, method=m, delta=delta) for m in ("parallelsfl", "safsl", "sflv2", "fl")}
+        ref = {k: v for k, v in ref.items() if v}
+        palette = plt.cm.tab10.colors
+        styles = {lab: {"color": palette[i % 10], "lw": 2.2 if i in (0, len(groups) - 1) else 1.5}
+                  for i, lab in enumerate(groups)}
+        styles.update({LABEL[m]: {"color": "#999999", "ls": ls, "lw": 1.0}
+                       for m, ls in (("parallelsfl", ":"), ("safsl", "--"), ("sflv2", "-."), ("fl", (0, (1, 3))))})
+        tb = float(cv["time_budget"].max()) if "time_budget" in cv else 0.0
+        title = f"CSA-SFL improvements, delta = {delta:g} (grey: baselines)"
+        for xcol, log, suf, xm in (("sim_time_s", False, "time", args.tmax or (tb if tb > 0 else None)),
+                                   ("sim_time_s", True, "time_log", None), ("comm_mb", True, "comm", None)):
+            curves = {k: mean_curve(v, xcol, log=log) for k, v in {**groups, **ref}.items()}
+            plot_curves(curves, xcol, os.path.join(out, f"variants_delta{delta:g}_{suf}"), title, log=log,
+                        xmax=xm, styles=styles)
+        t = summary_rows({**groups, **ref}, args.targets)
+        t.to_csv(os.path.join(out, f"variants_delta{delta:g}_table.csv"), index=False)
+        report += fmt_table(t, f"CSA-SFL improvements, delta = {delta:g}", args.targets)
 
     with open(os.path.join(out, "tables.txt"), "w") as f:
         f.write(report)
