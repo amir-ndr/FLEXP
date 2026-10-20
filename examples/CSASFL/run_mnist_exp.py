@@ -75,7 +75,15 @@ ABLATION = [("gradient", "weighted"), ("gradient", "uniform"), ("random", "weigh
 #                 system-aware clustering it floods the PS with tiny fast-cluster rounds, so not in the default)
 #   delta     (3) each cluster update applied once + staleness in sweeps (t - t_n)/N
 #   lazy      (4) re-clustering from held updates, no halt, no discarded work
-VARIANT_NAMES = ["paper", "sys", "slot", "deadline", "delta", "lazy", "all", "all_nosys"]
+# Second screen (targets the problems found in the first one):
+#   sys_lazy             (1)+(4): system-aware clustering without halts/restarts (slow clusters can finish)
+#   slot_batch           (2) with simultaneous arrivals aggregated together (no restarts from partial models)
+#   slot_batch_lazy      + lazy re-clustering (no halts)
+#   slot_batch_lazy_q25  the same with a shorter slot (L = 25th percentile of t_k): less local drift on
+#                        label-homogeneous clusters, twice as frequent mixing
+VARIANT_NAMES = ["paper", "sys", "slot", "deadline", "delta", "lazy", "all", "all_nosys",
+                 "sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25"]
+SCREEN2 = ["sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25"]
 DEFAULT_VARIANTS = ["paper", "sys", "slot", "delta", "lazy", "all", "all_nosys"]
 
 
@@ -87,6 +95,15 @@ def variant_overrides(name: str, args) -> dict:
            "lazy": {"recluster": "lazy"}}
     if name == "paper":
         return {}
+    if name == "sys_lazy":
+        return {**one["sys"], **one["lazy"]}
+    if name.startswith("slot_batch"):
+        o = {**one["slot"], "batch_arrivals": True}
+        if "lazy" in name:
+            o.update(one["lazy"])
+        if name.endswith("_q25"):
+            o["deadline_q"] = 0.25
+        return o
     if name in ("all", "all_nosys"):
         keys = ["sys", "slot", "delta", "lazy"] if name == "all" else ["slot", "delta", "lazy"]
         return {k: v for key in keys for k, v in one[key].items()}
@@ -107,7 +124,7 @@ def run_cost(cfg: RunConfig) -> float:
     c = COST.get(cfg.method, 1.0)
     if cfg.method == "csasfl":
         if cfg.local_work != "epochs":
-            c *= 5.0
+            c *= 5.0 * (2.0 if cfg.deadline_q <= 0.25 else 1.0)
         elif cfg.sys_lambda > 0:
             c *= 12.0
     return c
@@ -139,8 +156,9 @@ def build_runs(args) -> list:
             for cl, ag in ABLATION:
                 add("ablation", method="csasfl", delta=NONIID, seed=seed, clustering=cl, aggregation=ag)
         if "variants" in args.exp:
+            names = [v for n in args.variants for v in (SCREEN2 if n == "screen2" else [n])]
             for delta in args.variant_deltas:
-                for name in args.variants:
+                for name in names:
                     add("variants", method="csasfl", delta=delta, seed=seed, **variant_overrides(name, args))
     return [(sorted(e), c) for e, c in out.values()]
 
@@ -281,8 +299,8 @@ def main():
     global RESULTS
     p = argparse.ArgumentParser(description="mnist_exp: CSA-SFL paper setup (comparison, N/H sweeps, ablation)")
     p.add_argument("--exp", nargs="+", default=["main"], choices=["main", "nsweep", "hsweep", "ablation", "variants"])
-    p.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANT_NAMES,
-                   help="CSA-SFL improvement variants of --exp variants")
+    p.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANT_NAMES + ["screen2"],
+                   help="CSA-SFL improvement variants of --exp variants ('screen2' = " + " ".join(SCREEN2) + ")")
     p.add_argument("--variant-deltas", nargs="+", type=float, default=[NONIID], help="deltas of --exp variants")
     p.add_argument("--sys-lambda", type=float, default=1.0, help="(1) weight of the system term in the clustering")
     p.add_argument("--deadline-q", type=float, default=0.5, help="(2) time slot L = this quantile of the devices' t_k")

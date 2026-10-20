@@ -84,10 +84,15 @@ def common_budget(df: pd.DataFrame, budget=None) -> pd.DataFrame:
 
 
 def variant_label(v: str) -> str:
-    """'full+sys1+dl0.5+delta+sw+lazy' -> readable legend label."""
+    """'full+sys1+slot0.5+delta+sw+lazy' -> readable legend label."""
     tags = v.split("+")[1:]
     if not tags:
         return "CSA-SFL (paper)"
+    kinds = {("sys" if t.startswith("sys") else "slot" if t.startswith("slot") else t) for t in tags}
+    if kinds == {"sys", "slot", "delta", "sw", "lazy"}:
+        return "CSA-SFL + all 4 improvements"
+    if kinds == {"slot", "delta", "sw", "lazy"}:
+        return "CSA-SFL + all but sys-aware clust."
     names = []
     for tg in tags:
         if tg.startswith("sys"):
@@ -102,10 +107,8 @@ def variant_label(v: str) -> str:
             names.append("sweeps staleness")
         elif tg == "lazy":
             names.append("lazy re-clust.")
-    if len(tags) >= 5:
-        return "CSA-SFL + all 4 improvements"
-    if len(tags) == 4 and not any(t.startswith("sys") for t in tags):
-        return "CSA-SFL + all but sys-aware clust."
+        elif tg == "batch":
+            names.append("batched arrivals")
     return "+ " + ", ".join(names)
 
 
@@ -124,9 +127,19 @@ def hold(x, y, grid):
     return out
 
 
+def persistent(r):
+    """The model state that actually persists at each simulated instant: the last row per
+    timestamp. Several clusters can finish at the same instant (CSA-SFL time-slot variants); the
+    PS aggregates them one after another and logs an evaluation after each, but the intermediate
+    global models exist for zero simulated time and must not count for time / MB to accuracy."""
+    return r.groupby("sim_time_s", sort=True).tail(1)
+
+
 def mean_curve(runs, xcol, log=False, n=400):
     if not runs:
         return None
+    if xcol != "round":
+        runs = [persistent(r) for r in runs]
     end = min(r[xcol].iloc[-1] for r in runs)
     if log:
         lo = min(r[xcol][r[xcol] > 0].min() for r in runs)
@@ -178,6 +191,7 @@ def summary_rows(groups: dict, targets):
     for name, runs in groups.items():
         if not runs:
             continue
+        runs = [persistent(r) for r in runs]
         fin = np.array([r["test_acc"].iloc[-1] for r in runs])
         last10 = np.array([r["test_acc"].iloc[-10:].mean() for r in runs])
         row = {"config": name, "n_seeds": len(runs), "final_acc_mean": fin.mean(), "final_acc_std": fin.std(),

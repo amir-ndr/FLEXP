@@ -267,21 +267,42 @@ def check_variants(small, spec, cpu):
     cfg, ctx, rows, tr = go(staleness="sweeps")
     check("(3) buffer mode with sweeps staleness keeps Eq. global_update: w = sum phi_m b_m",
           all(close(e["g_after"][0], sum(f * bb[0] for f, bb in zip(e["phi"], e["bufs"]))) for e in tr))
+    # (2b) simultaneous arrivals aggregated together (slot mode)
+    for agg in ("buffer", "delta"):
+        cfg, ctx, rows, tr = go(local_work="slot", deadline_q=0.5, batch_arrivals=True, agg_mode=agg,
+                                staleness="sweeps" if agg == "delta" else "rounds", T=40, H=12)
+        sizes = [len(e["batch"]) for e in tr]
+        same_instant = all(len({b["done"] for b in e["batch"]}) == 1 for e in tr)
+        distinct = all(b["now"] > a["now"] for a, b in zip(tr, tr[1:]))
+        if agg == "buffer":
+            agg_ok = all(close(e["g_after"][0], sum(f * bb[0] for f, bb in zip(e["phi"], e["bufs"]))) for e in tr)
+        else:
+            agg_ok = all(close(e["g_after"][i], e["g_before"][i] + sum(b["w"] * (b["upd"][i] - b["start"][i]) for b in e["batch"]))
+                         for e in tr for i in (0, 1))
+        rounds_ok = [r["round"] for r in rows[1:]] == list(np.cumsum(sizes)[:len(rows) - 1])
+        check(f"(2b) [{agg}] one aggregation per instant (batches up to {max(sizes)} clusters), distinct instants",
+              same_instant and distinct and max(sizes) > 1)
+        check(f"(2b) [{agg}] the new model uses every fresh cluster model at once", agg_ok)
+        check(f"(2b) [{agg}] every arrival restarts from the final model; each arrival = one global round",
+              all(e["restart_from_final"] for e in tr) and rounds_ok)
     # (4) lazy re-clustering, alone and with everything else
-    for kw in ({}, {"agg_mode": "delta", "staleness": "sweeps", "sys_lambda": 1.0, "local_work": "slot"}):
+    for kw in ({}, {"agg_mode": "delta", "staleness": "sweeps", "sys_lambda": 1.0, "local_work": "slot"},
+               {"local_work": "slot", "batch_arrivals": True}, {"sys_lambda": 1.0}):
         cfg, ctx, rows, tr = go(recluster="lazy", T=40, **kw)
-        tag = "lazy" + ("+all" if kw else "")
+        tag = "lazy" + ("+" + "+".join(f"{k}={v}" for k, v in kw.items()) if kw else "")
         part = all(len(m) == len(set(m)) and set(m).isdisjoint(e["idle"]) and set(m) | e["idle"] == set(range(12))
                    for e in tr for m in [[x for _, ms, _, _, _ in e["active"] for x in ms]])
         wait_ok = all(set(x for C in e["pending"] for x in C) <= (e["idle"] | {x for _, ms, dz, _, _ in e["active"] if dz for x in ms})
                       for e in tr)
         dm = ctx.dims.device_model()
-        extra = [e["rb"] - sum(ctx.dims.split_round(e["samp"][k]) for k in e["members"]) for e in tr]
+        extra = [e["rb"] - sum(ctx.dims.split_round(b["samp"][k]) for b in e["batch"] for k in b["members"]) for e in tr]
+        done = set(k for e in tr for b in e["batch"] for k in b["members"])
+        busy_end = set(m for _, ms, _, _, _ in tr[-1]["active"] for m in ms)
         check(f"(4) [{tag}] no work discarded, partition consistent, pending waits only for free/finishing devices",
               tr[-1]["skipped"] == 0 and part and wait_ok)
-        check(f"(4) [{tag}] no halts and no probe traffic after the start",
+        check(f"(4) [{tag}] no halts and no probe traffic after the start; every device trained or is training",
               all(x >= -1e-6 and abs(x / dm - round(x / dm)) < 1e-9 for x in extra)
-              and sum(r["recluster"] for r in rows[1:]) > 0 and set(k for e in tr for k in e["members"]) == set(range(12)))
+              and sum(r["recluster"] for r in rows[1:]) > 0 and done | busy_end == set(range(12)))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,11 @@
 # simulated second than the paper version (time-slot variants ~1,900 MNIST-epochs per run at 10,000 s):
 #   J=$(sbatch --parsable --array=0-3 --export=ALL,EXP=variants,TIME_BUDGET=10000,SEEDS="1 2",EXTRA="--variant-deltas 0.1 10" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,EXP=plots,PLOT_EXTRA="--time-budget 10000" --time=00:30:00 slurm/run_csasfl_mnist.slurm
+# SECOND SCREEN (sys+lazy / slot+batched arrivals / +lazy / +lazy with a shorter slot; seeds 1-2, both deltas,
+# 10,000 s). Put all finished runs in ONE folder first so the figures compare against the baselines:
+#   cp -n examples/CSASFL/results_mnist_exp_old/runs/* examples/CSASFL/results_mnist_exp/runs/
+#   J=$(sbatch --parsable --array=0-3 --export=ALL,EXP=variants,TIME_BUDGET=10000,SEEDS="1 2",EXTRA="--variants screen2 --variant-deltas 0.1 10" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,EXP=plots,PLOT_EXTRA="--time-budget 10000 --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # MAIN, SEEDS 1-5 (the default; finished runs are skipped, resubmit the same line after a time-out):
 #   J=$(sbatch --parsable --array=0-3 slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,EXP=plots --time=00:30:00 slurm/run_csasfl_mnist.slurm

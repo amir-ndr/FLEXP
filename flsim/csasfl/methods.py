@@ -106,6 +106,7 @@ class RunConfig:
     agg_mode: str = "buffer"         # (3) buffer (paper Eq. global_update) | delta (each update applied once)
     staleness: str = "rounds"        # (3) rounds (paper tau = t - t_n) | sweeps (tau = (t - t_n) / N)
     recluster: str = "halt"          # (4) halt (paper: halt, re-probe, restart affected) | lazy
+    batch_arrivals: bool = False     # (2b) clusters finishing at the same instant -> one aggregation (slot mode)
     # SAFSL
     safsl_buffer_frac: float = 0.8   # aggregate the 0.8K earliest arrivals
     safsl_gamma: float = 1.0
@@ -114,7 +115,8 @@ class RunConfig:
     psfl_max_cluster: int = 8
 
     IMPROVEMENT_DEFAULTS = {"sys_lambda": 0.0, "local_work": "epochs", "deadline_q": 0.5,
-                            "agg_mode": "buffer", "staleness": "rounds", "recluster": "halt"}
+                            "agg_mode": "buffer", "staleness": "rounds", "recluster": "halt",
+                            "batch_arrivals": False}
 
     def improvements(self) -> dict:
         """The CSA-SFL improvement options that differ from the paper's algorithm."""
@@ -140,6 +142,8 @@ class RunConfig:
             tags.append("sw")
         if self.recluster == "lazy":
             tags.append("lazy")
+        if self.batch_arrivals:
+            tags.append("batch")
         return base + "".join("+" + t for t in tags)
 
 
@@ -428,6 +432,11 @@ def run_csasfl(ctx: Context):
           local_work = slot      the same work cap, and every cluster round lasts at least L:
                            cluster time = max(L, max_k n_k t_0 / s_k). All clusters then complete at the same
                            cadence (no flood of tiny fast-cluster rounds, no update-frequency bias)
+          batch_arrivals = True  clusters that complete at the same simulated instant (the norm in slot mode)
+                           are aggregated together as ONE update and all restart from the resulting model;
+                           without it they are aggregated one after another and the first ones restart from
+                           a partial global model (zero-duration intermediate states). Each arrival still
+                           counts as one global round (t, H and staleness keep the paper's units).
       (3) agg_mode = delta  each cluster update applied once to the CURRENT global:
                            w^{t+1} = w^t + psi_n (w_bar_n - w^{t_n}),  psi_n = |D_n|/|D| * 1/(1+tau_n)
                            (uniform ablation: psi_n = 1/N); no buffer of old models
@@ -548,32 +557,55 @@ def run_csasfl(ctx: Context):
             skipped += 1
             continue                                     # event of a cluster dissolved / rescheduled
         now = when
+        arr = [sl]                                       # clusters completing at this instant
+        if cfg.batch_arrivals:                           # (2b) all of them form ONE aggregation, and all restart
+            while heap and heap[0][0] <= now:            #      from the resulting model (never from a partial one)
+                _, _, sid2, tok2 = heapq.heappop(heap)
+                x2 = slots.get(sid2)
+                if x2 is None or tok2 != x2.token:
+                    skipped += 1
+                    continue
+                arr.append(x2)
+        m = len(arr)
+        arr_ids = {x.sid for x in arr}
         g_before = g
-        upd, loss, samp = train(sl)
+        res = [train(x) for x in arr]                    # (upd, loss, samples) per arrival
         order = list(slots.values())
         stale = [stale_of(x, t) for x in order]
-        i_n = order.index(sl)
+        idx = [order.index(x) for x in arr]
         if cfg.agg_mode == "buffer":
-            sl.buf = upd
+            for x, r in zip(arr, res):
+                x.buf = r[0]
             phi = algo.agg_weights([x.D for x in order], stale)                                 # Eq. phi
             g = (ctx.wavg([x.buf[0] for x in order], phi), ctx.wavg([x.buf[1] for x in order], phi))  # Eq. global_update
-            w_n = float(phi[i_n])
-        else:                                                    # (3) update applied once
-            w_n = (1.0 / len(order) if algo.aggregation == "uniform"
-                   else sl.D / D_tot / (1.0 + stale[i_n]))
-            g = (g[0] + w_n * (upd[0] - sl.start[0]), g[1] + w_n * (upd[1] - sl.start[1]))
-            sl.buf = upd
-        tau_n = float(stale[i_n])
+            ws = [float(phi[i]) for i in idx]
+        else:                                                    # (3) each update applied once
+            ws = [(1.0 / len(order) if algo.aggregation == "uniform" else x.D / D_tot / (1.0 + stale[i]))
+                  for x, i in zip(arr, idx)]
+            g0, g1 = g
+            for x, r, w in zip(arr, res, ws):
+                g0, g1 = g0 + w * (r[0][0] - x.start[0]), g1 + w * (r[0][1] - x.start[1])
+            g = (g0, g1)
+            for x, r in zip(arr, res):
+                x.buf = r[0]
+        taus = [float(stale[i]) for i in idx]
         if trace is not None:
-            trace.append({"t": t, "now": now, "g_before": g_before, "g_after": g, "upd": upd, "start": sl.start,
-                          "w_n": w_n, "D_n": sl.D, "tau_n": tau_n, "members": list(sl.members),
+            trace.append({"t": t, "now": now, "g_before": g_before, "g_after": g, "upd": res[0][0], "start": arr[0].start,
+                          "w_n": ws[0], "D_n": arr[0].D, "tau_n": taus[0], "members": list(arr[0].members),
                           "bufs": [x.buf for x in order], "phi": (list(phi) if cfg.agg_mode == "buffer" else None),
-                          "stale": list(stale), "samp": dict(samp), "began": sl.began, "done": sl.done})
-        wait = float(np.mean([sl.done - sl.began - rt[k] for k in sl.members]))        # intra-cluster straggler wait
-        rb = sum(dims.split_round(samp[k]) for k in sl.members)                      # its exchange + upload + broadcast
-        sl.start, sl.t_ref = g, t + 1
+                          "stale": list(stale), "samp": dict(res[0][2]), "began": arr[0].began, "done": arr[0].done,
+                          "batch": [{"sid": x.sid, "members": list(x.members), "upd": r[0], "start": x.start, "w": w,
+                                     "D": x.D, "tau": tau, "samp": dict(r[2]), "began": x.began, "done": x.done}
+                                    for x, r, w, tau in zip(arr, res, ws, taus)]})
+        wait = float(np.mean([x.done - x.began - rt[k] for x in arr for k in x.members]))   # intra-cluster straggler wait
+        rb = sum(sum(dims.split_round(r[2][k]) for k in x.members) for x, r in zip(arr, res))  # exchange + upload + broadcast
+        busy = {k for x in arr for k in x.members}       # devices that just received the new model
+        t_new = t + m
+        for x in arr:
+            x.start, x.t_ref = g, t_new
         n_aff = 0
-        recl = algo.clustering == "gradient" and (t + 1) % algo.H == 0 and t + 1 < cfg.T
+        recl = (algo.clustering == "gradient" and any(r % algo.H == 0 for r in range(t + 1, t_new + 1))
+                and t_new < cfg.T)
         if recl and not lazy:
             owner = {k: x.start for x in slots.values() for k in x.members}
             grads, _, h, pb = probe(owner)
@@ -585,21 +617,21 @@ def run_csasfl(ctx: Context):
                 x = old.get(tuple(sorted(int(k) for k in C)))
                 if x is not None:                         # unaffected: resume its current state
                     kept.add(x.sid)
-                    if x is sl:
+                    if x.sid in arr_ids:
                         schedule(x, now + h)
                     else:
                         x.began, x.done, x.token = x.began + h, x.done + h, x.token + 1
                         seq[0] += 1
                         heapq.heappush(heap, (x.done, seq[0], x.sid, x.token))
                 else:                                     # affected: restart from w^{t+1}
-                    x = _Slot(C, D_of(C), g, t + 1)
+                    x = _Slot(C, D_of(C), g, t_new)
                     schedule(x, now + h)
-                    # devices of the just-completed cluster already hold w^{c,t+1} (broadcast above)
-                    rb += sum(1 for k in x.members if k not in sl.members) * dims.device_model()
+                    # devices of the just-completed cluster(s) already hold w^{c,t+1} (broadcast above)
+                    rb += sum(1 for k in x.members if k not in busy) * dims.device_model()
                     n_aff += 1
                 new_slots[x.sid] = x
             for x in slots.values():                      # partial exchange of interrupted rounds
-                if x.sid not in kept and x is not sl:
+                if x.sid not in kept and x.sid not in arr_ids:
                     el = max(0.0, now - x.began)
                     for k in x.members:
                         nb = min(int(nb_cap[k]), int(math.floor(el * s[k] / t0)))
@@ -620,32 +652,36 @@ def run_csasfl(ctx: Context):
                 for x in slots.values():
                     x.dissolve = x.sid not in kept
                 n_aff = len(pending)
-            if getattr(sl, "dissolve", False):            # finished its round under an old partition
-                del slots[sl.sid]
-                idle |= set(sl.members)
-            else:
-                schedule(sl, now)
+            for x in arr:
+                if getattr(x, "dissolve", False):         # finished its round under an old partition
+                    del slots[x.sid]
+                    idle |= set(x.members)
+                else:
+                    schedule(x, now)
             for C in list(pending):                       # start every new cluster whose members are free
                 if all(k in idle for k in C):
-                    x = _Slot(C, D_of(C), g, t + 1)
+                    x = _Slot(C, D_of(C), g, t_new)
                     slots[x.sid] = x
                     schedule(x, now)
                     idle -= set(C)
                     pending.remove(C)
-                    rb += sum(1 for k in C if k not in sl.members) * dims.device_model()
+                    rb += sum(1 for k in C if k not in busy) * dims.device_model()
         comm += rb
         if trace is not None:
             trace[-1].update(active=[(x.sid, tuple(x.members), bool(getattr(x, "dissolve", False)), x.began, x.done)
                                      for x in slots.values()], idle=set(idle), pending=list(pending),
-                             skipped=skipped, rb=rb, recl=recl)
-        ok = ctx.record(t + 1, now, comm, rb, g[0], g[1], loss, round_latency_s=now - prev,
-                        cluster_id=sl.sid, cluster_size=len(sl.members), staleness=tau_n, phi=w_n,
+                             skipped=skipped, rb=rb, recl=recl,
+                             restart_from_final=all(x.start[0] is g[0] and x.start[1] is g[1] for x in arr))
+        ok = ctx.record(t_new, now, comm, rb, g[0], g[1], float(np.mean([r[1] for r in res])),
+                        round_latency_s=now - prev,
+                        cluster_id=arr[0].sid, cluster_size=sum(len(x.members) for x in arr),
+                        staleness=float(np.mean(taus)), phi=float(sum(ws)),
                         staleness_mean=float(np.mean(stale)), staleness_max=float(max(stale)),
-                        cluster_time_s=dur(sl.members),
+                        cluster_time_s=max(dur(x.members) for x in arr),
                         avg_wait_s=wait, recluster=int(recl), n_affected=n_aff, num_clusters=len(slots),
-                        pending=len(pending), idle_devices=len(idle))
+                        pending=len(pending), idle_devices=len(idle), batch=m)
         prev = now
-        t += 1
+        t = t_new
         if not ok or ctx.over(now):
             break
     return ctx.rows
