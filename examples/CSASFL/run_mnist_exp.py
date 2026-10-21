@@ -18,8 +18,8 @@ Setup (paper; every value a default of flsim.csasfl.methods.RunConfig):
 
 Experiments (--exp, any subset; every run is stored once in <results>/runs/):
   main      FL, SFLv2, SAFSL, ParallelSFL, CSA-SFL  x  delta in --deltas (default 0.1 10)
-  nsweep    CSA-SFL x N in --ns (default 3 5 7 9 11), H = 20, delta = 0.1
-  hsweep    CSA-SFL x H in --hs (default 10 20 30 40 50), N = 7, delta = 0.1
+  nsweep    CSA-SFL x N in --ns (default 3 5 7 9 11), H = 20, delta = 0.1   (variant: --csa-variant)
+  hsweep    CSA-SFL x H in --hs (default 10 20 30 40 50), N = 7, delta = 0.1 (variant: --csa-variant)
   ablation  CSA-SFL full / w/o weighted aggregation (phi = 1/N) / w/o gradient clustering (random
             one-time clustering), delta = 0.1
   variants  CSA-SFL improvement screen (flsim.csasfl.methods.run_csasfl): paper / +system-aware
@@ -125,9 +125,41 @@ def run_cost(cfg: RunConfig) -> float:
     if cfg.method == "csasfl":
         if cfg.local_work != "epochs":
             c *= 5.0 * (2.0 if cfg.deadline_q <= 0.25 else 1.0)
-        elif cfg.sys_lambda > 0:
+        elif cfg.sys_lambda > 0 or cfg.clustering == "system":
             c *= 12.0
     return c
+
+
+def ablation_configs(name: str, args) -> list:
+    """(label, RunConfig overrides) of the ablation of CSA-SFL variant `name`. Paper: the paper's ablation
+    (full / uniform phi / random one-time clustering). An improved variant: the paper reference, the
+    variant itself, the variant with each of its improvements removed (one at a time), with uniform phi
+    and with random one-time clustering; a variant with system-aware clustering also gets
+    "w/o gradient term" (one-time speed-only clusters). A removal that leaves the paper itself is
+    merged into the paper entry."""
+    if name == "paper":
+        return [("paper", {}), ("w/o weighted aggregation", {"aggregation": "uniform"}),
+                ("w/o gradient clustering", {"clustering": "random"})]
+    v = variant_overrides(name, args)
+    drop = lambda *ks: {k: x for k, x in v.items() if k not in ks}
+    rem = []
+    if v.get("local_work") in ("slot", "deadline"):
+        rem.append(("time slot", drop("local_work", "deadline_q", "batch_arrivals")))
+    if v.get("recluster") == "lazy":
+        rem.append(("lazy re-clustering", drop("recluster")))
+    if v.get("batch_arrivals"):
+        rem.append(("batched arrivals", drop("batch_arrivals")))
+    if v.get("sys_lambda"):
+        rem.append(("system term", drop("sys_lambda")))
+    if v.get("agg_mode") == "delta":
+        rem.append(("update aggregation", drop("agg_mode", "staleness")))
+    paper_label = "paper" + "".join(f" = w/o {lab}" for lab, ov in rem if not ov)
+    out = [(paper_label, {}), ("full", dict(v))] + [(f"w/o {lab}", ov) for lab, ov in rem if ov]
+    if v.get("sys_lambda"):
+        out.append(("w/o gradient term (speed-only clusters)", {**drop("sys_lambda", "recluster"), "clustering": "system"}))
+    out.append(("w/o weighted aggregation", {**v, "aggregation": "uniform"}))
+    out.append(("w/o gradient clustering (random)", {**drop("recluster", "sys_lambda"), "clustering": "random"}))
+    return out
 
 
 def build_runs(args) -> list:
@@ -146,15 +178,17 @@ def build_runs(args) -> list:
             for delta in args.deltas:
                 for m in args.methods:
                     add("main", method=m, delta=delta, seed=seed)
-        if "nsweep" in args.exp:
-            for N in args.ns:
-                add("nsweep", method="csasfl", delta=NONIID, seed=seed, N=N)
-        if "hsweep" in args.exp:
-            for H in args.hs:
-                add("hsweep", method="csasfl", delta=NONIID, seed=seed, H=H)
-        if "ablation" in args.exp:
-            for cl, ag in ABLATION:
-                add("ablation", method="csasfl", delta=NONIID, seed=seed, clustering=cl, aggregation=ag)
+        for csa in args.csa_variant:                              # CSA-SFL variant(s) of the sweeps / ablation
+            cv = variant_overrides(csa, args)
+            if "nsweep" in args.exp:
+                for N in args.ns:
+                    add("nsweep", method="csasfl", delta=NONIID, seed=seed, N=N, **cv)
+            if "hsweep" in args.exp:
+                for H in args.hs:
+                    add("hsweep", method="csasfl", delta=NONIID, seed=seed, H=H, **cv)
+            if "ablation" in args.exp:
+                for _, ov in ablation_configs(csa, args):
+                    add("ablation", method="csasfl", delta=NONIID, seed=seed, **ov)
         if "variants" in args.exp:
             names = [v for n in args.variants for v in (SCREEN2 if n == "screen2" else [n])]
             for delta in args.variant_deltas:
@@ -302,6 +336,9 @@ def main():
     p.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=VARIANT_NAMES + ["screen2"],
                    help="CSA-SFL improvement variants of --exp variants ('screen2' = " + " ".join(SCREEN2) + ")")
     p.add_argument("--variant-deltas", nargs="+", type=float, default=[NONIID], help="deltas of --exp variants")
+    p.add_argument("--csa-variant", nargs="+", default=["paper"], choices=VARIANT_NAMES,
+                   help="CSA-SFL variant(s) used by --exp nsweep / hsweep / ablation (default: the paper's algorithm); "
+                        "several = the sweeps and ablation of each")
     p.add_argument("--sys-lambda", type=float, default=1.0, help="(1) weight of the system term in the clustering")
     p.add_argument("--deadline-q", type=float, default=0.5, help="(2) time slot L = this quantile of the devices' t_k")
     p.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS, help="methods of --exp main")

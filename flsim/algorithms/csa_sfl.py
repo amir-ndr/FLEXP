@@ -53,7 +53,8 @@ class CSASFL:
         self.kmeans_iters = int(kmeans_iters)
         # Ablation switches (Exp 3): the full method is gradient + weighted.
         #   clustering  = "gradient" (cosine K-means, re-clustered every H) |
-        #                 "random"   (random ONE-TIME clustering, no re-clustering)
+        #                 "random"   (random ONE-TIME clustering, no re-clustering) |
+        #                 "system"   (ONE-TIME K-means on the devices' round times only, no gradients)
         #   aggregation = "weighted" (phi = |D_n|/(1+tau_n), normalized)     |
         #                 "uniform"  (phi = 1/N — drops data-size AND staleness)
         self.clustering = clustering
@@ -64,10 +65,16 @@ class CSASFL:
             raise ValueError(f"recluster_every must be >= 1, got {self.H}")
         if self.E < 1:
             raise ValueError(f"local_iters must be >= 1, got {self.E}")
-        if clustering not in ("gradient", "random"):
-            raise ValueError(f"clustering must be 'gradient' or 'random', got {clustering!r}")
+        if clustering not in ("gradient", "random", "system"):
+            raise ValueError(f"clustering must be 'gradient', 'random' or 'system', got {clustering!r}")
         if aggregation not in ("weighted", "uniform"):
             raise ValueError(f"aggregation must be 'weighted' or 'uniform', got {aggregation!r}")
+
+    def system_clusters(self, system: dict, rng: np.random.RandomState) -> list:
+        """System-only clustering (ablation of the system-aware variant without its gradient term):
+        K-means on the scalar system feature z_k alone (the same k-means++ / Lloyd procedure as
+        cluster_system_aware, with the gradient term constant), i.e. speed tiers."""
+        return self.cluster_system_aware({c: np.ones(1) for c in system}, system, 1.0, rng)
 
     def random_clusters(self, client_ids, rng: np.random.RandomState) -> list:
         """Random one-time clustering (ablation): shuffle devices, split into N

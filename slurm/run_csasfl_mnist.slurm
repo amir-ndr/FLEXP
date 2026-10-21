@@ -50,6 +50,22 @@
 # simulated second than the paper version (time-slot variants ~1,900 MNIST-epochs per run at 10,000 s):
 #   J=$(sbatch --parsable --array=0-3 --export=ALL,EXP=variants,TIME_BUDGET=10000,SEEDS="1 2",EXTRA="--variant-deltas 0.1 10" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,EXP=plots,PLOT_EXTRA="--time-budget 10000" --time=00:30:00 slurm/run_csasfl_mnist.slurm
+# SWEEPS + ABLATION OF THE TWO CHOSEN VARIANTS, in a NEW results folder (delta 0.1, 5,000 s):
+#   slot_batch_lazy_q25 (time slot q=0.25 + batched arrivals + lazy re-clustering) and sys (system-aware clustering,
+#   lambda=1): N sweep {3,5,7,9,11} (H=20), H sweep {10,20,30,40,50} (N=7), and each variant's ablation (paper reference,
+#   each improvement removed, uniform phi, random clustering; sys also: speed-only clusters). 27 runs per seed.
+#   R=examples/CSASFL/results_sweeps_ablation
+#   J=$(sbatch --parsable --array=0-7 --export=ALL,RESULTS=$R,EXP="nsweep hsweep ablation",TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant slot_batch_lazy_q25 sys" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant slot_batch_lazy_q25 sys --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
+#   (more seeds later: the same lines with SEEDS="4 5" -- finished runs are skipped)
+# IMPROVED CSA-SFL (winner of the screens: slot q=0.25 + batched arrivals + lazy re-clustering). Set RESULTS to
+# the ONE folder that holds all finished runs (finished runs are reused, the figures compare against them):
+#   A) main comparison, seeds 3-5 (seeds 1-2 exist), both deltas, 10,000 s -- 6 runs:
+#   J1=$(sbatch --parsable --array=0-1 --export=ALL,RESULTS=examples/CSASFL/results_mnist_exp,EXP=variants,TIME_BUDGET=10000,SEEDS="3 4 5",EXTRA="--variants slot_batch_lazy_q25 --variant-deltas 0.1 10" slurm/run_csasfl_mnist.slurm)
+#   B) N sweep + H sweep + ablation of the winner, delta 0.1, seeds 1-3, 5,000 s -- 38 new runs:
+#   J2=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=examples/CSASFL/results_mnist_exp,EXP="nsweep hsweep ablation",TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant slot_batch_lazy_q25" slurm/run_csasfl_mnist.slurm)
+#   figures (CSA-SFL = the winner everywhere; staleness figures for the N and H sweeps):
+#   sbatch --dependency=afterany:$J1:$J2 --export=ALL,RESULTS=examples/CSASFL/results_mnist_exp,EXP=plots,PLOT_EXTRA="--time-budget 5000 --csa-variant slot_batch_lazy_q25 --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # SECOND SCREEN (sys+lazy / slot+batched arrivals / +lazy / +lazy with a shorter slot; seeds 1-2, both deltas,
 # 10,000 s). Put all finished runs in ONE folder first so the figures compare against the baselines:
 #   cp -n examples/CSASFL/results_mnist_exp_old/runs/* examples/CSASFL/results_mnist_exp/runs/

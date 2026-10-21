@@ -96,7 +96,7 @@ class RunConfig:
     # CSA-SFL
     N: int = 7                       # clusters
     H: int = 20                      # re-clustering interval (global rounds)
-    clustering: str = "gradient"     # gradient | random (ablation)
+    clustering: str = "gradient"     # gradient | random | system (ablations: one-time random / speed-only clusters)
     aggregation: str = "weighted"    # weighted | uniform (ablation)
     # CSA-SFL improvements (defaults = the paper's algorithm; see run_csasfl)
     sys_lambda: float = 0.0          # (1) system-aware clustering weight (0 = paper)
@@ -126,7 +126,8 @@ class RunConfig:
         if self.method != "csasfl":
             return "-"
         base = {("gradient", "weighted"): "full", ("gradient", "uniform"): "uniform_agg",
-                ("random", "weighted"): "random_cluster"}.get((self.clustering, self.aggregation),
+                ("random", "weighted"): "random_cluster",
+                ("system", "weighted"): "system_cluster"}.get((self.clustering, self.aggregation),
                                                               f"{self.clustering}_{self.aggregation}")
         imp = self.improvements()
         tags = []
@@ -535,6 +536,8 @@ def run_csasfl(ctx: Context):
         now, comm = now + h0, comm + b0
         if lazy:
             last_dir = G0.clone()
+    elif algo.clustering == "system":                     # ablation: speed tiers only, one-time
+        clusters = algo.system_clusters(zsys, ctx.rng)
     else:
         clusters = algo.random_clusters(range(K), ctx.rng)
     slots = {}

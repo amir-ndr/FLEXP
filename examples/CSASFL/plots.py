@@ -180,6 +180,82 @@ def plot_curves(curves: dict, xcol, path, title, log=False, xmax=None, styles=No
     print(f"[plots] {path}.png")
 
 
+def sweep_definitions(name: str):
+    """(variant string of CSA-SFL variant `name`, [(ablation label, variant string)]) -- the same
+    definitions run_mnist_exp.py uses for --csa-variant, so the figures always match the runs."""
+    import types
+    from run_mnist_exp import ablation_configs, variant_overrides
+    from flsim.csasfl.methods import RunConfig
+    a = types.SimpleNamespace(sys_lambda=1.0, deadline_q=0.5)
+    vs = lambda ov: RunConfig(method="csasfl", **ov).variant()
+    return vs(variant_overrides(name, a)), [(lab, vs(ov)) for lab, ov in ablation_configs(name, a)]
+
+
+def staleness_figure(groups: dict, path: str, title: str):
+    """Staleness of CSA-SFL across a sweep (groups: label -> list of runs, already cut at the common
+    budget). Every aggregation event row carries the arriving cluster(s): staleness tau = t - t_n
+    (global rounds since the cluster received its model), the model's age in seconds (its round
+    time), and its weight phi; staleness_mean is the mean tau over ALL clusters at that event.
+    Rows with several simultaneous arrivals (batched) are expanded to one sample per arrival.
+      (a) tau at arrival  (b) age at arrival (s)  (c) phi of the arriving model  (d) mean tau of all
+      clusters over time (mean over seeds). Writes <path>.png/.pdf and <path>.csv (per-config summary)."""
+    labels = [k for k, v in groups.items() if v]
+    if len(labels) < 2:
+        return
+    fig, axes = plt.subplots(1, 4, figsize=(17, 3.9))
+    summ, tau_s, age_s, phi_s = [], [], [], []
+    for lab in labels:
+        rows = pd.concat([r.iloc[1:] for r in groups[lab]], ignore_index=True)
+        rows = rows[rows["staleness"].notna()]
+        rep = rows["batch"].fillna(1).astype(int).to_numpy() if "batch" in rows else np.ones(len(rows), int)
+        tau = np.repeat(rows["staleness"].to_numpy(float), rep)
+        age = np.repeat(rows["cluster_time_s"].to_numpy(float), rep)
+        phi = np.repeat((rows["phi"] / rep.clip(1)).to_numpy(float), rep)       # per-arrival share of the event weight
+        tau_s.append(tau); age_s.append(age); phi_s.append(phi)
+        span = sum(r["sim_time_s"].iloc[-1] - r["sim_time_s"].iloc[0] for r in groups[lab])
+        summ.append({"config": lab, "n_seeds": len(groups[lab]), "arrivals_per_1000s": 1000 * len(tau) / max(span, 1e-9),
+                     "tau_mean": tau.mean(), "tau_median": np.median(tau), "tau_p90": np.percentile(tau, 90), "tau_max": tau.max(),
+                     "share_stale_arrivals": float((tau > 0).mean()),
+                     "age_mean_s": age.mean(), "age_median_s": np.median(age), "age_p90_s": np.percentile(age, 90),
+                     "phi_mean": phi.mean(), "phi_p10": np.percentile(phi, 10),
+                     "reclusterings_per_1000s": 1000 * rows["recluster"].sum() / max(span, 1e-9),
+                     "staleness_mean_all_clusters": rows["staleness_mean"].mean()})
+    for ax, data, ylab, logy in ((axes[0], tau_s, "staleness tau at arrival (global rounds)", False),
+                                 (axes[1], age_s, "age of arriving model (s)", True),
+                                 (axes[2], phi_s, "weight phi of arriving model", False)):
+        ax.boxplot(data, showfliers=False, showmeans=True, meanprops={"marker": "^", "markerfacecolor": "k", "markersize": 5})
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel(ylab, fontsize=9)
+        if logy:
+            ax.set_yscale("log")
+        ax.grid(True, alpha=0.3, axis="y")
+    ax = axes[3]
+    for i, lab in enumerate(labels):
+        runs = groups[lab]
+        end = min(r["sim_time_s"].iloc[-1] for r in runs)
+        grid = np.linspace(0, end, 300)
+        Y = np.stack([hold(r["sim_time_s"].to_numpy(float), r["staleness_mean"].fillna(0).to_numpy(float), grid) for r in runs])
+        ok = ~np.isnan(Y).any(0)
+        y = Y[:, ok].mean(0)
+        w = max(1, int(round(len(y) * 500.0 / max(end, 1e-9))))           # 500 s moving average
+        y = np.convolve(y, np.ones(w) / w, mode="same") if w > 1 and len(y) > w else y
+        ax.plot(grid[ok], y, lw=1.5, label=lab, color=plt.cm.viridis(i / max(1, len(labels) - 1)))
+    ax.set_xlabel("Training time (s)", fontsize=9)
+    ax.set_ylabel("mean tau of all clusters (rounds, 500 s avg.)", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=7)
+    for a_, t_ in zip(axes, "abcd"):
+        a_.set_title(f"({t_})", fontsize=9, loc="left")
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{path}.{ext}", dpi=200)
+    plt.close(fig)
+    pd.DataFrame(summ).to_csv(f"{path}.csv", index=False)
+    print(f"[plots] {path}.png")
+
+
 def first_hit(r, col, target):
     hit = r.index[r["test_acc"] >= target]
     return float(r.loc[hit[0], col]) if len(hit) else np.nan
@@ -228,18 +304,25 @@ def fmt_table(t: pd.DataFrame, title: str, targets) -> str:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--results", default=os.path.join(HERE, "results_mnist_exp"))
+    p.add_argument("--out", default=None, help="figure folder (default <results>/figures)")
     p.add_argument("--targets", nargs="+", type=float, default=[0.90, 0.95, 0.97])
     p.add_argument("--tmax", type=float, default=None, help="x limit (s) of the linear time panels")
     p.add_argument("--noniid", type=float, default=0.1)
     p.add_argument("--time-budget", type=float, default=None,
                    help="cut every run at this simulated time (s); default: the smallest budget among the runs")
+    p.add_argument("--csa-variant", "--sweep-variant", dest="csa_variant", nargs="+", default=["paper"],
+                   help="CSA-SFL variant(s) (run_mnist_exp.py --csa-variant names, e.g. slot_batch_lazy_q25 sys): the "
+                        "N/H sweep, staleness and ablation figures are made for each (files prefixed '<name>__' unless "
+                        "paper); the first one is 'CSA-SFL' in the main comparison. Default: the paper's algorithm")
     p.add_argument("--N", type=int, default=7, help="default N (fixed in the H sweep)")
     p.add_argument("--H", type=int, default=20, help="default H (fixed in the N sweep)")
     args = p.parse_args()
     df = common_budget(load(args.results), args.time_budget)
-    out = os.path.join(args.results, "figures")
+    out = args.out or os.path.join(args.results, "figures")
     os.makedirs(out, exist_ok=True)
     report = ""
+    csa_v, _ = sweep_definitions(args.csa_variant[0])
+    csa_shown = "paper" if csa_v == "full" else csa_v
     # runs are selected by configuration (not by the experiment that trained them: a shared run,
     # e.g. CSA-SFL N=7 H=20 delta=0.1, belongs to the comparison, both sweeps and the ablation)
 
@@ -250,12 +333,15 @@ def main():
         for m in METHOD_ORDER:
             sel = dict(method=m, delta=delta)
             if m == "csasfl":
-                sel.update(N=args.N, H=args.H, variant="full")
+                sel.update(N=args.N, H=args.H, variant=csa_v)
             groups[m] = runs_of(main_df, **sel)
         styles = {LABEL[m]: {"color": COLOR[m], "lw": 2.4 if m == "csasfl" else 1.5} for m in METHOD_ORDER}
         tag = f"main_delta{delta:g}"
-        name = f"MNIST, delta = {delta:g}, K = 50 (mean of {max(len(v) for v in groups.values())} seeds)"
+        name = (f"MNIST, delta = {delta:g}, K = 50, CSA-SFL = [{csa_shown}] "
+                f"(mean of {max(len(v) for v in groups.values())} seeds)")
         cs = groups["csasfl"]
+        if not any(groups[m] for m in METHOD_ORDER if m != "csasfl"):
+            continue                                  # no baseline runs in this folder: no comparison figure
         tb = float(main_df["time_budget"].max()) if "time_budget" in main_df else 0.0
         tmax = args.tmax or (tb if tb > 0 else (1.5 * max(r["sim_time_s"].iloc[-1] for r in cs) if cs else None))
         for xcol, log, suf, xm in (("sim_time_s", False, "time", tmax), ("sim_time_s", True, "time_log", None),
@@ -266,58 +352,72 @@ def main():
         t.to_csv(os.path.join(out, f"{tag}_table.csv"), index=False)
         report += fmt_table(t, f"comparison, delta = {delta:g}", args.targets)
 
-    # ---- N sweep ----
-    sw = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid) & (df["variant"] == "full")]
-    ns = sorted(sw[np.isclose(sw["H"], args.H)]["N"].dropna().unique())
-    if len(ns) > 1:
-        groups = {f"N={int(n)}": runs_of(sw, N=n, H=args.H) for n in ns}
-        for xcol, suf, log in (("sim_time_s", "time", False), ("comm_mb", "comm", False)):
-            plot_curves({k: mean_curve(v, xcol, log=log) for k, v in groups.items()}, xcol,
-                        os.path.join(out, f"nsweep_{suf}"), f"CSA-SFL, delta = {args.noniid:g}, H = {args.H}: varying N")
-        t = summary_rows(groups, args.targets)
-        t.to_csv(os.path.join(out, "nsweep_table.csv"), index=False)
-        report += fmt_table(t, f"N sweep (delta {args.noniid:g}, H {args.H})", args.targets)
+    for csa_name in args.csa_variant:
+        # ---- N sweep ----
+        sweep_variant, abl = sweep_definitions(csa_name)
+        pre = "" if csa_name == "paper" else f"{csa_name}__"
+        shown = "full = paper CSA-SFL" if sweep_variant == "full" else sweep_variant
+        sw = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid) & (df["variant"] == sweep_variant)]
+        ns = sorted(sw[np.isclose(sw["H"], args.H)]["N"].dropna().unique())
+        if len(ns) > 1:
+            groups = {f"N={int(n)}": runs_of(sw, N=n, H=args.H) for n in ns}
+            for xcol, suf, log in (("sim_time_s", "time", False), ("comm_mb", "comm", False)):
+                plot_curves({k: mean_curve(v, xcol, log=log) for k, v in groups.items()}, xcol,
+                            os.path.join(out, f"{pre}nsweep_{suf}"),
+                            f"CSA-SFL [{shown}], delta = {args.noniid:g}, H = {args.H}: varying N")
+            staleness_figure(groups, os.path.join(out, f"{pre}nsweep_staleness"),
+                             f"CSA-SFL staleness vs N (delta = {args.noniid:g}, H = {args.H}, variant {shown})")
+            t = summary_rows(groups, args.targets)
+            t.to_csv(os.path.join(out, f"{pre}nsweep_table.csv"), index=False)
+            report += fmt_table(t, f"N sweep [{shown}] (delta {args.noniid:g}, H {args.H})", args.targets)
 
-    # ---- H sweep ----
-    hs = sorted(sw[np.isclose(sw["N"], args.N)]["H"].dropna().unique())
-    if len(hs) > 1:
-        groups = {f"H={int(h)}": runs_of(sw, N=args.N, H=h) for h in hs}
-        plot_curves({k: mean_curve(v, "sim_time_s") for k, v in groups.items()}, "sim_time_s",
-                    os.path.join(out, "hsweep_time"), f"CSA-SFL, delta = {args.noniid:g}, N = {args.N}: varying H")
-        t = summary_rows(groups, args.targets)
-        t.to_csv(os.path.join(out, "hsweep_table.csv"), index=False)
-        report += fmt_table(t, f"H sweep (delta {args.noniid:g}, N {args.N})", args.targets)
-        fig, ax = plt.subplots(figsize=(5.2, 3.8))
-        ax.errorbar([int(h) for h in hs], 100 * t["final_acc_mean"], yerr=100 * t["final_acc_std"],
-                    marker="o", capsize=4, color=COLOR["csasfl"])
-        ax.set_xlabel("Re-clustering interval H (global rounds)")
-        ax.set_ylabel("Final test accuracy (%)")
-        tb = float(sw["time_budget"].max()) if "time_budget" in sw else 0.0
-        ax.set_title(f"Effect of H (delta = {args.noniid:g}, N = {args.N}, "
-                     + (f"time budget {tb:g} s)" if tb > 0 else f"T = {int(sw['T'].iloc[0])})"), fontsize=10)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        for ext in ("png", "pdf"):
-            fig.savefig(os.path.join(out, f"hsweep_final.{ext}"), dpi=200)
-        plt.close(fig)
-        t[["config", "n_seeds", "final_acc_mean", "final_acc_std", "last10_acc_mean"]].to_csv(
-            os.path.join(out, "hsweep_final.csv"), index=False)
-        print(f"[plots] {out}/hsweep_final.png")
+        # ---- H sweep ----
+        hs = sorted(sw[np.isclose(sw["N"], args.N)]["H"].dropna().unique())
+        if len(hs) > 1:
+            groups = {f"H={int(h)}": runs_of(sw, N=args.N, H=h) for h in hs}
+            plot_curves({k: mean_curve(v, "sim_time_s") for k, v in groups.items()}, "sim_time_s",
+                        os.path.join(out, f"{pre}hsweep_time"),
+                        f"CSA-SFL [{shown}], delta = {args.noniid:g}, N = {args.N}: varying H")
+            staleness_figure(groups, os.path.join(out, f"{pre}hsweep_staleness"),
+                             f"CSA-SFL staleness vs H (delta = {args.noniid:g}, N = {args.N}, variant {shown})")
+            t = summary_rows(groups, args.targets)
+            t.to_csv(os.path.join(out, f"{pre}hsweep_table.csv"), index=False)
+            report += fmt_table(t, f"H sweep [{shown}] (delta {args.noniid:g}, N {args.N})", args.targets)
+            fig, ax = plt.subplots(figsize=(5.2, 3.8))
+            ax.errorbar([int(h) for h in hs], 100 * t["final_acc_mean"], yerr=100 * t["final_acc_std"],
+                        marker="o", capsize=4, color=COLOR["csasfl"])
+            ax.set_xlabel("Re-clustering interval H (global rounds)")
+            ax.set_ylabel("Final test accuracy (%)")
+            tb = float(sw["time_budget"].max()) if "time_budget" in sw else 0.0
+            ax.set_title(f"Effect of H [{shown}] (delta = {args.noniid:g}, N = {args.N}, "
+                         + (f"time budget {tb:g} s)" if tb > 0 else f"T = {int(sw['T'].iloc[0])})"), fontsize=10)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            for ext in ("png", "pdf"):
+                fig.savefig(os.path.join(out, f"{pre}hsweep_final.{ext}"), dpi=200)
+            plt.close(fig)
+            t[["config", "n_seeds", "final_acc_mean", "final_acc_std", "last10_acc_mean"]].to_csv(
+                os.path.join(out, f"{pre}hsweep_final.csv"), index=False)
+            print(f"[plots] {out}/{pre}hsweep_final.png")
 
-    # ---- ablation ----
-    ab = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid)]
-    if ab["variant"].isin(["uniform_agg", "random_cluster"]).any():
-        groups = {VARIANT_LABEL.get(v, v): runs_of(ab, variant=v, N=args.N, H=args.H)
-                  for v in ["full", "uniform_agg", "random_cluster"] if (ab["variant"] == v).any()}
-        styles = {VARIANT_LABEL["full"]: {"color": COLOR["csasfl"], "lw": 2.4},
-                  VARIANT_LABEL["uniform_agg"]: {"color": "#555555", "ls": "--"},
-                  VARIANT_LABEL["random_cluster"]: {"color": "#8c564b", "ls": "-."}}
-        plot_curves({k: mean_curve(v, "sim_time_s") for k, v in groups.items()}, "sim_time_s",
-                    os.path.join(out, "ablation_time"), f"Ablation, delta = {args.noniid:g}, N = {args.N}, H = {args.H}",
-                    styles=styles)
-        t = summary_rows(groups, args.targets)
-        t.to_csv(os.path.join(out, "ablation_table.csv"), index=False)
-        report += fmt_table(t, "ablation", args.targets)
+        # ---- ablation ----
+        ab = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid)]
+        present = [(lab, v) for lab, v in abl if (ab["variant"] == v).any()]
+        if len(present) > 1:
+            groups = {f"{lab} [{v}]" if lab.split(" ")[0] in ("paper", "full") else lab: runs_of(ab, variant=v, N=args.N, H=args.H)
+                      for lab, v in present}
+            pal = plt.cm.tab10.colors
+            styles = {k: {"color": COLOR["csasfl"] if k.startswith("full") else pal[(i + 1) % 10],
+                          "lw": 2.4 if k.startswith("full") else 1.4, "ls": "-" if i < 2 else "--"}
+                      for i, k in enumerate(groups)}
+            plot_curves({k: mean_curve(v, "sim_time_s") for k, v in groups.items()}, "sim_time_s",
+                        os.path.join(out, f"{pre}ablation_time"),
+                        f"Ablation of CSA-SFL [{shown}], delta = {args.noniid:g}, N = {args.N}, H = {args.H}",
+                        styles=styles)
+            t = summary_rows(groups, args.targets)
+            t.to_csv(os.path.join(out, f"{pre}ablation_table.csv"), index=False)
+            report += fmt_table(t, f"ablation of [{shown}]", args.targets)
+
 
     # ---- CSA-SFL improvement variants (run_mnist_exp.py --exp variants) ----
     cv = df[(df["method"] == "csasfl") & np.isclose(df["N"], args.N) & np.isclose(df["H"], args.H)

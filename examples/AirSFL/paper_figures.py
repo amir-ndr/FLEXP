@@ -123,7 +123,8 @@ FIGS = {   # file name -> (partition, kind[, options])
     "fig3_noniid_uplink_time_to_target_vs_snr": ("dirichlet", "uplink_time_to_target_vs_snr"),
     "fig4_noniid_accuracy_within_uplink_budget": ("dirichlet", "budget_vs_snr"),    # budget = AirSFL's full run
     "fig4_noniid_accuracy_within_uplink_budget_2000": ("dirichlet", "budget_vs_snr", {"budget_s": 2000.0}),
-    "fig5_noniid_uplink_time_to_target_vs_N": ("dirichlet", "time_to_target_vs_N"),
+    # fig5 target "common": the highest accuracy every method reaches in every seed at every N (as fig3)
+    "fig5_noniid_uplink_time_to_target_vs_N": ("dirichlet", "time_to_target_vs_N", {"target": "common"}),
     "fig6_iid_accuracy_vs_uplink_time_20dB": ("iid", "curves_20dB"),
     "fig7_iid_uplink_time_to_target_vs_N": ("iid", "time_to_target_vs_N"),
 }
@@ -237,14 +238,20 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
             rows.append(row)
         return pd.DataFrame(rows)
 
-    def time_to_target_vs_N(fig, scheme, xcol="uplink_s"):
+    def time_to_target_vs_N(fig, scheme, xcol="uplink_s", target="rule"):
         def frame(mn):
             a = pd.concat([f for f in (mn, nsweep) if not f.empty], ignore_index=True)
             return a[(a.rho_db == 20.0) & (a.tau == P.TAU0) & a.cut.isin([P.CUT0, 0]) & (a.partition == scheme)]
         sub, sub_t = frame(P._main20(main)), frame(main)   # bars: --main-seeds at N = 30; target: every seed
         Ns = sorted({int(n) for n in sub.N})
-        tg = [P.rule_target(sub_t[sub_t.N == N], scheme) for N in Ns]
-        A = min(t for t in tg if t is not None)            # common target reachable by every N
+        if target == "common":                              # highest accuracy every drawn run reaches
+            A = math.floor(100 * min(float(g[g["round"] >= 1].val_acc.max()) for N in Ns for m in TRAINED
+                                     for g in P._seed_runs(sub[(sub.N == N) & (sub.method == m)]))) / 100
+        elif target == "rule":                              # lowest per-N 95% target, reachable by every N
+            tg = [P.rule_target(sub_t[sub_t.N == N], scheme) for N in Ns]
+            A = min(t for t in tg if t is not None)
+        else:
+            A = float(target) / 100 if float(target) > 1 else float(target)
         rows = []
         for N in Ns:
             row, ns = {"N": N, "target val acc (%)": 100 * A}, []
@@ -297,7 +304,8 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
                     "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "uplink_s", fig3_target),
                     "training_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "training_time_s"),
                     "budget_vs_snr": lambda f, sc: budget_vs_snr(f, sc, budget_s=opts.get("budget_s")),
-                    "time_to_target_vs_N": time_to_target_vs_N}[kind](name, scheme)
+                    "time_to_target_vs_N": lambda f, sc: time_to_target_vs_N(f, sc, target=opts.get("target", "rule"))
+                    }[kind](name, scheme)
         data.to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.6g")
         tg = f" (target {data['target val acc (%)'].iloc[0]:g}%)" if "target val acc (%)" in data else ""
         print(f"[data] {name}.csv{tg}")
