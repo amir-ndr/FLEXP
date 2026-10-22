@@ -32,6 +32,21 @@ payloads. FP32 (`--digital-q 32`) remains available: its digital SFL-V1 runs are
 error-free reference, its FedAvg runs the reference of the target rule, and `fig12` compares
 the two payloads.
 
+**Low-precision digital baselines: INT8 / INT4** (`--digital-q 8` / `4`, any q = 2..8). The
+uploaded tensors are *really quantized*: per 256-value block the block maximum s is side
+information (as for FP16 and the analog packet norms, covered by ε) and every value is a q-bit
+integer on a uniform grid — 2^q − 1 steps over [0, s] for blocks without negative values (the
+post-ReLU cut activations: zeros stay exact; at cut 2 a block is one 16×16 feature map of one
+sample), 2^(q−1) − 1 steps per sign over [−s, s] otherwise (model differences). Activations are
+rounded to the nearest level; model differences stochastically (unbiased, as in QSGD/FedPAQ;
+seeded per (seed, round), so reruns are bitwise identical). Rounding error on the real cut-2
+activations: INT8 ≈ −50 dB, INT4 ≈ −26 dB (AirSFL's ZF error: −35 dB at 20 dB, −25 dB at
+10 dB). Timing: q bits per value, so per round at 20 dB Hybrid-Z takes 1.97 s (INT8) / 1.14 s
+(INT4) and SFL-Z 2.08 / 1.04 s vs AirSFL 1.53 s. Break-even payload (same airtime per value as
+the analog upload): q\* = c_ZF/2 = 5.9 bits at 20 dB, 4.2 at 10 dB, 2.6 at 0 dB, 0.2 at −20 dB
+(`timing.breakeven_bits`). The INT-q runs carry the quantizer version in their identity; FP16 /
+FP32 runs are bitwise unchanged.
+
 † Stronger digital baselines (non-orthogonal access): every client sends its own coded
 stream on all S tones and the server separates the N streams with the same ZF filter
 AirSFL uses. Their learning is *identical* to Digital SFL-V1 / Hybrid FDMA-AirComp SFL
@@ -103,12 +118,12 @@ transmission itself.
 
 | File | What it is | Verified by |
 |---|---|---|
-| `flsim/airsfl/timing.py` | uplink time per phase, source MB; OFDMA and multi-user ZF digital rates; FP16 / FP32 payload | formula regression, limit cases, each phase counted once, ZF rate vs explicit ZF channels, N=1: ZF = OFDMA, q = 16 halves exactly the digital phases |
+| `flsim/airsfl/timing.py` | uplink time per phase, source MB; OFDMA and multi-user ZF digital rates; FP16 / FP32 / INT-q payload; break-even payload q\* | formula regression, limit cases, each phase counted once, ZF rate vs explicit ZF channels, N=1: ZF = OFDMA, q = 16 halves exactly the digital phases, INT-q scales them by q/32, q\* = c_ZF/2 gives the analog airtime |
 | `flsim/airsfl/compute.py` | FLOP profile per cut, computation time per phase | closed-form MACs, framework counter, prefix+suffix = full, N=1 limit, hand calculation |
 | `flsim/airsfl/model.py` | ResNet-18: 3x3 stem, no max-pool, GroupNorm-32, cuts after stages 1-4 | roadmap d_c / d_s / d_a |
 | `flsim/airsfl/radio.py` | dimensional ZF / AirComp physics | gates (packing, power, C^H H = I, noiseless AirComp, zero packets); MC MSE vs Eq. 10 / 23 |
 | `flsim/airsfl/data.py` | 45k/5k split, IID / Dirichlet(α) (default α = 0.1), matched per-client streams, crop+flip | vectorized crop == reference |
-| `flsim/airsfl/simulator.py` | training for all methods (the 5 trained ones + the ZF digital baselines); joint ZF error per packet; AirComp error; FP16 rounding of digital uploads; radio streams seeded by (seed, link, round, step); two engines | `python -m flsim.airsfl.checks` (incl. ZF baselines == parents' learning, bitwise; FP16 error bound, analog methods untouched by q) |
+| `flsim/airsfl/simulator.py` | training for all methods (the 5 trained ones + the ZF digital baselines); joint ZF error per packet; AirComp error; FP16 / INT-q rounding of digital uploads; radio streams seeded by (seed, link, round, step); two engines | `python -m flsim.airsfl.checks` (incl. ZF baselines == parents' learning, bitwise; FP16 error bound, analog methods untouched by q; INT-q error bounds, unbiased stochastic rounding, reruns bitwise) |
 
 **Engines.** `vmap` (default) trains all clients in parallel (torch.func) with fast cuDNN
 (1.53 s/round on an idle A30); `loop` trains clients one after another with relay back-prop
@@ -231,5 +246,39 @@ computation per round and its composition), fig4a (bytes vs airtime). fig2c plot
 accuracy reached within a fixed uplink / training-time budget vs SNR (`--budget-uplink`,
 `--budget-training`; default: AirSFL's full-run time at 20 dB). fig10 / fig1d compare the
 computation regimes (uplink only, edge GPU, IoT CPU) from the same `main` runs.
+
+## Paper figures (`paper_figures.py`)
+
+`python examples/AirSFL/paper_figures.py --results <folder>` writes the paper's figures (seed
+means only, FP16 payload, ZF variants derived) with one CSV per figure and `provenance.csv` to
+`<folder>/finalz/`; the look is set in its FORMAT / METHODS blocks, `--plot-only` redraws from the
+CSVs.
+
+**With the INT8 / INT4 baselines**: train them into their own folder (AirSFL / AirComp-FL do not
+depend on q and come from the FP16 folder; the ZF variants are derived as usual):
+
+```bash
+Q=examples/AirSFL/results_qbits; mkdir -p $Q/lr; cp examples/AirSFL/results_final_s1/lr/chosen_lr.json $Q/lr/
+for QB in 8 4; do
+  C="EPOCHS=100,RESULTS=$Q,SKIP_PLOTS=1,EXTRA=--early-evals --evals-per-epoch 4 --dirichlet-alpha 0.1 --digital-q $QB"
+  for P in iid dirichlet; do for M in digital_sflv1 sun_fdma_aircomp; do            # 20 dB (fig2/6, table)
+    sbatch --export="ALL,EXP=main,PARTITION=$P,METHODS=$M,SEEDS=11 22 33 44 55,$C" slurm/run_airsfl.slurm
+    sbatch --export="ALL,EXP=nsweep,PARTITION=$P,METHODS=$M,SEEDS=11 22 33 44 55,$C" slurm/run_airsfl.slurm
+  done; done
+  for S in 11 22 33 44 55; do                    # SNR sweep: only the hybrid (SFL learning is SNR-independent)
+    sbatch --export="ALL,EXP=snr,PARTITION=dirichlet,METHODS=sun_fdma_aircomp,SEEDS=$S,$C" slurm/run_airsfl.slurm
+  done
+done
+```
+
+then `paper_figures.py --results examples/AirSFL/results_final_s1 --payload-results
+examples/AirSFL/results_qbits` writes `<results>/finalz_payload/`: the same figures with Hybrid-Z
+and SFL-Z at INT8 / INT4 added (VARIANTS: hollow markers, hatched bars; legends as a family x
+payload grid), `fig8_noniid_payload_uplink_time_to_target_vs_snr` (AirSFL vs Hybrid-Z / SFL-Z at
+FP16 / INT8 / INT4) and the payload table: `table_payload.csv` (every method x payload at every SNR,
+20 dB IID / non-IID and N, at the figures' targets: final accuracy, s/round, uplink time to target
+and its ratio to AirSFL, seeds reached, error-to-signal ratios, q\*) and `table_payload.tex` / `.md`
+(compact, PAYLOAD["table_rows"] x PAYLOAD["table_snrs"]). Targets are those of `finalz`, so every
+FP16 number is identical in both folders; `finalz/` is not touched.
 
 On the cluster: see the header of `slurm/run_airsfl.slurm`.

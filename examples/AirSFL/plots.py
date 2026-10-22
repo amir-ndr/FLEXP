@@ -86,8 +86,8 @@ import numpy as np
 import pandas as pd
 
 from flsim.airsfl.compute import SPLIT_METHODS, compute_time_breakdown, split_flops
-from flsim.airsfl.timing import (RadioConfig, digital_rates, path_gain_offsets_db, profiled_dims,
-                                 source_equivalent_mb_per_round,
+from flsim.airsfl.timing import (PAYLOAD_BITS, RadioConfig, digital_rates, path_gain_offsets_db, payload_name,
+                                 profiled_dims, source_equivalent_mb_per_round,
                                  uplink_time_breakdown, uplink_time_per_round)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -347,10 +347,10 @@ def _report_missing(d, sel, q):
                 + (f" spread {float(r['path_gain_spread_db']):g} dB" if float(r.get("path_gain_spread_db", 0) or 0)
                    else ""))
     if not groups:
-        print(f"[plots] FP{q} digital payload: every digital-payload run has its FP{q} version")
+        print(f"[plots] {payload_name(q)} digital payload: every digital-payload run has its {payload_name(q)} version")
     else:
-        print(f"[plots] FP{q} digital payload: these runs exist only with another payload, so they are LEFT OUT of "
-              f"the FP{q} figures (train them with run_airsfl.py --digital-q {q}; finished runs are skipped):")
+        print(f"[plots] {payload_name(q)} digital payload: these runs exist only with another payload, so they are LEFT OUT of "
+              f"the {payload_name(q)} figures (train them with run_airsfl.py --digital-q {q}; finished runs are skipped):")
         for (e, m), pts in sorted(groups.items()):
             print(f"    {e:9s} {m:17s} {len(pts):3d} run(s): " + "; ".join(pts[:6]) + (" ..." if len(pts) > 6 else ""))
 
@@ -364,7 +364,7 @@ def _write_runs_used(x, out):
         g = df[df.method.isin([m for m in ORDER if m not in DERIVED])]
         cols = [c for c in ("method", "partition", "seed", "rho_db", "N", "run_id", "source_file") if c in g]
         g = g[cols].drop_duplicates("run_id").assign(experiment=e)
-        g["digital payload"] = [f"FP{_q_of(r)}" if r["method"] in PAYLOAD_METHODS else
+        g["digital payload"] = [payload_name(_q_of(r)) if r["method"] in PAYLOAD_METHODS else
                                 ("labels only" if r["method"] in SPLIT_METHODS else "none")
                                 for _, r in df.loc[g.index].iterrows()]
         frames.append(g)
@@ -399,12 +399,12 @@ def _report_unpaired(x):
 def _payload_of(m, run):
     """Digital payload of a method's uploads as recorded by its run."""
     if m in PAYLOAD_METHODS:
-        return f"FP{_q_of(run.iloc[0])}"
+        return payload_name(_q_of(run.iloc[0]))
     return "labels only" if m in SPLIT_METHODS else "none"
 
 
 def _pl():
-    return f"digital FP{ENV0['q_bits']}"
+    return f"digital {payload_name(ENV0['q_bits'])}"
 
 
 def _mb_per_round(run):
@@ -807,13 +807,13 @@ def fig1_and_table(main):
                              "compute s/round": float(r0.compute_s_per_round),
                              "client FP+BP s/round": float(r0.client_fp_s + r0.client_bp_s),
                              "server FP+BP s/round": float(r0.server_fp_s + r0.server_bp_s),
-                             "training s/round": float(r0.e2e_s_per_round), f"MB/round (FP{ENV0['q_bits']})": mb,
+                             "training s/round": float(r0.e2e_s_per_round), f"MB/round ({payload_name(ENV0['q_bits'])})": mb,
                              "final test acc (%)": acc, "acc min": amin, "acc max": amax,
                              "target val acc (%)": 100 * A, "reached": f"{st_ul[m]['hit']}/{st_ul[m]['n']}",
                              "rounds to target": st_ul[m]["k"], "epochs to target": st_ul[m]["epochs"],
                              "UL time to target (s)": st_ul[m]["t"],
                              "training time to target (s)": st_tr[m]["t"],
-                             f"MB to target (FP{ENV0['q_bits']})": st_ul[m]["k"] * mb,
+                             f"MB to target ({payload_name(ENV0['q_bits'])})": st_ul[m]["k"] * mb,
                              "UL time / AirSFL (paired)": xu[0], "training time / AirSFL (paired)": xr[0],
                              "UL speed-up vs SFL-V1 (paired)": su[0], "training speed-up vs SFL-V1 (paired)": sr[0]})
     if rows:
@@ -928,7 +928,7 @@ def fig2_snr(main, snr):
         axes[i][0].set_xlabel("Reference SNR rho (dB)")
         axes[i][0].set_ylabel("Final test accuracy (%)")
         axes[i][0].set_title(f"{PART_NAME[scheme]}: final accuracy vs SNR (bars = seed min-max)\n"
-                             f"digital (FP{ENV0['q_bits']}) learning is SNR-independent; ZF = OFDMA twin (drawn once)",
+                             f"digital ({payload_name(ENV0['q_bits'])}) learning is SNR-independent; ZF = OFDMA twin (drawn once)",
                              fontsize=10.5)
         for j, axis in ((1, "uplink"), (2, "training")):
             axes[i][j].set_yscale("log")
@@ -988,7 +988,7 @@ def fig2_snr(main, snr):
         ax.set_ylabel("Test accuracy (%)")
         ax.set_title(f"SNR sweep — {PART_NAME[scheme]}")
     _fig_legend(fig, axes, ncol=4)
-    fig.suptitle(f"AirSFL: airtime is SNR-independent, distortion is not; digital (FP{ENV0['q_bits']}): accuracy fixed, "
+    fig.suptitle(f"AirSFL: airtime is SNR-independent, distortion is not; digital ({payload_name(ENV0['q_bits'])}): accuracy fixed, "
                  "rate falls at low SNR", y=1.02, fontsize=11)
     _save(fig, "fig2b_airsfl_snr_curves")
 
@@ -1401,7 +1401,7 @@ def fig3_breakdown(Ns=(20, 30, 40), stage=CUT0, tau=TAU0):
                              "compute s/round (f_min=lo)": c["total"], "training s/round": b["total"] + c["total"],
                              "d_c": dims_all[s]["d_c"], "d_s": dims_all[s]["d_s"], "d_a": dims_all[s]["d_a"],
                              "tau*d_a < d_s": tau * dims_all[s]["d_a"] < dims_all[s]["d_s"],
-                             f"MB/round (FP{r.q_bits})": source_equivalent_mb_per_round(m, dims_all[s], r, tau,
+                             f"MB/round ({payload_name(r.q_bits)})": source_equivalent_mb_per_round(m, dims_all[s], r, tau,
                                                                                         q_ref=r.q_bits)})
             ax.bar(np.arange(4) + (j - (len(ORDER) - 1) / 2) * wb, vals, width=wb, color=STYLE[m]["color"],
                    edgecolor="k", lw=0.4, label=STYLE[m]["label"])
@@ -1554,7 +1554,7 @@ def fig5_nr(main, nr):
         for m in ("digital_sflv1_zf", "digital_sflv1"):
             ref = main[(main.partition == scheme) & (main.method == m)] if not main.empty else main
             if m in ORDER and not ref.empty:
-                _plot_curve(ax, ref, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']} (Nr=64, FP{ENV0['q_bits']})")
+                _plot_curve(ax, ref, STYLE[m], "uplink_s", label=f"{STYLE[m]['label']} (Nr=64, {payload_name(ENV0['q_bits'])})")
         ax.set_xscale("log")
         ax.set_xlabel(AXES["uplink"][1])
         ax.set_ylabel("Test accuracy (%)")
@@ -1935,7 +1935,7 @@ def fig12_digital_transport(sets):
         for ci, (acc, q) in enumerate(combos):
             t = uplink_time_per_round(ms[acc], dims, radios[q], TAU0, _rates(radios[q]))
             draw(axes[0], fi, ci, t, t / t_air)
-            rows.append({"partition": "analytic (per round)", "family": fam, "access": acc, "payload": f"FP{q}",
+            rows.append({"partition": "analytic (per round)", "family": fam, "access": acc, "payload": f"{payload_name(q)}",
                          "method": ms[acc], "UL s/round": t, "UL s/round / AirSFL": t / t_air})
     axes[0].axhline(t_air, color=STYLE["airsfl"]["color"], ls="--", lw=1.5)
     axes[0].set_title(f"(a) uplink seconds per round (cut {CUT0}, N=30, 20 dB); AirSFL = {t_air:.2f} s",
@@ -1952,14 +1952,14 @@ def fig12_digital_transport(sets):
                 dm = src[(src.partition == scheme) & (src.method == ms[acc])] if not src.empty else src
                 if dm.empty:
                     draw(ax, fi, ci, np.nan, np.nan)
-                    rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"FP{q}",
-                                 "method": ms[acc], "note": f"no FP{q} run"})
+                    rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"{payload_name(q)}",
+                                 "method": ms[acc], "note": f"no {payload_name(q)} run"})
                     continue
                 s = ttt(dm, A, "uplink_s")
                 ratio = paired_speedup(s, air)[0] if air["hit"] > 0 and s["hit"] > 0 else np.nan
                 draw(ax, fi, ci, s["t"] if s["hit"] > 0 else np.nan, ratio)
                 acc_m, lo, hi = final_acc(dm)
-                rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"FP{q}",
+                rows.append({"partition": PART_NAME[scheme], "family": fam, "access": acc, "payload": f"{payload_name(q)}",
                              "method": ms[acc], "seeds": s["n"], "UL s/round": float(dm.ul_s_per_round.iloc[0]),
                              "UL s/round / AirSFL": float(dm.ul_s_per_round.iloc[0]) / t_air,
                              "final test acc (%)": acc_m, "target val acc (%)": 100 * A if A else np.nan,
@@ -2061,10 +2061,12 @@ def main():
                    help="methods to draw (default: AirSFL, AirComp-FL, the two hybrids and digital SFL-V1 (ZF / "
                         "OFDMA); add digital_fedavg (and digital_fedavg_zf) to draw digital FedAvg. The ZF variants "
                         "are derived from the digital_sflv1 / sun_fdma_aircomp / digital_fedavg runs)")
-    p.add_argument("--digital-q", nargs="+", type=int, default=[16], choices=[16, 32],
+    p.add_argument("--digital-q", nargs="+", type=int, default=[16], choices=sorted(PAYLOAD_BITS),
                    help="digital payload(s) of the drawn figure sets: 16 = the FP16 runs (default) -> plots_fp16/, "
-                        "32 = the FP32 runs -> plots_fp32/ (--digital-q 16 32: both); each folder holds figures/, "
-                        "tables/, paper_results/, the --snr folders and runs_used.csv")
+                        "32 = the FP32 runs -> plots_fp32/, 8 / 4 = the INT8 / INT4 runs -> plots_int8/, plots_int4/ "
+                        "(--digital-q 16 32: both); each folder holds figures/, tables/, paper_results/, the --snr "
+                        "folders and runs_used.csv. (The INT-q baselines in the paper figures: paper_figures.py "
+                        "--payload-results)")
     p.add_argument("--budget-mult", nargs="+", type=float, default=[1.0],
                    help="fig2c: budgets = base budget x each value, e.g. 1 3 10 (base = AirSFL's full run)")
     p.add_argument("--linear-snrs", nargs="+", type=float, default=None,
@@ -2110,11 +2112,11 @@ def main():
     print(f"[plots] results={RESULTS} | filter {FILTER} | compute {COMPUTE} "
           f"({'recomputed' if recompute else 'as stored'}) | targets = "
           f"{TARGETS or 'rule (95% of the error-free reference)'} | methods {ORDER}")
-    sets = {q: _select_payload(d, q) for q in (16, 32)}     # both: fig12 compares the payloads
+    sets = {q: _select_payload(d, q) for q in sorted(set(a.digital_q) | {16, 32})}   # fig12 compares FP16 / FP32
     for q in a.digital_q:
         ENV0["q_bits"] = q
         x = sets[q]
-        out = f"plots_fp{q}"                                # every output of one payload set in its own folder
+        out = f"plots_{payload_name(q).lower()}"            # every output of one payload set in its own folder
         TARGET_SRC["df"] = x["main"]                        # 95% target: all seeds of the set's digital SFL-V1
         m20 = _main20(x["main"])                            # 20 dB-only figures: --main-seeds
         _report_missing(d, x, q)
@@ -2126,7 +2128,7 @@ def main():
         for rho in a.snr:
             FIG = os.path.join(RESULTS, out, "figures" + ("" if rho == 20.0 else f"_snr{rho:g}"))
             TAB = os.path.join(RESULTS, out, "tables" + ("" if rho == 20.0 else f"_snr{rho:g}"))
-            print(f"[plots] digital payload FP{q}, {rho:g} dB -> {FIG}, {TAB}")
+            print(f"[plots] digital payload {payload_name(q)}, {rho:g} dB -> {FIG}, {TAB}")
             # subfigure files of the nominal pass -> plots_fp<q>/paper_results/<figure>/
             PANELS["dir"] = os.path.join(out, "paper_results") if rho == 20.0 else None
             if rho == 20.0:                  # nominal point: every figure, sweeps included

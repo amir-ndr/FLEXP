@@ -18,7 +18,9 @@ differences, AirComp) with 64 antennas each; S=120 subcarriers x 15 kHz (W=1.8 M
 tones per client in OFDMA); Pmax=0.1 W; N0=-167 dBm/Hz; eps_D=eps_U=eps_A=0.6; rho=20 dB;
 cut after stage 2; tau=5; B=16; plain SGD with cosine decay to 1% (fixed within a round);
 digital payload FP16 (--digital-q 16: the tensors digital SFL-V1, the hybrid and digital FedAvg
-upload are really rounded to FP16 and timed with q = 16 bits; --digital-q 32 for FP32; AirSFL and
+upload are really rounded to FP16 and timed with q = 16 bits; --digital-q 32 for FP32; --digital-q 8 / 4
+for the low-precision INT8 / INT4 baselines: per-256-value block scale + q-bit uniform grid, activations
+rounded to the nearest level, model differences stochastically (unbiased); AirSFL and
 AirComp-FL upload nothing digitally but labels and are unaffected); evaluation once per
 global-epoch equivalent; FP32 arithmetic (TF32 disabled); no augmentation (--augment
 enables crop+flip); parallel "vmap" engine with fast cuDNN (--engine loop / --deterministic
@@ -53,6 +55,10 @@ copied, e.g. FP16 runs of --exp fp16 into main/), any changed setting produces a
           runs (finished fp16 runs are reused there); kept for older job scripts.
 The FP32 runs of the digital-payload methods (--digital-q 32) are the exact error-free reference,
 the reference of the target rule and the FP32 rows of plots.py's payload-sensitivity figure.
+Low-precision baselines (--digital-q 8 / 4, own results folder, e.g. --results examples/AirSFL/results_qbits):
+main / snr / nsweep with --methods digital_sflv1 sun_fdma_aircomp (the ZF variants are derived;
+AirSFL / AirComp-FL do not depend on q and come from the FP16 folder); paper_figures.py
+--payload-results adds them to the paper figures and the payload table.
 
 Usage:
   python examples/AirSFL/run_airsfl.py --exp bench lr
@@ -78,9 +84,10 @@ import torch
 from flsim.airsfl.compute import ComputeConfig, compute_time_breakdown, split_flops
 from flsim.airsfl.data import (PARTITION_REDRAWS, ClientStream, load_cifar10_tensors, make_eval_tensors,
                                partition)
-from flsim.airsfl.simulator import PACKET_REAL, SCHEMA, AirSFLSimulator, RunConfig
+from flsim.airsfl.simulator import INTQ_SCHEME, PACKET_REAL, SCHEMA, AirSFLSimulator, RunConfig
 from flsim.airsfl.timing import METHODS as ALL_TIMED
-from flsim.airsfl.timing import SPLIT_METHODS, RadioConfig, environment_summary, path_gain_offsets_db
+from flsim.airsfl.timing import (PAYLOAD_BITS, SPLIT_METHODS, RadioConfig, environment_summary, path_gain_offsets_db,
+                                 payload_name)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "results")
@@ -112,7 +119,7 @@ TAU_SWEEP = [1, 10, 20, 50]            # stage-2 per-round crossover with AirCom
 NR_SWEEP = [32, 40, 48]                # M-server antennas; F-server fixed
 SPREAD_SWEEP = [10.0, 20.0, 30.0, 40.0]   # path-gain spreads (dB) for --exp pathloss (0 = main)
 PATH_GAIN = {"spread_db": 0.0}         # --path-gain-spread: unequal path gains for every experiment
-DIGITAL_Q = {"q_bits": 16}             # --digital-q: payload bits of FP16_METHODS (16 FP16 default, 32 FP32)
+DIGITAL_Q = {"q_bits": 16}             # --digital-q: payload bits of FP16_METHODS (16 FP16 default, 32 FP32, 2..8 INT-q)
 TARGETS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]   # reached_XX columns (validation)
 
 
@@ -160,7 +167,10 @@ def run_manifest(env, method, scheme, radio, cfg, epochs):
     CSV but excluded from the identity."""
     d = env.data
     part_sizes = [len(p) for p in env.parts(scheme, radio.N, cfg.seed)]
+    # INT-q runs also carry the quantizer version (FP16 / FP32 runs keep their hash)
+    intq = {"int_quantizer": INTQ_SCHEME} if radio.q_bits <= 8 else {}
     return {
+        **intq,
         "schema": SCHEMA, "method": method, "partition": scheme,
         "dirichlet_alpha": TRAIN["dirichlet_alpha"] if scheme == "dirichlet" else None,
         "min_per_client": TRAIN["min_per_client"],
@@ -466,7 +476,8 @@ def print_budget():
     """Per-round uplink + computation budget of the default environment."""
     radio = RadioConfig(**ENV, gains_db=path_gain_offsets_db(ENV["N"], PATH_GAIN["spread_db"], TRAIN["seed"]),
                         q_bits=DIGITAL_Q["q_bits"])
-    print(f"  digital payload: FP{radio.q_bits} (q = {radio.q_bits} bits per value) for {', '.join(FP16_METHODS)}")
+    print(f"  digital payload: {payload_name(radio.q_bits)} (q = {radio.q_bits} bits per value) for "
+          f"{', '.join(FP16_METHODS)}")
     environment_summary(radio, stage=TRAIN["stage"], tau=TRAIN["tau"])
     lo, hi, fs = COMPUTE["client_tflops_lo"], COMPUTE["client_tflops_hi"], COMPUTE["server_tflops"]
     print(f"  computation: client f_i ~ U[{lo}, {hi}] TFLOPS (slowest client paces each step), "
@@ -500,10 +511,12 @@ def main():
                    help="path-gain spreads (dB) for --exp pathloss")
     p.add_argument("--pathloss-snrs", nargs="+", type=float, default=None,
                    help="SNRs for --exp pathloss (default: the nominal 20 dB only)")
-    p.add_argument("--digital-q", type=int, default=16, choices=[16, 32],
+    p.add_argument("--digital-q", type=int, default=16, choices=sorted(PAYLOAD_BITS),
                    help="digital payload bits of the methods that upload tensors digitally (digital SFL-V1, hybrid, "
-                        "digital FedAvg): 16 = FP16 (default; the uploaded tensors are really rounded), 32 = FP32. "
-                        "AirSFL / AirComp-FL are unaffected (same runs for both); --exp fp16 uses 16, --exp lr 32")
+                        "digital FedAvg): 16 = FP16 (default; the uploaded tensors are really rounded), 32 = FP32, "
+                        "2..8 = INT-q (really quantized: block scale + q-bit grid; the low-precision baselines, e.g. 8 "
+                        "and 4). AirSFL / AirComp-FL are unaffected (same runs for every q); --exp fp16 uses 16, --exp "
+                        "lr 32")
     p.add_argument("--path-gain-spread", type=float, default=0.0,
                    help="unequal path gains for EVERY run of this call: client gains spread uniformly (dB) over "
                         "this range around the reference (rho = median client); 0 = equal gains")

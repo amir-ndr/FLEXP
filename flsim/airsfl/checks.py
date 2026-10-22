@@ -24,6 +24,9 @@ flsim/airsfl/checks.py: correctness checks for the AirSFL environment
         (bitwise), timing == retiming;
      l. FP16 digital payload: transport error bound, analog methods unaffected (bitwise),
         digital methods rounded at the FP16 level, both engines agree;
+     m. INT-q digital payloads (q = 8, 4): quantizer error bounds / levels / exact grid / unbiased
+        stochastic rounding / vmap, analog methods unaffected (bitwise), digital methods quantized at
+        the INT-q level, seeded reruns bitwise identical, both engines agree;
      k. unequal path gains: scale-free == dimensional, sampler Monte Carlo, uniform offsets ==
         shifted SNR, all-zero offsets == equal gains;
      g. vectorized crop+flip == per-image reference.
@@ -43,7 +46,7 @@ from flsim.airsfl.data import ClientStream, load_cifar10_tensors, make_eval_tens
 from flsim.airsfl.model import CifarResNet18GN, check_profiled_dims
 from flsim.airsfl.simulator import AirSFLSimulator, RunConfig, _HAS_FUNC
 from flsim.airsfl.timing import (RadioConfig, digital_rates, uplink_time_breakdown, verify_limit_cases,
-                                 verify_fp16, verify_path_gains, verify_reference_example, verify_zf)
+                                 verify_fp16, verify_intq, verify_path_gains, verify_reference_example, verify_zf)
 
 _OK = lambda b: "PASS" if b else "FAIL"
 ENGINES = ("loop", "vmap") if _HAS_FUNC else ("loop",)
@@ -263,8 +266,8 @@ def check_time_columns_and_streams(verbose=True) -> bool:
     sim._sample_zf_joint()                                    # consume more randomness
     sim.gen_U.manual_seed(sim._stream_seed(1, 3, 2))
     e2 = sim._sample_zf_joint()
-    seeds = {sim._stream_seed(l, r, i) for l in (1, 2) for r in range(200) for i in range(60)}
-    good = torch.equal(e1, e2) and len(seeds) == 2 * 200 * 60
+    seeds = {sim._stream_seed(l, r, i) for l in (1, 2, 3) for r in range(200) for i in range(60)}
+    good = torch.equal(e1, e2) and len(seeds) == 3 * 200 * 60
     ok &= good
     if verbose:
         print(f"  (i) radio draws depend only on (seed, link, round, step), no seed collisions: {_OK(good)}")
@@ -288,16 +291,19 @@ def check_zf_baselines(verbose=True) -> bool:
     parents (the digital links are reliable either way; the hybrids share the parent's AirComp
     stream): identical models, losses and accuracies. Their recorded uplink columns equal the
     parent run's rows retimed with uplink_time_breakdown -- the derivation plots.py uses instead
-    of training them again -- and their computation is the parent's. Also for FP16 payloads."""
+    of training them again -- and their computation is the parent's. Also for FP16 and INT8 payloads
+    (INT8: the seeded stochastic rounding of the model differences is shared too)."""
     radio, make_streams, weights, ev = _small_env()
     same = lambda x, y: x == y or (isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y))
     ok = True
     import dataclasses
-    for q in (32, 16):
+    for q in (32, 16, 8):
         rq = dataclasses.replace(radio, q_bits=q)
         for der, parent, stage in DERIVED_PAIRS:
             if q == 16 and der not in ("digital_sflv1_zf", "digital_fedavg_zf"):
                 continue                          # FP16: one split and one FL pair are enough
+            if q == 8 and der not in ("digital_sflv1_zf", "hybrid_zf_aircomp"):
+                continue                          # INT8: the two split pairs of the low-precision baselines
             a = _run(parent, stage, rq, make_streams, weights, ev, False, ENGINES[-1])
             b = _run(der, stage, rq, make_streams, weights, ev, False, ENGINES[-1])
             good = torch.equal(a.global_vector(), b.global_vector()) and len(a.history) == len(b.history)
@@ -380,6 +386,106 @@ def check_fp16(verbose=True) -> bool:
             print(f"  (l3) {m:16s} q=16: act NSR {act:6.1f} dB, agg NSR {agg:6.1f} dB, max|theta16 - theta32| = "
                   f"{float(dv.max()):.1e}, loop vs vmap max {float(de.max()):.1e} / median {float(de.median()):.1e}, "
                   f"uplink {b.ul_s:.3f} vs {a.ul_s:.3f} s/round  {_OK(good)}")
+    return ok
+
+
+INTQ_ACT_NSR_DB = {8: (-60.0, -35.0), 4: (-35.0, -12.0)}     # expected activation NSR window per q
+
+
+def check_intq(verbose=True) -> bool:
+    """(m) INT-q digital payloads (q = 8, 4; the low-precision baselines):
+      1. _intq_transport, q = 8, 4, 2: nearest rounding -- error <= s / 2L per block (L = 2^q - 1 steps
+         on [0, s] for blocks without negative values, 2^(q-1) - 1 per sign otherwise) over 12 decades
+         of magnitude, at most 2^q distinct values per block, zero blocks and the zeros of a ReLU block
+         stay exactly zero, grid values are reproduced exactly, vmap over clients == per client;
+         stochastic rounding -- error < s / L, unbiased (mean of 4000 draws within 5 standard errors),
+         a re-seeded generator reproduces it bitwise;
+      2. AirSFL and AirComp-FL upload nothing digitally except labels: with q = 8 their training and
+         their uplink time are bitwise those of q = 32;
+      3. digital SFL-V1, the hybrid and digital FedAvg with q = 8 and 4: the quantization error is
+         recorded at the INT-q level (activation NSR window per q), the digitally aggregated methods
+         record their aggregate quantization error, the trajectory moves but stays bounded, the uplink
+         time is that of q bits, a rerun is bitwise identical (seeded stochastic rounding) and both
+         engines agree (loose, as in (d2); q = 8)."""
+    import dataclasses
+    from flsim.airsfl.simulator import _intq_transport
+    ok = True
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(40, 256, generator=g, dtype=torch.float64)
+    x = x * (10.0 ** torch.linspace(-9, 3, 40, dtype=torch.float64))[:, None]     # 12 decades across blocks
+    x[7] = 0.0
+    x[8] = x[8].abs()                                                           # non-negative block
+    x[9] = torch.relu(x[9])                                                     # ReLU block with exact zeros
+    xf = x.float()
+    s = xf.double().abs().amax(dim=1, keepdim=True)
+    s = torch.where(s > 0, s, torch.ones_like(s))
+    nonneg = xf.amin(dim=1, keepdim=True) >= 0
+    for q in (8, 4, 2):
+        L = torch.where(nonneg, torch.tensor(2.0 ** q - 1), torch.tensor(2.0 ** (q - 1) - 1)).double()
+        y = _intq_transport(xf.reshape(-1), q).reshape(40, 256).double()
+        good = bool(((y - xf.double()).abs() <= s / (2 * L) * (1 + 1e-5)).all())
+        good &= bool((y[7] == 0).all()) and bool((y[9][xf[9] == 0] == 0).all())
+        good &= max(int(torch.unique(y[k]).numel()) for k in range(40)) <= 2 ** q
+        Ls, Lu = 2 ** (q - 1) - 1, 2 ** q - 1
+        grid_s = (torch.arange(-Ls, Ls + 1, dtype=torch.float32) / Ls).repeat(256)[:256]
+        grid_u = (torch.arange(0, Lu + 1, dtype=torch.float32) / Lu).repeat(256)[:256]
+        good &= torch.equal(_intq_transport(grid_s, q), grid_s) and torch.equal(_intq_transport(grid_u, q), grid_u)
+        if _HAS_FUNC:
+            from torch.func import vmap
+            Z = xf[:32].reshape(4, 8, 256)
+            good &= torch.equal(vmap(lambda z: _intq_transport(z, q))(Z),
+                                torch.stack([_intq_transport(z, q) for z in Z]))
+        gs = torch.Generator().manual_seed(5)
+        draws = torch.stack([_intq_transport(xf[:12].reshape(-1), q, gs).reshape(12, 256) for _ in range(4000)]).double()
+        sL = s[:12] / L[:12]
+        good &= bool(((draws - xf[:12].double()).abs() < sL * (1 + 1e-5)).all())
+        se = 0.5 * sL / math.sqrt(draws.shape[0])                               # std of one rounding <= step/2
+        good &= bool(((draws.mean(0) - xf[:12].double()).abs() <= 5 * se + 1e-6 * sL).all())
+        gs.manual_seed(5)
+        good &= torch.equal(_intq_transport(xf[:12].reshape(-1), q, gs).reshape(12, 256).double(), draws[0])
+        ok &= good
+        if verbose:
+            print(f"  (m1) INT{q} transport: nearest error <= s/2L, <= 2^q levels per block, zeros exact, grid exact"
+                  + (", vmap == per client" if _HAS_FUNC else "") + "; stochastic error < s/L, unbiased, "
+                  f"reproducible  {_OK(good)}")
+    radio, make_streams, weights, ev = _small_env()
+    r8 = dataclasses.replace(radio, q_bits=8)
+    for m, stage in (("airsfl", 2), ("aircomp_fl", None)):
+        a = _run(m, stage, radio, make_streams, weights, ev, False, ENGINES[-1])
+        b = _run(m, stage, r8, make_streams, weights, ev, False, ENGINES[-1])
+        good = torch.equal(a.global_vector(), b.global_vector()) and a.ul_s == b.ul_s
+        ok &= good
+        if verbose:
+            print(f"  (m2) {m:14s} q=8 == q=32 (training bitwise, uplink {b.ul_s:.4f} s/round)  {_OK(good)}")
+    for q in (8, 4):
+        rq = dataclasses.replace(radio, q_bits=q)
+        for m, stage in (("digital_sflv1", 2), ("sun_fdma_aircomp", 2), ("digital_fedavg", None)):
+            a = _run(m, stage, radio, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+            b = _run(m, stage, rq, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+            b2 = _run(m, stage, rq, make_streams, weights, ev, False, ENGINES[-1], rounds=3)
+            dv = (a.global_vector() - b.global_vector()).abs()
+            mean_db = lambda k: (lambda v: float(np.mean(v)) if v else float("nan"))(
+                [h[k] for h in b.history[1:] if not math.isnan(h[k])])
+            act, agg = mean_db("act_nsr_db"), mean_db("agg_nsr_db")
+            lo, hi = INTQ_ACT_NSR_DB[q]
+            good = float(dv.max()) > 0 and float(dv.max()) < 0.5                    # moved, but bounded
+            good &= (lo < act < hi) if stage is not None else math.isnan(act)
+            good &= agg < 0.0 if m != "sun_fdma_aircomp" else not math.isnan(agg)     # hybrid: AirComp noise
+            rd = dataclasses.replace(rq)
+            rd.batch_size = b.cfg.batch_size
+            good &= abs(b.ul_s - uplink_time_breakdown(m, b.dims, rd, b.cfg.tau, digital_rates(rd))["total"]) < 1e-12
+            good &= torch.equal(b.global_vector(), b2.global_vector())
+            eng = ""
+            if q == 8 and len(ENGINES) == 2:
+                c = _run(m, stage, rq, make_streams, weights, ev, False, "loop", rounds=3)
+                de = (b.global_vector() - c.global_vector()).abs()
+                good &= float(de.max()) < 1e-2 and float(de.median()) < 1e-5
+                eng = f", loop vs vmap max {float(de.max()):.1e} / median {float(de.median()):.1e}"
+            ok &= good
+            if verbose:
+                print(f"  (m3) {m:16s} q={q}: act NSR {act:6.1f} dB, agg NSR {agg:6.1f} dB, max|theta{q} - theta32| = "
+                      f"{float(dv.max()):.1e}, rerun bitwise{eng}, uplink {b.ul_s:.3f} vs {a.ul_s:.3f} s/round  "
+                      f"{_OK(good)}")
     return ok
 
 
@@ -493,6 +599,7 @@ def run_all() -> bool:
     ok &= verify_zf()
     ok &= verify_path_gains()
     ok &= verify_fp16()
+    ok &= verify_intq()
     print("\n########## 2. MODEL + COMPUTATION ##########")
     ok &= check_profiled_dims()["ok"]
     ok &= verify_compute()
@@ -506,6 +613,7 @@ def run_all() -> bool:
     ok &= check_time_columns_and_streams()
     ok &= check_zf_baselines()
     ok &= check_fp16()
+    ok &= check_intq()
     ok &= check_path_gains()
     ok &= check_crop()
     print(f"\n==== ALL AIRSFL CHECKS: {_OK(ok)} ====")

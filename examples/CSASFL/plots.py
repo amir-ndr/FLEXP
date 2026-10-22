@@ -191,6 +191,20 @@ def sweep_definitions(name: str):
     return vs(variant_overrides(name, a)), [(lab, vs(ov)) for lab, ov in ablation_configs(name, a)]
 
 
+def resolve_variants(df, args) -> list:
+    """--csa-variant auto: the CSA-SFL variants (run_mnist_exp.py names) with N- or H-sweep runs here."""
+    if args.csa_variant != ["auto"]:
+        return args.csa_variant
+    from run_mnist_exp import VARIANT_NAMES
+    cs = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid)]
+    found = []
+    for name in VARIANT_NAMES:
+        sub = cs[cs["variant"] == sweep_definitions(name)[0]]
+        if len(sub) and ((~np.isclose(sub["N"], args.N)).any() or (~np.isclose(sub["H"], args.H)).any()):
+            found.append(name)
+    return found or ["paper"]
+
+
 def staleness_figure(groups: dict, path: str, title: str):
     """Staleness of CSA-SFL across a sweep (groups: label -> list of runs, already cut at the common
     budget). Every aggregation event row carries the arriving cluster(s): staleness tau = t - t_n
@@ -310,10 +324,11 @@ def main():
     p.add_argument("--noniid", type=float, default=0.1)
     p.add_argument("--time-budget", type=float, default=None,
                    help="cut every run at this simulated time (s); default: the smallest budget among the runs")
-    p.add_argument("--csa-variant", "--sweep-variant", dest="csa_variant", nargs="+", default=["paper"],
+    p.add_argument("--csa-variant", "--sweep-variant", dest="csa_variant", nargs="+", default=["auto"],
                    help="CSA-SFL variant(s) (run_mnist_exp.py --csa-variant names, e.g. slot_batch_lazy_q25 sys): the "
                         "N/H sweep, staleness and ablation figures are made for each (files prefixed '<name>__' unless "
-                        "paper); the first one is 'CSA-SFL' in the main comparison. Default: the paper's algorithm")
+                        "paper); the first one is 'CSA-SFL' in the main comparison. Default 'auto': every variant that "
+                        "has N- or H-sweep runs in the folder (the paper's algorithm if none)")
     p.add_argument("--N", type=int, default=7, help="default N (fixed in the H sweep)")
     p.add_argument("--H", type=int, default=20, help="default H (fixed in the N sweep)")
     args = p.parse_args()
@@ -321,6 +336,8 @@ def main():
     out = args.out or os.path.join(args.results, "figures")
     os.makedirs(out, exist_ok=True)
     report = ""
+    args.csa_variant = resolve_variants(df, args)
+    print(f"[plots] CSA-SFL variant(s) of the sweep / ablation figures: {args.csa_variant}")
     csa_v, _ = sweep_definitions(args.csa_variant[0])
     csa_shown = "paper" if csa_v == "full" else csa_v
     # runs are selected by configuration (not by the experiment that trained them: a shared run,

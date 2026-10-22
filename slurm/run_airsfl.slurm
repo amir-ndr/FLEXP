@@ -18,6 +18,8 @@
 #              that hits GPU out-of-memory restarts on the loop engine by itself)
 #   PLOT_EXTRA any other plots.py flags, e.g. "--budget-mult 1 3 --sweep-curves epochs uplink",
 #              "--digital-q 16 32" (FP16 figures in figures/ + FP32 figures in figures_q32/)
+#   SKIP_PLOTS 1 = do not run plots.py at the end (e.g. a results folder holding only the INT8 / INT4
+#              baselines, which paper_figures.py --payload-results combines with the FP16 folder)
 # Digital payload: FP16 by default for digital SFL-V1 / hybrid / digital FedAvg (really rounded
 # uploads, q = 16); AirSFL and AirComp-FL do not depend on it and keep their runs. --digital-q 32
 # trains the FP32 versions (error-free reference, target rule, payload comparison of fig12).
@@ -38,6 +40,15 @@
 #   done
 #
 # FULL RUNS (5 seeds) -- after the quick test is checked; see README.
+#
+# LOW-PRECISION DIGITAL BASELINES (INT8 / INT4, own folder; AirSFL / AirComp-FL come from the FP16 folder):
+#   Q=examples/AirSFL/results_qbits; mkdir -p $Q/lr; cp examples/AirSFL/results_final_s1/lr/chosen_lr.json $Q/lr/
+#   for QB in 8 4; do C="EPOCHS=100,RESULTS=$Q,SKIP_PLOTS=1,EXTRA=--early-evals --evals-per-epoch 4 --dirichlet-alpha 0.1 --digital-q $QB"
+#     for P in iid dirichlet; do for M in digital_sflv1 sun_fdma_aircomp; do
+#       sbatch --export="ALL,EXP=main,PARTITION=$P,METHODS=$M,SEEDS=11 22 33 44 55,$C" slurm/run_airsfl.slurm; done; done
+#     for S in 11 22 33 44 55; do
+#       sbatch --export="ALL,EXP=snr,PARTITION=dirichlet,METHODS=sun_fdma_aircomp,SEEDS=$S,$C" slurm/run_airsfl.slurm; done
+#   done        (+ EXP=nsweep like main for fig5 / fig7; see README)
 #
 # EDIT the two sections marked below for your cluster before submitting:
 #   1. #SBATCH directives (partition / gres / account names differ per site)
@@ -132,6 +143,8 @@ PLOT_ARGS=()
 [[ -n "${PLOT_EXTRA:-}" ]] && PLOT_ARGS+=(${PLOT_EXTRA})
 echo "AirSFL: ${ARGS[*]}"
 python examples/AirSFL/run_airsfl.py "${ARGS[@]}"
-python examples/AirSFL/plots.py "${PLOT_ARGS[@]}"
+if [[ "${SKIP_PLOTS:-0}" != "1" ]]; then
+    python examples/AirSFL/plots.py "${PLOT_ARGS[@]}"
+fi
 
 echo "Job finished at $(date)"

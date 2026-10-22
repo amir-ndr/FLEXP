@@ -22,8 +22,8 @@ combining and before OFDMA bandwidth division: rho = Pmax*lambda_ref/(N0*W).
 
   DIGITAL OFDMA -- client n gets S_n = S/N disjoint tones and concentrates its
   power Pmax on them; maximum-ratio reception over the receiving server's array;
-  q bits per real value (radio.q_bits: 16 = FP16, the experiments' default; 32 = FP32)
-  (Eq. 11-12):
+  q bits per real value (radio.q_bits: 16 = FP16, the experiments' default; 32 = FP32;
+  2..8 = INT-q block quantization, the low-precision baselines) (Eq. 11-12):
         Rbar_n = eps_D * df * S_n * c_D,   c_D = E[log2(1 + rho * N * X)],
         X = sum_{a=1..Nr}|g_a|^2 ~ Gamma(Nr, 1),     D(D) = max_n q*D / Rbar_n.
   (per-tone SNR = Pmax*lambda*X/(S_n N0 df) = rho*(S/S_n)*X = rho*N*X). The
@@ -38,7 +38,8 @@ combining and before OFDMA bandwidth division: rho = Pmax*lambda_ref/(N0*W).
         Rbar_ZF = eps_D * df * S * c_ZF,   c_ZF = E[log2(1 + rho * Y)],   Z(D) = q*D / Rbar_ZF.
   At N = 1 it equals OFDMA (single-user MRC on all tones). Its gap to AirSFL is only the
   signalling cost q/c_ZF vs 1/2 tone-use per value (plus the smaller ZF array gain);
-  the OFDMA gap additionally contains the N-fold spatial reuse.
+  the OFDMA gap additionally contains the N-fold spatial reuse. Break-even payload (equal
+  airtime per value, breakeven_bits): q* = eps_D c_ZF / (2 eps_U) (= c_ZF / 2 at equal eps).
 
   UNEQUAL PATH GAINS (optional robustness setting): lambda_n = g_n lambda_ref, the same to
   both servers; rho is the median client's SNR (path_gain_offsets_db). Every digital
@@ -69,6 +70,14 @@ from typing import Optional
 import numpy as np
 
 Q_BITS = 32  # bits per FP32 real value (digital serialization)
+# digital payload precisions: 32 = FP32, 16 = FP16, 2..8 = INT-q (block-wise uniform quantization,
+# simulator._intq_transport); the per-block scale is side information covered by eps, as for FP16
+PAYLOAD_BITS = (32, 16, 8, 7, 6, 5, 4, 3, 2)
+
+
+def payload_name(q: int) -> str:
+    """Name of the q-bit digital payload format: FP32, FP16 or INTq."""
+    return f"FP{q}" if q in (16, 32) else f"INT{q}"
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +106,8 @@ class RadioConfig:
     q_bits: int = 32                   # bits per real value of every reliable DIGITAL payload (activations,
                                        # model differences): 32 = FP32, 16 = FP16 (the experiments' default,
                                        # run_airsfl.py --digital-q; the simulator then really rounds those
-                                       # tensors); labels and analog stages are unaffected
+                                       # tensors), 2..8 = INT-q (really quantized); labels and analog stages
+                                       # are unaffected
 
     def __post_init__(self):
         if self.Nr_F is None:
@@ -107,8 +117,8 @@ class RadioConfig:
             if len(self.gains_db) != self.N:
                 raise ValueError(f"{len(self.gains_db)} path gains for N={self.N} clients")
         self.q_bits = int(self.q_bits)
-        if self.q_bits not in (16, 32):
-            raise ValueError(f"q_bits must be 32 (FP32) or 16 (FP16), got {self.q_bits}")
+        if self.q_bits not in PAYLOAD_BITS:
+            raise ValueError(f"q_bits must be 32 (FP32), 16 (FP16) or 2..8 (INT-q), got {self.q_bits}")
 
     @property
     def g_lin(self) -> np.ndarray:
@@ -226,6 +236,15 @@ def digital_rates(radio: RadioConfig, seed: int = 2026) -> dict:
             "c_U": cU, "c_A": cA, "U_zf": zf(zU), "A_zf": zf(zA), "c_zf_U": zU, "c_zf_A": zA}
 
 
+def breakeven_bits(radio: RadioConfig, rates: Optional[dict] = None) -> float:
+    """Digital payload precision at which a multi-user ZF digital upload takes the same airtime per
+    real value as AirSFL's analog upload (ceil effects aside): q / (eps_D W c_ZF) = 1 / (2 eps_U W)
+    -> q* = eps_D c_ZF / (2 eps_U) (= c_ZF / 2 at equal efficiencies). Digital payloads with q > q*
+    are slower than the analog upload at this SNR, q < q* faster."""
+    rates = rates if rates is not None else digital_rates(radio)
+    return radio.eps_D * rates["c_zf_U"] / (2.0 * radio.eps_U)
+
+
 # ---------------------------------------------------------------------------
 # Per-tensor uplink times
 # ---------------------------------------------------------------------------
@@ -277,7 +296,7 @@ def uplink_time_breakdown(method: str, dims: dict, radio: RadioConfig, tau: int,
         raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
     d_c, d_s, d_a = int(dims["d_c"]), int(dims["d_s"]), int(dims["d_a"])
     rates = rates if rates is not None else digital_rates(radio)
-    q = radio.q_bits                                        # digital payload bits per value (32 or 16)
+    q = radio.q_bits                                        # digital payload bits per value (32, 16 or 2..8)
     AU = lambda D: analog_time_s(D, radio.eps_U, radio)
     AA = lambda D: analog_time_s(D, radio.eps_A, radio)
     DU = lambda D: digital_time_s(D, rates["U"], q)         # OFDMA (S/N tones per client, concurrent)
@@ -543,6 +562,60 @@ def verify_fp16(verbose: bool = True) -> bool:
     return ok
 
 
+def verify_intq(verbose: bool = True) -> bool:
+    """INT-q digital payloads (q = 8, 4; the low-precision baselines):
+      (1) every digital phase of every method is exactly q/32 of its FP32 value, labels and analog
+          phases unchanged (equal gains and a 20 dB spread);
+      (2) golden per-round uplink of the default environment (cut 2, tau 5, 20 dB): Hybrid ZF-AirComp
+          1.965 / 1.139 s, Digital SFL-V1 (ZF) 2.078 / 1.039 s at q = 8 / 4 (AirSFL 1.527 s);
+      (3) break-even payload q* = c_ZF / 2 (5.88 bits at 20 dB): a ZF digital upload of q* bits per
+          value takes the analog airtime of the same tensor (up to the OFDM-symbol ceiling)."""
+    ok = True
+    lines = []
+    dims = profiled_dims(16)[2]
+    for name, gains in (("equal gains", None), ("20 dB spread", path_gain_offsets_db(RadioConfig().N, 20.0, 11))):
+        r32 = RadioConfig(gains_db=gains)
+        rates = digital_rates(r32)
+        good = True
+        for q in (8, 4):
+            rq = RadioConfig(gains_db=gains, q_bits=q)
+            for m in METHODS:
+                b32 = uplink_time_breakdown(m, dims, r32, 5, rates)
+                bq = uplink_time_breakdown(m, dims, rq, 5, rates)
+                analog = m in ("airsfl", "aircomp_fl")
+                for ph in ("activation", "aggregation"):
+                    digital_phase = not analog and not (ph == "aggregation" and "aircomp" in m)
+                    want = b32[ph] * q / 32 if digital_phase else b32[ph]
+                    good &= abs(bq[ph] - want) <= 1e-12 * max(1.0, want)
+                good &= bq["labels"] == b32["labels"]
+        ok &= good
+        lines.append(f"  (1) {name}: digital phases x q/32 (q = 8, 4), labels and analog phases unchanged for all "
+                     f"{len(METHODS)} methods  {'OK' if good else 'BAD'}")
+    base = RadioConfig()
+    rates = digital_rates(base)
+    got = {f"{m}_q{q}": uplink_time_per_round(m, dims, RadioConfig(q_bits=q), 5, rates)
+           for m in ("hybrid_zf_aircomp", "digital_sflv1_zf") for q in (8, 4)}
+    golden = {"hybrid_zf_aircomp_q8": 1.965, "hybrid_zf_aircomp_q4": 1.139,
+              "digital_sflv1_zf_q8": 2.078, "digital_sflv1_zf_q4": 1.039}
+    good = all(abs(got[k] - v) / v < 0.005 for k, v in golden.items())
+    ok &= good
+    lines.append("  (2) default environment: " + ", ".join(f"{k} = {got[k]:.3f} [golden {v}]" for k, v in golden.items())
+                 + f"  {'OK' if good else 'BAD'}")
+    qs = breakeven_bits(base, rates)
+    d = dims["d_a"]
+    t_dig = digital_time_s(d, rates["U_zf"], qs)
+    t_ana = analog_time_s(d, base.eps_U, base)
+    good = abs(qs - rates["c_zf_U"] / 2) < 1e-12 and abs(qs - 5.88) < 0.01 and abs(t_dig / t_ana - 1) < 1e-3
+    ok &= good
+    lines.append(f"  (3) break-even q* = c_ZF/2 = {qs:.3f} bits at 20 dB: ZF digital {t_dig * 1e3:.3f} ms vs analog "
+                 f"{t_ana * 1e3:.3f} ms per activation upload  {'OK' if good else 'BAD'}")
+    if verbose:
+        print("=== INT-q digital payloads (timing) ===")
+        print("\n".join(lines))
+        print(f"  INTQ_TIMING: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def environment_summary(radio: Optional[RadioConfig] = None, stage: int = 2, tau: int = 5) -> None:
     """Print the per-round uplink budget of the default environment."""
     radio = radio or RadioConfig()
@@ -574,5 +647,7 @@ if __name__ == "__main__":
     verify_path_gains()
     print()
     verify_fp16()
+    print()
+    verify_intq()
     print()
     environment_summary()

@@ -23,9 +23,18 @@ that reached the target / seeds; "seeds" = seeds per point (20 dB uses --main-se
 finalz/provenance.csv lists, for every point of every figure and every method, the digital payload,
 the seeds and the run files it is computed from.
 
+Low-precision digital baselines (--payload-results <folder of the INT8 / INT4 runs of run_airsfl.py
+--digital-q 8 / 4>): the same figures with the INT-q versions of the ZF baselines added (VARIANTS
+below), the payload figure fig8 (AirSFL vs Hybrid-Z / SFL-Z at FP16 / INT8 / INT4) and the payload
+table (table_payload.csv with every method x payload x SNR / N, table_payload.tex / .md compact) go to
+<results>/finalz_payload/; finalz/ is not touched. Targets are those of finalz (from the six FP16
+methods), so every FP16 number is the same in both folders.
+
 Usage (from the repo root):
   python examples/AirSFL/paper_figures.py --results examples/AirSFL/results_final_s1 --main-seeds 11
   python examples/AirSFL/paper_figures.py --results examples/AirSFL/results_final_s1 --plot-only
+  python examples/AirSFL/paper_figures.py --results examples/AirSFL/results_final_s1 \\
+      --payload-results examples/AirSFL/results_qbits            (+ --plot-only to redraw)
 """
 
 import argparse
@@ -87,7 +96,7 @@ FORMAT = dict(
     no_title_figs=("fig1_noniid_final_accuracy_vs_snr", "fig2_noniid_accuracy_vs_uplink_time_20dB",
                    "fig3_noniid_uplink_time_to_target_vs_snr", "fig4_noniid_accuracy_within_uplink_budget",
                    "fig4_noniid_accuracy_within_uplink_budget_2000", "fig5_noniid_uplink_time_to_target_vs_N", "fig6_iid_accuracy_vs_uplink_time_20dB",
-                   "fig7_iid_uplink_time_to_target_vs_N"),
+                   "fig7_iid_uplink_time_to_target_vs_N", "fig8_noniid_payload_uplink_time_to_target_vs_snr"),
     # fig1: a ZF variant has exactly the accuracy of its OFDMA twin. "merge" draws each pair once under a joint
     # label (SFL-O / SFL-Z); "overlay" draws both (Z dash-dot with its own marker on top of O)
     fig1_twins="merge",
@@ -117,6 +126,90 @@ COLUMN = {"airsfl": "AirSFL", "aircomp_fl": "AirComp-FL", "hybrid_zf_aircomp": "
           "sun_fdma_aircomp": "Hybrid-O", "digital_sflv1_zf": "SFL-Z", "digital_sflv1": "SFL-O"}
 TRAINED = list(METHODS)
 
+# ---------------------------------------------------------------------------------------------------
+# LOW-PRECISION DIGITAL BASELINES (only with --payload-results; output -> <results>/finalz_payload/)
+# ---------------------------------------------------------------------------------------------------
+# key "<method>@int<q>" = that method trained with a q-bit INT payload (run_airsfl.py --digital-q q); hollow
+# markers, hatched bars. Add e.g. "sun_fdma_aircomp@int8" (style it) to draw an OFDMA variant too.
+VARIANTS = {
+    "hybrid_zf_aircomp@int8": dict(label="Hybrid-Z (INT8)", color="#ff7f0e", marker="X", ls="--", lw=1.6,
+                                   mfc="white", hatch="///"),
+    "hybrid_zf_aircomp@int4": dict(label="Hybrid-Z (INT4)", color="#e377c2", marker="X", ls=":", lw=2.0,
+                                   mfc="white", hatch="..."),
+    "digital_sflv1_zf@int8":  dict(label="SFL-Z (INT8)", color="#bcbd22", marker="P", ls="--", lw=1.6,
+                                   mfc="white", hatch="///"),
+    "digital_sflv1_zf@int4":  dict(label="SFL-Z (INT4)", color="#7f7f7f", marker="P", ls=":", lw=2.0,
+                                   mfc="white", hatch="..."),
+}
+PAYLOAD = dict(
+    bits=(8, 4),                                        # INT-q payloads read from --payload-results
+    # payload figure (fig8): AirSFL against the ZF baselines at every payload, uplink time to fig3's target vs SNR
+    fig8_methods=("airsfl", "hybrid_zf_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4",
+                  "digital_sflv1_zf", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+    # table_payload.tex / .md (compact; table_payload.csv has everything): rows (method, q), SNR columns
+    table_rows=(("airsfl", None), ("hybrid_zf_aircomp", 16), ("hybrid_zf_aircomp", 8), ("hybrid_zf_aircomp", 4),
+                ("digital_sflv1_zf", 16), ("digital_sflv1_zf", 8), ("digital_sflv1_zf", 4)),
+    table_snrs=(20.0, 10.0, 0.0, -20.0),
+    # finalz_payload labels: the FP16 baselines say "(FP16)"; fig1 draws each O/Z pair once ("Hybrid-O/Z ...")
+    labels={"airsfl": "AirSFL", "hybrid_zf_aircomp": "Hybrid-Z (FP16)", "sun_fdma_aircomp": "Hybrid-O (FP16)",
+            "digital_sflv1_zf": "SFL-Z (FP16)", "digital_sflv1": "SFL-O (FP16)"},
+    joint={"sun_fdma_aircomp": "Hybrid-O/Z (FP16)", "digital_sflv1": "SFL-O/Z (FP16)",
+           "hybrid_zf_aircomp@int8": "Hybrid-O/Z (INT8)", "hybrid_zf_aircomp@int4": "Hybrid-O/Z (INT4)",
+           "digital_sflv1_zf@int8": "SFL-O/Z (INT8)", "digital_sflv1_zf@int4": "SFL-O/Z (INT4)"},
+    # legends of finalz_payload (more entries than finalz): overrides of FORMAT["inside_legend"] / legend_figure.
+    # "rows": the legend as a grid, one method family per row, one payload per column (None = empty cell)
+    # (footroom: extra room below the data, as a fraction of the y span; cs / hl: column spacing / handle length)
+    inside_legend={
+        "fig1_noniid_final_accuracy_vs_snr": dict(loc="lower right", font=8.5, footroom=0.45, rows=(
+            ("airsfl", "aircomp_fl", None),
+            ("digital_sflv1", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+            ("sun_fdma_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"))),
+        "fig3_noniid_uplink_time_to_target_vs_snr": dict(loc="upper center", headroom=60.0, font=7.5, cs=0.8, hl=1.8,
+                                                         rows=(
+            ("airsfl", "aircomp_fl", None, None),
+            ("digital_sflv1", "digital_sflv1_zf", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+            ("sun_fdma_aircomp", "hybrid_zf_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"))),
+        "fig4_noniid_accuracy_within_uplink_budget": dict(loc="lower right", ncol=2, bbox=(0.99, 0.10), font=8.5),
+        "fig4_noniid_accuracy_within_uplink_budget_2000": dict(loc="lower right", ncol=2, bbox=(0.99, 0.10), font=8.5),
+        "fig5_noniid_uplink_time_to_target_vs_N": dict(loc="upper center", headroom=40.0, font=7.5, cs=0.8, hl=1.8,
+                                                       rows=(
+            ("airsfl", "aircomp_fl", None, None),
+            ("digital_sflv1", "digital_sflv1_zf", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+            ("sun_fdma_aircomp", "hybrid_zf_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"))),
+        "fig7_iid_uplink_time_to_target_vs_N": dict(loc="upper center", headroom=40.0, font=7.5, cs=0.8, hl=1.8,
+                                                    rows=(
+            ("airsfl", "aircomp_fl", None, None),
+            ("digital_sflv1", "digital_sflv1_zf", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+            ("sun_fdma_aircomp", "hybrid_zf_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"))),
+        "fig8_noniid_payload_uplink_time_to_target_vs_snr": dict(loc="upper center", headroom=25.0, font=9.5, rows=(
+            ("airsfl", None, None),
+            ("digital_sflv1_zf", "digital_sflv1_zf@int8", "digital_sflv1_zf@int4"),
+            ("hybrid_zf_aircomp", "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"))),
+    },
+    legend_figure=dict(cols=5, font=9, width=7.0,
+                       order=("airsfl", "digital_sflv1", "digital_sflv1_zf", "digital_sflv1_zf@int8",
+                              "digital_sflv1_zf@int4", "aircomp_fl", "sun_fdma_aircomp", "hybrid_zf_aircomp",
+                              "hybrid_zf_aircomp@int8", "hybrid_zf_aircomp@int4"),
+                       rows=(("airsfl", "digital_sflv1", "digital_sflv1_zf", "digital_sflv1_zf@int8",
+                              "digital_sflv1_zf@int4"),
+                             ("aircomp_fl", "sun_fdma_aircomp", "hybrid_zf_aircomp", "hybrid_zf_aircomp@int8",
+                              "hybrid_zf_aircomp@int4"))),
+)
+PAYLOAD_FIGS = {   # extra figures of finalz_payload (same specs as FIGS)
+    "fig8_noniid_payload_uplink_time_to_target_vs_snr": ("dirichlet", "uplink_time_to_target_vs_snr",
+                                                         {"methods": PAYLOAD["fig8_methods"]}),
+}
+DRAWN = TRAINED + list(VARIANTS)                         # drawing order (variants exist only in finalz_payload)
+COLUMN.update({m: st["label"] for m, st in VARIANTS.items()})
+
+
+def _variant(m):
+    """'<method>@int<q>' -> (method, q); a plain method -> (method, None)."""
+    if "@int" not in m:
+        return m, None
+    base, q = m.split("@int")
+    return base, int(q)
+
 FIGS = {   # file name -> (partition, kind[, options])
     "fig1_noniid_final_accuracy_vs_snr": ("dirichlet", "final_acc_vs_snr"),
     "fig2_noniid_accuracy_vs_uplink_time_20dB": ("dirichlet", "curves_20dB"),
@@ -139,9 +232,10 @@ def _seeds_txt(ns):
     return "" if not ns else (str(min(ns)) if min(ns) == max(ns) else f"{min(ns)}-{max(ns)}")
 
 
-def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
+def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_results=None, payload_bits=PAYLOAD["bits"]):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import plots as P
+    from flsim.airsfl.timing import breakeven_bits, payload_name
     P.MAIN_SEEDS["seeds"] = set(main_seeds) if main_seeds else None
     d, _ = P.load_results(results)
     x = P._select_payload(d, 16)                       # FP16 digital payload
@@ -149,27 +243,70 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
     P.TARGET_SRC["df"] = x["main"]                     # 95% target: every seed of FP16 digital SFL-V1
     main, snr, nsweep = x["main"], x["snr"], x["nsweep"]
     P._report_unpaired({**x, "main": P._main20(main)})
+    xq = {}                                            # INT-q sets (finalz_payload): {q: {experiment: runs}}
+    if payload_results:
+        dq, _ = P.load_results(payload_results)
+        for q in payload_bits:
+            xq[q] = P._select_payload(dq, q)
+            n = {e: int(df[df.method.isin(P.FP16_PARENTS)].run_id.nunique()) for e, df in xq[q].items()
+                 if not df.empty and e in ("main", "snr", "nsweep")}
+            print(f"[data] {payload_name(q)} runs in {payload_results}: {n or 'none'}")
+            if n:
+                P._report_unpaired({**xq[q], "main": P._main20(xq[q]["main"])})
+    drawn = DRAWN if payload_results else TRAINED
     rhos = sorted(set([20.0] + [float(r) for r in snr.rho_db.unique()]))
     os.makedirs(out, exist_ok=True)
     prov = []
+    targets = {}                                       # figure -> its target (payload table)
 
     def note(fig, point, m, r):
         """Record which payload, seeds and run files a plotted point of method m comes from."""
+        base, qv = _variant(m)
         q = sorted(set(P._q_col(r)))
+        files = sorted(set(r.source_file))
+        if qv is not None:                             # INT-q runs: path relative to the repo's AirSFL folder
+            files = [os.path.join(os.path.basename(os.path.normpath(payload_results)), f) for f in files]
         prov.append({"figure": fig, "point": point, "method": COLUMN[m],
-                     "digital payload": "/".join(f"FP{v}" for v in q) if m in P.PAYLOAD_METHODS else
-                     ("none (analog; labels only)" if m == "airsfl" else "none (analog)"),
+                     "digital payload": "/".join(payload_name(v) for v in q) if base in P.PAYLOAD_METHODS else
+                     ("none (analog; labels only)" if base == "airsfl" else "none (analog)"),
                      "seeds": ",".join(str(v) for v in sorted(set(r.seed.astype(int)))),
-                     "run files": "; ".join(sorted(set(r.source_file)))})
+                     "run files": "; ".join(files)})
+
+    def runs_q(scheme, m, q, rho):
+        """Runs of method m at SNR rho with a q-bit digital payload (None / 16: the FP16 set)."""
+        if q in (None, 16):
+            return P._snr_runs(main, snr, scheme, m, rho)
+        s = xq.get(q, {})
+        mn, sn = s.get("main", pd.DataFrame()), s.get("snr", pd.DataFrame())
+        if mn.empty:                                   # no 20 dB runs (yet): the hybrid's SNR-sweep runs only
+            if rho == 20.0 or m in P.DIGITAL or sn.empty:
+                return pd.DataFrame()
+            return sn[(sn.partition == scheme) & (sn.method == m) & (sn.rho_db == rho)]
+        return P._snr_runs(mn, sn, scheme, m, rho)
 
     def runs(scheme, m, rho):
-        return P._snr_runs(main, snr, scheme, m, rho)
+        return runs_q(scheme, *_variant(m), rho)
+
+    def frame(mn, ns, scheme):
+        """20 dB runs of the N sweep (N = 30 from main) of one partition."""
+        a = pd.concat([f for f in (mn, ns) if not f.empty], ignore_index=True)
+        if a.empty:
+            return a
+        return a[(a.rho_db == 20.0) & (a.tau == P.TAU0) & a.cut.isin([P.CUT0, 0]) & (a.partition == scheme)]
+
+    def runs_N(scheme, m, N, every_seed=False):
+        """Runs of method m (or '<method>@int<q>') at N clients, 20 dB (--main-seeds at N = 30 unless every_seed)."""
+        base, q = _variant(m)
+        s = x if q is None else xq.get(q, {})
+        mn = s.get("main", pd.DataFrame())
+        f = frame(mn if every_seed else P._main20(mn), s.get("nsweep", pd.DataFrame()), scheme)
+        return f if f.empty else f[(f.N == N) & (f.method == base)]
 
     def final_acc_vs_snr(fig, scheme):
         rows = []
         for rho in rhos:
             row, ns = {"SNR (dB)": rho}, []
-            for m in TRAINED:
+            for m in drawn:
                 r = runs(scheme, m, rho)
                 if not r.empty:
                     row[COLUMN[m]] = P.final_acc(r)[0]
@@ -199,7 +336,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
         rows = []
         for rho in rhos:
             row, ns = {"SNR (dB)": rho, "target val acc (%)": 100 * A}, []
-            for m in TRAINED:
+            for m in drawn:
                 r = runs(scheme, m, rho)
                 if r.empty:
                     continue
@@ -223,7 +360,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
         rows = []
         for rho in rhos:
             row, ns, hollow = {"SNR (dB)": rho, "budget (uplink s)": T, "budget": source}, [], []
-            for m in TRAINED:
+            for m in drawn:
                 r = runs(scheme, m, rho)
                 if r.empty:
                     continue
@@ -239,10 +376,8 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
         return pd.DataFrame(rows)
 
     def time_to_target_vs_N(fig, scheme, xcol="uplink_s", target="rule"):
-        def frame(mn):
-            a = pd.concat([f for f in (mn, nsweep) if not f.empty], ignore_index=True)
-            return a[(a.rho_db == 20.0) & (a.tau == P.TAU0) & a.cut.isin([P.CUT0, 0]) & (a.partition == scheme)]
-        sub, sub_t = frame(P._main20(main)), frame(main)   # bars: --main-seeds at N = 30; target: every seed
+        # bars: --main-seeds at N = 30; target: every seed (and the six FP16 methods only, as in finalz)
+        sub, sub_t = frame(P._main20(main), nsweep, scheme), frame(main, nsweep, scheme)
         Ns = sorted({int(n) for n in sub.N})
         if target == "common":                              # highest accuracy every drawn run reaches
             A = math.floor(100 * min(float(g[g["round"] >= 1].val_acc.max()) for N in Ns for m in TRAINED
@@ -255,8 +390,8 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
         rows = []
         for N in Ns:
             row, ns = {"N": N, "target val acc (%)": 100 * A}, []
-            for m in TRAINED:
-                dm = sub[(sub.N == N) & (sub.method == m)]
+            for m in drawn:
+                dm = runs_N(scheme, m, N)
                 if dm.empty:
                     continue
                 note(fig, f"N={N}", m, dm)
@@ -272,7 +407,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
         A = P.primary_target(main, scheme)
         curves, summary = [], []
         air_t = None
-        for m in TRAINED:
+        for m in drawn:
             r = runs(scheme, m, 20.0)
             if r.empty:
                 continue
@@ -293,12 +428,65 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
             summary["UL time to target / AirSFL"] = summary["UL time to target (s)"] / air_t
         return pd.concat(curves, ignore_index=True), summary
 
-    for name, spec in FIGS.items():
+    def payload_table():
+        """table_payload.csv: AirSFL, AirComp-FL and the ZF / OFDMA baselines at FP16 and every INT-q payload, at
+        the targets of the figures -- non-IID SNR sweep (fig3), 20 dB non-IID / IID (fig2 / fig6), N sweep
+        (fig5 / fig7): seeds, final test accuracy, uplink s/round (and / AirSFL's), uplink time to target (mean
+        over the seeds that reached it; / AirSFL's), seeds reached, rounds to target, activation and aggregate
+        error-to-signal ratios (AirSFL: ZF / AirComp error; digital: payload rounding) and, per SNR, the
+        break-even payload q* = c_ZF / 2 (the digital ZF payload with AirSFL's airtime per value)."""
+        meths = [("airsfl", None), ("aircomp_fl", None)] + [
+            (m, q) for m in ("hybrid_zf_aircomp", "sun_fdma_aircomp", "digital_sflv1_zf", "digital_sflv1")
+            for q in [16] + list(xq)]
+        rows = []
+
+        def add(section, scheme, point, A, get):
+            first = len(rows)
+            for m, q in meths:
+                r = get(m, q)
+                if r.empty:
+                    continue
+                s = P.ttt(r, A, "uplink_s")
+                ev = r[r["round"] >= 1]
+                db = lambda c: float(ev[c].mean()) if c in ev and ev[c].notna().any() else np.nan
+                rows.append({"section": section, "partition": scheme, **point, "method": COLUMN[m],
+                             "payload": "analog" if q is None else payload_name(q), "seeds": P._nseeds(r),
+                             "final test acc (%)": P.final_acc(r)[0], "UL s/round": float(r.ul_s_per_round.iloc[0]),
+                             "target val acc (%)": 100 * A, "UL time to target (s)": s["t"],
+                             "reached": f"{s['hit']}/{s['n']}", "rounds to target": s["k"],
+                             "activation NSR (dB)": db("act_nsr_db"), "aggregation NSR (dB)": db("agg_nsr_db")})
+            air = [w for w in rows[first:] if w["method"] == COLUMN["airsfl"]]
+            for w in rows[first:]:
+                w["UL s/round / AirSFL"] = w["UL s/round"] / air[0]["UL s/round"] if air else np.nan
+                w["UL time to target / AirSFL"] = w["UL time to target (s)"] / air[0]["UL time to target (s)"] \
+                    if air else np.nan
+
+        A3 = targets["fig3_noniid_uplink_time_to_target_vs_snr"]
+        for rho in rhos:
+            radio = P._radio(rho_db=rho)
+            add("snr", "dirichlet", {"SNR (dB)": rho, "N": 30, "q* = c_ZF/2 (bits)": breakeven_bits(radio, P._rates(radio))},
+                A3, lambda m, q: runs_q("dirichlet", m, q, rho))
+        for scheme, fig in (("dirichlet", "fig2_noniid_accuracy_vs_uplink_time_20dB"),
+                            ("iid", "fig6_iid_accuracy_vs_uplink_time_20dB")):
+            add("20dB", scheme, {"SNR (dB)": 20.0, "N": 30}, targets[fig], lambda m, q: runs_q(scheme, m, q, 20.0))
+        for scheme, fig in (("dirichlet", "fig5_noniid_uplink_time_to_target_vs_N"),
+                            ("iid", "fig7_iid_uplink_time_to_target_vs_N")):
+            for N in sorted({int(n) for n in frame(main, nsweep, scheme).N}):
+                add("N", scheme, {"SNR (dB)": 20.0, "N": N}, targets[fig],
+                    lambda m, q: runs_N(scheme, m if q in (None, 16) else f"{m}@int{q}", N))
+        t = pd.DataFrame(rows)
+        t.to_csv(os.path.join(out, "table_payload.csv"), index=False, float_format="%.6g")
+        _payload_tex(t, out)
+        print(f"[data] table_payload.csv ({len(t)} rows), table_payload.tex / .md")
+
+    figs = {**FIGS, **(PAYLOAD_FIGS if payload_results else {})}
+    for name, spec in figs.items():
         scheme, kind = spec[:2]
         opts = spec[2] if len(spec) > 2 else {}
         if kind == "curves_20dB":
             data, summary = curves_20dB(name, scheme)
             summary.to_csv(os.path.join(out, f"{name}_summary.csv"), index=False, float_format="%.6g")
+            targets[name] = float(summary["target val acc (%)"].iloc[0]) / 100
         else:
             data = {"final_acc_vs_snr": final_acc_vs_snr,
                     "uplink_time_to_target_vs_snr": lambda f, sc: time_to_target_vs_snr(f, sc, "uplink_s", fig3_target),
@@ -306,14 +494,74 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
                     "budget_vs_snr": lambda f, sc: budget_vs_snr(f, sc, budget_s=opts.get("budget_s")),
                     "time_to_target_vs_N": lambda f, sc: time_to_target_vs_N(f, sc, target=opts.get("target", "rule"))
                     }[kind](name, scheme)
+            if "target val acc (%)" in data:
+                targets[name] = float(data["target val acc (%)"].iloc[0]) / 100
         data.to_csv(os.path.join(out, f"{name}.csv"), index=False, float_format="%.6g")
         tg = f" (target {data['target val acc (%)'].iloc[0]:g}%)" if "target val acc (%)" in data else ""
         print(f"[data] {name}.csv{tg}")
+    if payload_results:
+        payload_table()
     prov = pd.DataFrame(prov)
     prov.to_csv(os.path.join(out, "provenance.csv"), index=False)
-    pay = prov[prov["digital payload"].str.startswith("FP")]["digital payload"].unique()
+    pay = prov[prov["digital payload"].str.match(r"(FP|INT)\d")]["digital payload"].unique()
     print(f"[data] provenance.csv: digital payloads used {sorted(pay)}; seeds per point "
           f"{prov.groupby('seeds').size().to_dict()}")
+
+
+def _payload_tex(t, out):
+    """Compact payload table (PAYLOAD["table_rows"] x PAYLOAD["table_snrs"]) as LaTeX (booktabs) and Markdown:
+    uplink s/round and final test accuracy at 20 dB, then the uplink time to fig3's target per SNR -- AirSFL in
+    seconds, every other row relative to AirSFL ("k/n" = seeds that reached it when not all; "--" = none)."""
+    snr = t[t.section == "snr"]
+    if snr.empty:
+        return
+    A = float(snr["target val acc (%)"].iloc[0])
+    cols = [c for c in PAYLOAD["table_snrs"] if np.isclose(snr["SNR (dB)"], c).any()]
+    name = {v: k for k, v in COLUMN.items()}
+
+    def cell(m, pl, c, tex):
+        w = snr[(snr.method == COLUMN[m]) & (snr.payload == pl) & np.isclose(snr["SNR (dB)"], c)]
+        if w.empty:
+            return "n/a"
+        w = w.iloc[0]
+        hit, n = (int(v) for v in w["reached"].split("/"))
+        if hit == 0:
+            return "--"
+        v = f"{w['UL time to target (s)']:,.0f} s" if m == "airsfl" else \
+            (f"${w['UL time to target / AirSFL']:.2f}\\times$" if tex else f"{w['UL time to target / AirSFL']:.2f}x")
+        return v + (f" ({hit}/{n})" if hit < n else "")
+
+    head = ["Scheme", "Payload", "s/round", r"Acc. (\%)"] + [f"${c:g}$ dB" for c in cols]
+    body, md = [], []
+    prev = None
+    for m, q in PAYLOAD["table_rows"]:
+        pl = "analog" if q is None else ("FP16" if q == 16 else f"INT{q}")
+        w20 = snr[(snr.method == COLUMN[m]) & (snr.payload == pl) & np.isclose(snr["SNR (dB)"], 20.0)]
+        if w20.empty and not any(cell(m, pl, c, True) != "n/a" for c in cols):
+            continue
+        lab = METHODS[m]["label"].replace(" (proposed)", "") if m in METHODS else name.get(m, m)
+        cells = [f"{w20['UL s/round'].iloc[0]:.2f}" if not w20.empty else "n/a",
+                 f"{w20['final test acc (%)'].iloc[0]:.1f}" if not w20.empty else "n/a"]
+        body.append(" & ".join([lab if lab != prev else "", pl] + cells + [cell(m, pl, c, True) for c in cols]) + r" \\")
+        md.append("| " + " | ".join([lab, pl] + cells + [cell(m, pl, c, False) for c in cols]) + " |")
+        prev = lab
+    qs = [f"{snr[np.isclose(snr['SNR (dB)'], c)]['q* = c_ZF/2 (bits)'].iloc[0]:.1f}" for c in cols]
+    body += [r"\midrule", " & ".join([r"$q^\star = c_{\mathrm{ZF}}/2$ (bits)", "", "", ""] + qs) + r" \\"]
+    md.append("| " + " | ".join(["q* = c_ZF/2 (bits)", "", "", ""] + qs) + " |")
+    tex = [r"\begin{table}[t]", r"\centering", r"\footnotesize", r"\setlength{\tabcolsep}{3pt}",
+           r"\caption{Uplink communication time to " + f"{A:g}" + r"\% validation accuracy (non-IID, $N=30$): AirSFL in "
+           r"seconds, the baselines relative to AirSFL; uplink time per round and final test accuracy at 20~dB. "
+           r"$q^\star$: digital ZF payload with AirSFL's airtime per value.}",
+           r"\label{tab:payload}", r"\begin{tabular}{ll" + "c" * (len(head) - 2) + "}", r"\toprule",
+           " & ".join(head) + r" \\", r"\midrule"] + body + [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    with open(os.path.join(out, "table_payload.tex"), "w") as f:
+        f.write("\n".join(tex) + "\n")
+    with open(os.path.join(out, "table_payload.md"), "w") as f:
+        f.write(f"Uplink time to {A:g}% validation accuracy (non-IID, N = 30): AirSFL in seconds, others x AirSFL; "
+                f"s/round and final test accuracy at 20 dB\n\n")
+        f.write("| " + " | ".join(h.replace("$", "").replace("\\%", "%") for h in head) + " |\n|" + "---|" * len(head)
+                + "\n")
+        f.write("\n".join(md) + "\n")
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -321,7 +569,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET):
 # ---------------------------------------------------------------------------------------------------
 
 def _style(m):
-    return METHODS[m]
+    return METHODS[m] if m in METHODS else VARIANTS[m]
 
 
 def _legend(ax, fig):
@@ -358,15 +606,35 @@ def _inside_legend(ax, spec):
     if spec.get("headroom"):                           # make room above the data
         lo, hi = ax.get_ylim()
         ax.set_ylim(lo, hi * spec["headroom"] if ax.get_yscale() == "log" else lo + (hi - lo) * spec["headroom"])
+    if spec.get("footroom"):                           # make room below the data (linear axes)
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo - (hi - lo) * spec["footroom"], hi)
     lf = FORMAT["legend_figure"]
-    key = {METHODS[m]["label"]: m for m in METHODS}
+    key = {_style(m)["label"]: m for m in DRAWN}
     key.update({v: m for m, v in JOINT.items()})
     rank = {m: i for i, m in enumerate(lf["order"])}
     h, lab = ax.get_legend_handles_labels()
-    pairs = sorted(zip(h, lab), key=lambda p: rank.get(key.get(p[1]), len(rank)))
-    ax.legend([p[0] for p in pairs], [lf.get("labels", {}).get(key.get(p[1]), p[1]) for p in pairs],
-              loc=spec.get("loc", "best"), ncol=spec.get("ncol", 1), bbox_to_anchor=spec.get("bbox"),
-              fontsize=FORMAT["inside_legend_font"], frameon=FORMAT["inside_legend_frame"], framealpha=0.9)
+    # joint labels (fig1: one line per O/Z pair) stay as drawn; the others take the legend figure's labels
+    text = lambda l: l if l in JOINT.values() else lf.get("labels", {}).get(key.get(l), l)
+    if spec.get("rows"):                               # grid: one family per row, one payload per column
+        h, lab = _grid({key.get(l): (hh, text(l)) for hh, l in zip(h, lab)}, spec["rows"])
+        ncol = max(len(r) for r in spec["rows"])
+    else:
+        pairs = sorted(zip(h, lab), key=lambda p: rank.get(key.get(p[1]), len(rank)))
+        h, lab, ncol = [p[0] for p in pairs], [text(p[1]) for p in pairs], spec.get("ncol", 1)
+    ax.legend(h, lab, loc=spec.get("loc", "best"), ncol=ncol, bbox_to_anchor=spec.get("bbox"),
+              fontsize=spec.get("font", FORMAT["inside_legend_font"]), frameon=FORMAT["inside_legend_frame"],
+              framealpha=0.9, **({"columnspacing": spec.get("cs", 1.0), "handlelength": spec.get("hl", 2.2)}
+                                 if spec.get("rows") else {}))
+
+
+def _grid(entries, rows):
+    """Handles and labels in matplotlib's column-major legend order so that the legend reads as `rows`
+    (method keys; None or a method not drawn = empty cell). entries: method -> (handle, label)."""
+    blank = plt.Line2D([], [], alpha=0)
+    ncol = max(len(r) for r in rows)
+    cells = [entries.get(r[c]) if c < len(r) and r[c] is not None else None for c in range(ncol) for r in rows]
+    return [e[0] if e else blank for e in cells], [e[1] if e else "" for e in cells]
 
 
 def _not_reached(ax, x, color):
@@ -380,30 +648,30 @@ def _part(name):
 def plot_final_acc_vs_snr(df, out, name):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
     overlay = FORMAT["fig1_twins"] == "overlay"
-    order = [m for m in TRAINED if m not in TWINS] + ([m for m in TRAINED if m in TWINS] if overlay else [])
+    order = [m for m in DRAWN if m not in TWINS] + ([m for m in DRAWN if m in TWINS] if overlay else [])
     for m in order:                                    # OFDMA first, ZF twins (identical values) on top
         if COLUMN[m] not in df:
             continue
         st = _style(m)
         ax.plot(df["SNR (dB)"], df[COLUMN[m]], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"] - (1 if m in TWINS else 0),
+                ms=FORMAT["marker_size"] - (1 if m in TWINS else 0), mfc=st.get("mfc"),
                 label=st["label"] if overlay else JOINT.get(m, st["label"]))
     ax.set_xlabel(FORMAT["snr_label"])
     ax.set_ylabel("Final test accuracy (%)")
     _finish(fig, ax, out, name, f"{_part(name)}: final accuracy vs SNR")
 
 
-def plot_time_to_target_vs_snr(df, out, name, axis="Training"):
+def plot_time_to_target_vs_snr(df, out, name, axis="Training", methods=None):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
     unreached = False
-    for m in TRAINED:
+    for m in methods or DRAWN:
         c = COLUMN[m]
         if c not in df:
             continue
         st = _style(m)
         ok = df[df[c].notna()]
         ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"], label=st["label"])
+                ms=FORMAT["marker_size"], mfc=st.get("mfc"), label=st["label"])
         for _, r in df.iterrows():
             if not isinstance(r.get(f"{c} [reached]"), str):
                 continue                               # no run of this method at this SNR
@@ -426,15 +694,15 @@ def plot_time_to_target_vs_snr(df, out, name, axis="Training"):
 
 def plot_budget_vs_snr(df, out, name):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
-    for m in TRAINED:
+    for m in DRAWN:
         c = COLUMN[m]
         if c not in df:
             continue
         st = _style(m)
-        hollow = df["no evaluated checkpoint in budget"].fillna("").str.contains(c, regex=False)
+        hollow = df["no evaluated checkpoint in budget"].fillna("").str.split("; ").apply(lambda v: c in v)
         ok = df[~hollow]
         ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"], label=st["label"])
+                ms=FORMAT["marker_size"], mfc=st.get("mfc"), label=st["label"])
         if hollow.any():                               # initial model only (nothing evaluated inside the budget)
             ax.plot(df["SNR (dB)"][hollow], df[c][hollow], marker=st["marker"], mfc="white", mec=st["color"],
                     ms=FORMAT["marker_size"] + 2, ls="")
@@ -447,14 +715,14 @@ def plot_budget_vs_snr(df, out, name):
 
 def plot_time_to_target_vs_N(df, out, name):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
-    ms = [m for m in TRAINED if COLUMN[m] in df]
+    ms = [m for m in DRAWN if COLUMN[m] in df]
     x = np.arange(len(df))
     w = 0.84 / len(ms)
     unreached = False
     for j, m in enumerate(ms):
         st, c = _style(m), COLUMN[m]
         xs = x + (j - (len(ms) - 1) / 2) * w
-        ax.bar(xs, df[c], width=w, color=st["color"], edgecolor="k", lw=0.4, label=st["label"])
+        ax.bar(xs, df[c], width=w, color=st["color"], edgecolor="k", lw=0.4, hatch=st.get("hatch"), label=st["label"])
         for xi, v in zip(xs, df[c]):
             if np.isnan(v):
                 ax.text(xi, 0.02, "×", ha="center", color=st["color"], fontsize=10, transform=ax.get_xaxis_transform())
@@ -472,13 +740,14 @@ def plot_curves(df, out, name):
     fig, ax = plt.subplots(figsize=FORMAT["figsize"])
     ends = df[df.method.isin([COLUMN["aircomp_fl"], COLUMN["airsfl"]])].groupby("method")["uplink time (s)"].max()
     xmax = 1.05 * float(ends.max()) if len(ends) else None    # AirComp-FL's full run (the fastest baseline)
-    for m in METHODS:
+    for m in DRAWN:
         c = df[df.method == COLUMN[m]].sort_values("round")
         if c.empty:
             continue
         st = _style(m)
         ax.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=st["lw"], marker=st["marker"],
-                markevery=max(1, len(c) // FORMAT["curve_markers"]), ms=FORMAT["marker_size"] - 1, label=st["label"])
+                markevery=max(1, len(c) // FORMAT["curve_markers"]), ms=FORMAT["marker_size"] - 1, mfc=st.get("mfc"),
+                label=st["label"])
         if FORMAT["extend_curves"] and xmax and float(c["uplink time (s)"].iloc[-1]) < xmax:
             ax.plot([float(c["uplink time (s)"].iloc[-1]), xmax], [float(c["test acc (%)"].iloc[-1])] * 2,
                     color=st["color"], ls=":", lw=1.0, alpha=0.7)
@@ -512,20 +781,26 @@ def _inset_full_runs(ax, df, bounds):
         ins.set_title(FORMAT["inset_title"], fontsize=FORMAT["inset_font"], pad=2)
 
 
-def plot_all(out):
+def plot_all(out, payload=False):
     plt.rcParams.update({"font.size": FORMAT["font"]})
+    if payload:                                        # finalz_payload: more legend entries, "(FP16)" labels
+        FORMAT["inside_legend"] = {**FORMAT["inside_legend"], **PAYLOAD["inside_legend"]}
+        FORMAT["legend_figure"] = {**PAYLOAD["legend_figure"], "labels": PAYLOAD["labels"]}
+        JOINT.update(PAYLOAD["joint"])
     draw = {"final_acc_vs_snr": plot_final_acc_vs_snr,
-            "uplink_time_to_target_vs_snr": lambda d, o, n: plot_time_to_target_vs_snr(d, o, n, axis="Uplink"),
-            "training_time_to_target_vs_snr": lambda d, o, n: plot_time_to_target_vs_snr(d, o, n, axis="Training"),
+            "uplink_time_to_target_vs_snr": lambda d, o, n, **k: plot_time_to_target_vs_snr(d, o, n, axis="Uplink", **k),
+            "training_time_to_target_vs_snr": lambda d, o, n, **k: plot_time_to_target_vs_snr(d, o, n, axis="Training",
+                                                                                               **k),
             "budget_vs_snr": plot_budget_vs_snr, "time_to_target_vs_N": plot_time_to_target_vs_N,
             "curves_20dB": plot_curves}
-    for name, spec in FIGS.items():
+    for name, spec in {**FIGS, **(PAYLOAD_FIGS if payload else {})}.items():
         kind = spec[1]
         path = os.path.join(out, f"{name}.csv")
         if not os.path.exists(path):
             print(f"[fig] {name}: {path} missing (run without --plot-only first)")
             continue
-        draw[kind](pd.read_csv(path), out, name)
+        extra = {"methods": spec[2]["methods"]} if len(spec) > 2 and "methods" in spec[2] else {}
+        draw[kind](pd.read_csv(path), out, name, **extra)
     if FORMAT["shared_legend_figs"]:
         plot_legend(out)
 
@@ -534,11 +809,17 @@ def plot_legend(out, name="legend"):
     """Stand-alone legend of all methods (line style, color and marker as in the figures), for the
     figures drawn without one (FORMAT["shared_legend_figs"])."""
     lf = FORMAT["legend_figure"]
-    handles = [plt.Line2D([], [], color=METHODS[m]["color"], ls=METHODS[m]["ls"], lw=METHODS[m]["lw"],
-                          marker=METHODS[m]["marker"], ms=FORMAT["marker_size"] - 1) for m in lf["order"]]
-    fig = plt.figure(figsize=(lf["width"], 0.4))
-    fig.legend(handles, [lf.get("labels", {}).get(m, METHODS[m]["label"]) for m in lf["order"]], loc="center",
-               ncol=lf["cols"],
+    entries = {m: (plt.Line2D([], [], color=_style(m)["color"], ls=_style(m)["ls"], lw=_style(m)["lw"],
+                              marker=_style(m)["marker"], mfc=_style(m).get("mfc"), ms=FORMAT["marker_size"] - 1),
+                   lf.get("labels", {}).get(m, _style(m)["label"])) for m in lf["order"]}
+    if lf.get("rows"):                                 # grid: one family per row
+        handles, labels = _grid(entries, lf["rows"])
+        cols, nrow = max(len(r) for r in lf["rows"]), len(lf["rows"])
+    else:
+        handles, labels = [entries[m][0] for m in lf["order"]], [entries[m][1] for m in lf["order"]]
+        cols, nrow = lf["cols"], math.ceil(len(lf["order"]) / lf["cols"])
+    fig = plt.figure(figsize=(lf["width"], 0.4 * nrow))
+    fig.legend(handles, labels, loc="center", ncol=cols,
                fontsize=lf["font"], frameon=False, handlelength=2.6, columnspacing=1.4)
     for ext in FORMAT["file_types"]:
         fig.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=FORMAT["dpi"])
@@ -555,11 +836,17 @@ def main():
     p.add_argument("--fig3-target", default=FIG3_TARGET,
                    help='fig3 target: "common" (default: highest accuracy every method reaches in every seed at every '
                         'SNR), "rule" (95%% of digital SFL-V1, as the other figures) or a number such as 65')
+    p.add_argument("--payload-results", default=None,
+                   help="folder of the INT-q runs (run_airsfl.py --digital-q 8 / 4, e.g. examples/AirSFL/results_qbits): "
+                        "the figures with the INT-q baselines (VARIANTS), fig8 and table_payload -> <results>/finalz_payload/")
+    p.add_argument("--payload-bits", nargs="+", type=int, default=list(PAYLOAD["bits"]),
+                   help="INT-q payloads read from --payload-results (default 8 4)")
+    p.add_argument("--out", default=None, help="output folder (default <results>/finalz or <results>/finalz_payload)")
     a = p.parse_args()
-    out = os.path.join(os.path.abspath(a.results), "finalz")
+    out = a.out or os.path.join(os.path.abspath(a.results), "finalz_payload" if a.payload_results else "finalz")
     if not a.plot_only:
-        build_data(a.results, a.main_seeds, out, a.fig3_target)
-    plot_all(out)
+        build_data(a.results, a.main_seeds, out, a.fig3_target, a.payload_results, a.payload_bits)
+    plot_all(out, payload=bool(a.payload_results))
 
 
 if __name__ == "__main__":
