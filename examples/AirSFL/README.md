@@ -279,6 +279,8 @@ FP16 / INT8 / INT4) and the payload table: `table_payload.csv` (every method x p
 20 dB IID / non-IID and N, at the figures' targets: final accuracy, s/round, uplink time to target
 and its ratio to AirSFL, seeds reached, error-to-signal ratios, q\*) and `table_payload.tex` / `.md`
 (compact, PAYLOAD["table_rows"] x PAYLOAD["table_snrs"]). Targets are those of `finalz`, so every
-FP16 number is identical in both folders; `finalz/` is not touched.
+FP16 number is identical in both folders; `finalz/` is not touched. While the INT-q runs have fewer
+seeds, add `--seeds 11 22 33` for a paired comparison (every method on the same seeds; targets
+recomputed from them, so the FP16 numbers then differ from the 5-seed `finalz`).
 
 On the cluster: see the header of `slurm/run_airsfl.slurm`.

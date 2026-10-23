@@ -81,8 +81,10 @@ ABLATION = [("gradient", "weighted"), ("gradient", "uniform"), ("random", "weigh
 #   slot_batch_lazy      + lazy re-clustering (no halts)
 #   slot_batch_lazy_q25  the same with a shorter slot (L = 25th percentile of t_k): less local drift on
 #                        label-homogeneous clusters, twice as frequent mixing
+#   sys_warm             (1) with warm-started re-clustering (Lloyd from the current partition, not a fresh
+#                        k-means++ seeding): only clusters whose members really moved restart
 VARIANT_NAMES = ["paper", "sys", "slot", "deadline", "delta", "lazy", "all", "all_nosys",
-                 "sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25"]
+                 "sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25", "sys_warm"]
 SCREEN2 = ["sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25"]
 DEFAULT_VARIANTS = ["paper", "sys", "slot", "delta", "lazy", "all", "all_nosys"]
 
@@ -97,6 +99,8 @@ def variant_overrides(name: str, args) -> dict:
         return {}
     if name == "sys_lazy":
         return {**one["sys"], **one["lazy"]}
+    if name == "sys_warm":
+        return {**one["sys"], "recluster_init": "warm"}
     if name.startswith("slot_batch"):
         o = {**one["slot"], "batch_arrivals": True}
         if "lazy" in name:
@@ -147,6 +151,8 @@ def ablation_configs(name: str, args) -> list:
         rem.append(("time slot", drop("local_work", "deadline_q", "batch_arrivals")))
     if v.get("recluster") == "lazy":
         rem.append(("lazy re-clustering", drop("recluster")))
+    if v.get("recluster_init") == "warm":
+        rem.append(("warm re-clustering", drop("recluster_init")))
     if v.get("batch_arrivals"):
         rem.append(("batched arrivals", drop("batch_arrivals")))
     if v.get("sys_lambda"):
@@ -156,16 +162,36 @@ def ablation_configs(name: str, args) -> list:
     paper_label = "paper" + "".join(f" = w/o {lab}" for lab, ov in rem if not ov)
     out = [(paper_label, {}), ("full", dict(v))] + [(f"w/o {lab}", ov) for lab, ov in rem if ov]
     if v.get("sys_lambda"):
-        out.append(("w/o gradient term (speed-only clusters)", {**drop("sys_lambda", "recluster"), "clustering": "system"}))
+        out.append(("w/o gradient term (speed-only clusters)",
+                    {**drop("sys_lambda", "recluster", "recluster_init"), "clustering": "system"}))
     out.append(("w/o weighted aggregation", {**v, "aggregation": "uniform"}))
-    out.append(("w/o gradient clustering (random)", {**drop("recluster", "sys_lambda"), "clustering": "random"}))
+    out.append(("w/o gradient clustering (random)",       # one-time clusterings: no re-clustering options
+                {**drop("recluster", "recluster_init", "sys_lambda"), "clustering": "random"}))
     return out
+
+
+ABLATION_PARTS = ["all", "full", "paper", "uniform", "random", "speed", "removals"]
+
+
+def ablation_part(label: str) -> str:
+    """--ablation-parts key of an ablation_configs label."""
+    if label == "full":
+        return "full"
+    if label.startswith("paper"):
+        return "paper"
+    if label == "w/o weighted aggregation":
+        return "uniform"
+    if label.endswith("(random)") or label == "w/o gradient clustering":
+        return "random"
+    if "speed-only" in label:
+        return "speed"
+    return "removals"
 
 
 def build_runs(args) -> list:
     """(experiments, RunConfig) for every requested run, deduplicated by identity."""
     base = dict(K=args.K, T=args.rounds, time_budget=args.time_budget, E=args.E, B=args.B, lr=args.lr,
-                t0=args.t0, sigma_s=args.sigma_s)
+                t0=args.t0, sigma_s=args.sigma_s, speed_drift_rho=args.speed_drift_rho, speed_drift_dt=args.speed_drift_dt)
     out = {}
 
     def add(exp, **kw):
@@ -187,8 +213,9 @@ def build_runs(args) -> list:
                 for H in args.hs:
                     add("hsweep", method="csasfl", delta=NONIID, seed=seed, H=H, **cv)
             if "ablation" in args.exp:
-                for _, ov in ablation_configs(csa, args):
-                    add("ablation", method="csasfl", delta=NONIID, seed=seed, **ov)
+                for lab, ov in ablation_configs(csa, args):
+                    if "all" in args.ablation_parts or ablation_part(lab) in args.ablation_parts:
+                        add("ablation", method="csasfl", delta=NONIID, seed=seed, **ov)
         if "variants" in args.exp:
             names = [v for n in args.variants for v in (SCREEN2 if n == "screen2" else [n])]
             for delta in args.variant_deltas:
@@ -199,7 +226,11 @@ def build_runs(args) -> list:
 
 def manifest(cfg: RunConfig) -> dict:
     d = dataclasses.asdict(cfg)
-    # improvement options enter the identity only when they differ from the paper (finished runs keep their hash)
+    # improvement options / time-varying speeds enter the identity only when they differ from the paper
+    # (finished runs keep their hash)
+    for k, v in RunConfig.SYSTEM_DEFAULTS.items():
+        if d[k] == v:
+            d.pop(k)
     for k, v in RunConfig.IMPROVEMENT_DEFAULTS.items():
         if cfg.method != "csasfl" or d[k] == v:
             d.pop(k)
@@ -220,6 +251,8 @@ def run_id(cfg: RunConfig) -> str:
 def run_name(cfg: RunConfig) -> str:
     extra = f"_N{cfg.N}_H{cfg.H}_{cfg.variant()}" if cfg.method == "csasfl" else ""
     stop = f"_tb{cfg.time_budget:g}" if cfg.time_budget > 0 else ""
+    if cfg.speed_drift_rho < 1.0:
+        stop = f"_drift{cfg.speed_drift_rho:g}-{cfg.speed_drift_dt:g}" + stop
     return f"{cfg.method}_d{cfg.delta:g}_s{cfg.seed}{extra}_T{cfg.T}{stop}_{run_id(cfg)}"
 
 
@@ -315,6 +348,7 @@ def run_one(cfg: RunConfig, exps: list, data: dict, args) -> str:
     for k, v in [("method", cfg.method), ("label", METHOD_LABELS[cfg.method]), ("variant", cfg.variant()),
                  ("delta", cfg.delta), ("seed", cfg.seed), ("K", cfg.K), ("E", cfg.E), ("B", cfg.B),
                  ("lr", cfg.lr), ("T", cfg.T), ("time_budget", cfg.time_budget), ("t0", cfg.t0),
+                 ("speed_drift_rho", cfg.speed_drift_rho), ("speed_drift_dt", cfg.speed_drift_dt),
                  ("sigma_s", cfg.sigma_s),
                  ("N", cfg.N if cfg.method == "csasfl" else np.nan), ("H", cfg.H if cfg.method == "csasfl" else np.nan),
                  ("engine", eng.engine), ("run_id", run_id(cfg)), ("experiments", "+".join(exps)),
@@ -339,6 +373,10 @@ def main():
     p.add_argument("--csa-variant", nargs="+", default=["paper"], choices=VARIANT_NAMES,
                    help="CSA-SFL variant(s) used by --exp nsweep / hsweep / ablation (default: the paper's algorithm); "
                         "several = the sweeps and ablation of each")
+    p.add_argument("--ablation-parts", nargs="+", default=["all"], choices=ABLATION_PARTS,
+                   help="subset of --exp ablation: full (the variant itself), paper (reference), uniform (w/o weighted "
+                        "aggregation), random (w/o gradient clustering), speed (speed-only clusters), removals (the "
+                        "variant with each improvement removed); default all")
     p.add_argument("--sys-lambda", type=float, default=1.0, help="(1) weight of the system term in the clustering")
     p.add_argument("--deadline-q", type=float, default=0.5, help="(2) time slot L = this quantile of the devices' t_k")
     p.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS, help="methods of --exp main")
@@ -357,6 +395,10 @@ def main():
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--t0", type=float, default=0.2)
     p.add_argument("--sigma-s", type=float, default=2.0)
+    p.add_argument("--speed-drift-rho", type=float, default=1.0,
+                   help="time-varying device speeds: AR(1) coefficient of log s_k per --speed-drift-dt seconds "
+                        "(1 = the paper's fixed speeds; e.g. 0.9). The LogNormal(0, sigma_s^2) heterogeneity is kept")
+    p.add_argument("--speed-drift-dt", type=float, default=100.0, help="speed update interval (s)")
     p.add_argument("--engine", default="vmap", choices=["vmap", "loop"])
     p.add_argument("--vmap-chunk", type=int, default=None, help="devices per vmap chunk (GPU memory)")
     p.add_argument("--shard", default="0/1", help="i/n: run only the i-th of n cost-balanced slices")

@@ -88,7 +88,13 @@ class CSASFL:
     # Mechanism 1 — cosine-distance K-means on device-side gradients
     # ------------------------------------------------------------------
 
-    def cluster_by_gradient(self, gradients: dict, rng: np.random.RandomState) -> list:
+    @staticmethod
+    def _labels_from(init, cids) -> np.ndarray:
+        """Assignment of cids from a partition (list of member lists); every cid must be in one."""
+        of = {c: n for n, members in enumerate(init) for c in members}
+        return np.array([of[c] for c in cids])
+
+    def cluster_by_gradient(self, gradients: dict, rng: np.random.RandomState, init=None) -> list:
         """
         Cosine-distance K-means over device-side gradients (paper Eq. clustering):
             min_{C_1..C_N} sum_n sum_{k in C_n} (1 - cos(g_k, mu_n)),   mu_n = (1/|C_n|) sum_{k in C_n} g_k,
@@ -100,6 +106,8 @@ class CSASFL:
         Args:
             gradients: {client_id -> 1-D np.ndarray} device-side gradient g_k.
             rng:       seeded RNG for reproducible centroid initialization.
+            init:      optional current partition (N member lists): warm start, Lloyd iterations
+                       begin from it instead of k-means++ seeding (rng unused).
 
         Returns:
             list[list[client_id]] — N non-empty clusters.
@@ -111,8 +119,12 @@ class CSASFL:
         U = G / norms                                   # unit vectors; cos(a,b) = <a_hat, b_hat>
         N = min(self.N, len(cids))
 
-        C = self._init_centroids(U, N, rng)             # (N, d) unit centroid directions
-        labels = (U @ C.T).argmax(axis=1)
+        if init is not None:
+            labels, C = self._labels_from(init, cids), None
+            N = len(init)
+        else:
+            C = self._init_centroids(U, N, rng)         # (N, d) unit centroid directions
+            labels = (U @ C.T).argmax(axis=1)
         best_obj, best = np.inf, None
         for _ in range(self.kmeans_iters):
             labels = self._fill_empty(labels, U, C, N)
@@ -134,7 +146,7 @@ class CSASFL:
         return [c for c in clusters if c]
 
     def cluster_system_aware(self, gradients: dict, system: dict, lam: float,
-                             rng: np.random.RandomState) -> list:
+                             rng: np.random.RandomState, init=None) -> list:
         """
         Gradient + system-behaviour K-means (improvement 1; lam = 0 is the paper's clustering,
         use cluster_by_gradient for it). Each device k carries its gradient g_k and a scalar
@@ -143,7 +155,8 @@ class CSASFL:
             mu_n = mean of the cluster's g_k (paper),  c_n = mean of the cluster's z_k,
         so devices are grouped by update direction AND by how long their local round takes,
         which bounds the intra-cluster straggler wait. Lloyd iterations with k-means++ seeding
-        on the same cost; the partition with the lowest objective seen is returned.
+        on the same cost (or, with init = the current partition, from that partition: warm
+        start); the partition with the lowest objective seen is returned.
         """
         cids = list(gradients.keys())
         G = np.stack([np.asarray(gradients[c], dtype=np.float64) for c in cids])
@@ -154,19 +167,21 @@ class CSASFL:
         N = min(self.N, len(cids))
         lam = float(lam)
 
-        # k-means++ seeding on the joint point-to-point cost
-        chosen = [int(rng.randint(len(U)))]
-        for _ in range(1, N):
-            dist = np.min(np.stack([(1.0 - U @ U[j]) + lam * (z - z[j]) ** 2 for j in chosen]), axis=0)
-            dist = np.clip(dist, 0.0, None)
-            s = dist.sum()
-            chosen.append(int(rng.choice(len(U), p=dist / s if s > 0 else np.full(len(U), 1.0 / len(U)))))
-        C, c = U[chosen].copy(), z[chosen].copy()
-
         def cost(C, c):                                          # (K, N) assignment cost
             return (1.0 - U @ C.T) + lam * (z[:, None] - c[None, :]) ** 2
 
-        labels = cost(C, c).argmin(axis=1)
+        if init is not None:                                     # warm start from the current partition
+            labels, N = self._labels_from(init, cids), len(init)
+        else:
+            # k-means++ seeding on the joint point-to-point cost
+            chosen = [int(rng.randint(len(U)))]
+            for _ in range(1, N):
+                dist = np.min(np.stack([(1.0 - U @ U[j]) + lam * (z - z[j]) ** 2 for j in chosen]), axis=0)
+                dist = np.clip(dist, 0.0, None)
+                s = dist.sum()
+                chosen.append(int(rng.choice(len(U), p=dist / s if s > 0 else np.full(len(U), 1.0 / len(U)))))
+            C, c = U[chosen].copy(), z[chosen].copy()
+            labels = cost(C, c).argmin(axis=1)
         best_obj, best = np.inf, None
         for _ in range(self.kmeans_iters):
             for n in range(N):                                   # refill an empty cluster with the worst-fit device

@@ -40,6 +40,9 @@ def load(results: str) -> pd.DataFrame:
     frames, partial = [], []
     for f in sorted(glob.glob(os.path.join(results, "runs", "*.csv"))):
         d = pd.read_csv(f)
+        for col, default in (("speed_drift_rho", 1.0), ("speed_drift_dt", 100.0)):   # runs before time-varying speeds
+            if col not in d:
+                d[col] = default
         tb = float(d["time_budget"].iloc[0]) if "time_budget" in d and len(d) else 0.0
         if len(d) and (d["round"].max() >= d["T"].iloc[0] or d["diverged"].astype(bool).any()
                        or (tb > 0 and d["sim_time_s"].max() >= tb)):
@@ -55,7 +58,8 @@ def load(results: str) -> pd.DataFrame:
     return df
 
 
-CONFIG_COLS = ["method", "variant", "delta", "seed", "K", "E", "B", "lr", "t0", "sigma_s", "N", "H"]  # not T: a cap
+CONFIG_COLS = ["method", "variant", "delta", "seed", "K", "E", "B", "lr", "t0", "sigma_s", "N", "H",
+               "speed_drift_rho", "speed_drift_dt"]  # not T: a cap
 
 
 def common_budget(df: pd.DataFrame, budget=None) -> pd.DataFrame:
@@ -109,6 +113,8 @@ def variant_label(v: str) -> str:
             names.append("lazy re-clust.")
         elif tg == "batch":
             names.append("batched arrivals")
+        elif tg == "warm":
+            names.append("warm re-clust.")
     return "+ " + ", ".join(names)
 
 
@@ -331,8 +337,20 @@ def main():
                         "has N- or H-sweep runs in the folder (the paper's algorithm if none)")
     p.add_argument("--N", type=int, default=7, help="default N (fixed in the H sweep)")
     p.add_argument("--H", type=int, default=20, help="default H (fixed in the N sweep)")
+    p.add_argument("--speed-drift", nargs=2, type=float, default=None, metavar=("RHO", "DT"),
+                   help="only the runs with these time-varying speeds (rho 1 = fixed speeds); required when the folder "
+                        "holds several speed models, which are never averaged together")
     args = p.parse_args()
-    df = common_budget(load(args.results), args.time_budget)
+    df = load(args.results)
+    models = sorted({(float(r), float(d)) for r, d in zip(df["speed_drift_rho"], df["speed_drift_dt"])})
+    if args.speed_drift is not None:
+        rho, dt = args.speed_drift
+        df = df[np.isclose(df["speed_drift_rho"], rho) & (np.isclose(df["speed_drift_dt"], dt) | (rho >= 1.0))]
+        if df.empty:
+            raise SystemExit(f"[plots] no runs with --speed-drift {rho:g} {dt:g}; the folder has {models}")
+    elif len({m if m[0] < 1.0 else (1.0, 0.0) for m in models}) > 1:
+        raise SystemExit(f"[plots] the folder mixes speed models {models} (rho, dt): pass --speed-drift RHO DT")
+    df = common_budget(df, args.time_budget)
     out = args.out or os.path.join(args.results, "figures")
     os.makedirs(out, exist_ok=True)
     report = ""

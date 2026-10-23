@@ -16,6 +16,12 @@ flsim/csasfl/checks.py: correctness checks for the CSA-SFL paper setup (run befo
                 (time non-decreasing, staleness, re-clustering every H, comm formulas)
   9 variants    (python -m flsim.csasfl.checks --variants, ~10 min) the four CSA-SFL improvement
                 options, each formula / invariant verified exactly through run_csasfl's trace hook
+ 10 drift       (python -m flsim.csasfl.checks --drift, ~10 min) time-varying speeds: the AR(1)
+                process keeps LogNormal(0, sigma^2) with lag-1 correlation rho and is deterministic;
+                the time-varying code path with frozen speeds reproduces the fixed-speed runs of every
+                method; with drifting speeds every method's timing (FL / SFLv2 rounds, SAFSL arrivals,
+                ParallelSFL Eq. 15, CSA-SFL rounds, caps, halts, paused rounds) matches an independent
+                re-simulation
 """
 
 import math
@@ -209,6 +215,8 @@ def main():
 
     if "--variants" in sys.argv:
         check_variants(small, spec, cpu)
+    if "--drift" in sys.argv:
+        check_drift(small, spec, cpu)
     print(f"\n{'ALL CHECKS PASSED' if not _fails else f'{len(_fails)} FAILED: {_fails}'}")
     return 1 if _fails else 0
 
@@ -238,6 +246,24 @@ def check_variants(small, spec, cpu):
     c3 = CSASFL(num_clusters=4).cluster_system_aware(gr, z, 1e6, np.random.RandomState(5))
     spans = sorted((min(z[k] for k in c), max(z[k] for k in c)) for c in c3)
     check("(1) lam -> inf gives speed tiers", all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1)))
+    # (4b) warm-started re-clustering
+    dirs = r0.randn(4, 300)
+    gp = {k: dirs[k % 4] * r0.uniform(0.5, 3.0) + 0.3 * r0.randn(300) for k in range(40)}
+    zp = {k: 0.1 * float(r0.randn()) for k in range(40)}
+    planted = [[k for k in range(40) if k % 4 == n] for n in range(4)]
+    a4 = CSASFL(num_clusters=4)
+    w1 = a4.cluster_by_gradient(gp, np.random.RandomState(9), init=planted)
+    w2 = a4.cluster_system_aware(gp, zp, 1.0, np.random.RandomState(9), init=planted)
+    check("(4b) warm start from a well-separated partition keeps it (gradient / system-aware)",
+          sorted(map(sorted, w1)) == planted and sorted(map(sorted, w2)) == planted)
+    noisy = {k: v + 2.0 * r0.randn(300) for k, v in gr.items()}
+    p0 = CSASFL(num_clusters=4).cluster_system_aware(gr, z, 1.0, np.random.RandomState(5))
+    obj = lambda P, g: sum(sum((1 - g[k] @ mu / (np.linalg.norm(g[k]) * np.linalg.norm(mu))) + (z[k] - cz) ** 2 for k in C)
+                           for C in P for mu, cz in [(np.mean([g[k] for k in C], 0), np.mean([z[k] for k in C]))])
+    a5 = CSASFL(num_clusters=4)
+    p1 = a5.cluster_system_aware(noisy, z, 1.0, np.random.RandomState(5), init=p0)
+    check("(4b) warm start never ends worse than the partition it starts from", obj(p1, noisy) <= obj(p0, noisy) + 1e-9
+          and math.isclose(a5.last_objective, obj(p1, noisy), rel_tol=1e-9), f"{obj(p0, noisy):.3f} -> {obj(p1, noisy):.3f}")
     # (2) deadline local work
     cfg, ctx, rows, tr = go(local_work="deadline", deadline_q=0.5)
     L, sp = float(np.quantile(ctx.tk, 0.5)), ctx.speeds
@@ -303,6 +329,200 @@ def check_variants(small, spec, cpu):
         check(f"(4) [{tag}] no halts and no probe traffic after the start; every device trained or is training",
               all(x >= -1e-6 and abs(x / dm - round(x / dm)) < 1e-9 for x in extra)
               and sum(r["recluster"] for r in rows[1:]) > 0 and done | busy_end == set(range(12)))
+
+
+class _RefClock:
+    """Independent integrator of the piecewise-constant speeds of a SpeedProcess: cumulative work
+    W_k(t) tabulated at the interval boundaries and inverted directly (SpeedProcess.finish / .work
+    walk interval by interval instead). Built on a fresh process of the same seed."""
+
+    def __init__(self, sp):
+        self.sp, self.dt = sp, sp.dt
+        self.S = np.zeros((0, sp.K))
+
+    def _grow(self, J):
+        if len(self.S) <= J + 1:
+            self.S = np.exp(np.stack([self.sp._log(j) for j in range(J + 64)]))
+            self.C = np.vstack([np.zeros((1, self.sp.K)), np.cumsum(self.S * self.dt, axis=0)])
+
+    def W(self, k, t):
+        J = int(np.floor(t / self.dt))
+        self._grow(J)
+        return self.C[J, k] + (t - J * self.dt) * self.S[J, k]
+
+    def work(self, k, a, b):
+        return self.W(k, b) - self.W(k, a)
+
+    def finish(self, k, a, w):
+        target, J = self.W(k, a) + w, int(np.floor(a / self.dt))
+        while True:
+            self._grow(J + 1)
+            if self.C[J + 1, k] > target:
+                return max(a, J * self.dt + (target - self.C[J, k]) / self.S[J, k])
+            J += 1
+
+
+def check_drift(small, spec, cpu):
+    """10 time-varying device speeds (RunConfig.speed_drift_rho < 1)."""
+    import heapq
+    from flsim.csasfl.methods import RUNNERS, Context, _ParallelSFLCompute
+    from flsim.csasfl.model import layer_macs
+    from flsim.csasfl.system import SpeedProcess, batches
+    from flsim.interfaces.parallel_sfl_algorithm import WorkerInfo
+    print("10 time-varying speeds (--drift)")
+    rel = lambda a, b, tol: abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+    # the process itself
+    sp = SpeedProcess(np.random.RandomState(0).lognormal(0.0, 2.0, 4000), 2.0, 0.9, 10.0, 7)
+    L = np.stack([np.log(sp.at(10.0 * j + 1.0)) for j in range(150)])            # (150, 4000)
+    corr = float(np.mean([np.corrcoef(L[j], L[j + 1])[0, 1] for j in range(149)]))
+    check("AR(1) on log s_k keeps LogNormal(0, sigma^2), lag-1 correlation rho",
+          abs(L.mean()) < 0.03 and abs(L.std() - 2.0) < 0.03 and abs(corr - 0.9) < 0.01,
+          f"mean {L.mean():.3f}, std {L.std():.3f}, corr {corr:.3f}")
+    a = SpeedProcess(np.ones(5), 2.0, 0.7, 3.0, 11)
+    b = SpeedProcess(np.ones(5), 2.0, 0.7, 3.0, 11)
+    late = a.at(500.0).copy()
+    check("deterministic per seed, independent of query order",
+          all(np.array_equal(a.at(3.0 * j), b.at(3.0 * j)) for j in range(200)) and np.array_equal(late, b.at(500.0)))
+    ref, r0 = _RefClock(SpeedProcess(np.ones(5), 2.0, 0.7, 3.0, 11)), np.random.RandomState(1)
+    qs = [(int(r0.randint(5)), float(r0.uniform(0, 400)), float(r0.exponential(20.0))) for _ in range(300)]
+    check("finish / work == independent integrator, finish inverts work",
+          all(rel(a.finish(k, t, w), ref.finish(k, t, w), 1e-9) and rel(a.work(k, t, t + w), ref.work(k, t, t + w), 1e-9)
+              and rel(a.work(k, t, a.finish(k, t, w)), w, 1e-9) for k, t, w in qs))
+    st = SpeedProcess(np.array([0.5, 2.0]), 2.0, 1.0, 100.0, 3)
+    check("rho = 1: fixed speeds, t + work / s_k", not st.dyn and st.finish(0, 7.0, 3.0) == 7.0 + 3.0 / 0.5
+          and np.allclose(st.at(1e5), [0.5, 2.0]))
+
+    quiet = lambda *_: None
+    eng = lambda: Engine(spec, 8, 0.01, cpu, "vmap" if _HAS_FUNC else "loop")
+    base = dict(delta=0.1, seed=2, K=10, E=1, B=32, lr=0.01, time_budget=0.0, N=3, H=4)
+    csa = {"paper": {}, "sys": {"sys_lambda": 1.0}, "system": {"clustering": "system"},
+           "uniform": {"aggregation": "uniform", "sys_lambda": 1.0},
+           "slot": {"local_work": "slot", "deadline_q": 0.5},
+           "slot+batch+lazy": {"local_work": "slot", "deadline_q": 0.25, "batch_arrivals": True, "recluster": "lazy"},
+           "sys+warm H=2": {"sys_lambda": 1.0, "recluster_init": "warm", "H": 2},       # kept clusters: paused, resumed
+           "slot+warm H=2": {"local_work": "slot", "deadline_q": 0.5, "recluster_init": "warm", "H": 2}}
+    cases = [(m, {}, 10) for m in ("fl", "sflv2", "safsl", "parallelsfl")] + [("csasfl", kw, 20) for kw in csa.values()]
+    tags = {id(kw): n for n, kw in csa.items()}
+
+    def go(method, kw, T, rho=1.0, dt=100.0, frozen_dt=None):
+        cfg = RunConfig(method=method, T=T, speed_drift_rho=rho, speed_drift_dt=dt, **{**base, **kw})
+        ctx = Context(cfg, small, eng(), quiet)
+        if frozen_dt is not None:                       # the time-varying code path, speeds frozen at s_k(0)
+            ctx.sp = SpeedProcess(ctx.speeds, cfg.sigma_s, 1.0, frozen_dt, cfg.seed)
+            ctx.sp.dyn = ctx.dyn = True
+        ctx.trace = []
+        return cfg, ctx, RUNNERS[method](ctx)
+
+    # (a) frozen speeds through the time-varying code: identical training, same clocks / traffic
+    timing = ("sim_time_s", "comm_mb", "round_comm_mb", "round_latency_s", "avg_wait_s", "cluster_time_s",
+              "staleness", "staleness_mean", "staleness_max", "phi")
+    eq = lambda u, v: u == v or (isinstance(u, float) and isinstance(v, float) and math.isnan(u) and math.isnan(v))
+    for m, kw, T in cases:
+        _, _, ra = go(m, kw, T)
+        _, _, rb = go(m, kw, T, frozen_dt=3.7)
+        same = len(ra) == len(rb) and all(eq(x[c], y[c]) for x, y in zip(ra, rb) for c in ("test_acc", "test_loss", "train_loss"))
+        worst = max((abs(x[c] - y[c]) / max(1.0, abs(x[c])) for x, y in zip(ra, rb) for c in timing
+                     if c in x and isinstance(x[c], float) and not math.isnan(x[c])), default=0.0)
+        rest = all(eq(x[c], y[c]) for x, y in zip(ra, rb) for c in x if c not in timing and c not in ("wall_s", "cluster_id"))
+        check(f"(a) frozen drift == fixed speeds: {m + (' ' + tags[id(kw)] if m == 'csasfl' else '')}",
+              same and rest and worst < 1e-9, f"{len(rb)} rows, max rel. timing diff {worst:.1e}")
+
+    # (b) drifting speeds: every method's clock vs an independent re-simulation (_RefClock)
+    rho, dt = 0.6, 5.0
+    for m, kw, T in cases:
+        cfg, ctx, rows = go(m, kw, T, rho, dt)
+        ref = _RefClock(SpeedProcess(ctx.speeds, cfg.sigma_s, rho, dt, cfg.seed))
+        K, t0, nbf = cfg.K, cfg.t0, ctx.nb_full
+        tt = [r["sim_time_s"] for r in rows]
+        mono = all(y >= x for x, y in zip(tt, tt[1:]))
+        name = m + (" " + tags[id(kw)] if m == "csasfl" else "")
+        if m in ("fl", "sflv2"):
+            t, ok = 0.0, True
+            for r in rows[1:]:
+                d = [ref.finish(k, t, nbf[k] * t0) - t for k in range(K)]
+                t += max(d)
+                ok &= rel(r["round_latency_s"], max(d), 1e-7) and rel(r["sim_time_s"], t, 1e-7) \
+                    and rel(r["avg_wait_s"], float(np.mean(max(d) - np.array(d))), 1e-6)
+            check(f"(b) {name}: round = max_k (finish of E epochs from the round start)", ok and mono)
+        elif m == "safsl":
+            kbuf = max(1, int(round(cfg.safsl_buffer_frac * K)))
+            heap = [(ref.finish(k, 0.0, nbf[k] * t0), k) for k in range(K)]
+            heapq.heapify(heap)
+            ver, ok = {k: 0 for k in range(K)}, True
+            for e, r in enumerate(rows[1:]):
+                arr = [heapq.heappop(heap) for _ in range(min(kbuf, len(heap)))]
+                now = max(x[0] for x in arr)
+                stale = [e - ver[x[1]] for x in arr]
+                ok &= rel(r["sim_time_s"], now, 1e-7) and r["staleness_max"] == max(stale)
+                for _, k in arr:
+                    ver[k] = e + 1
+                    heapq.heappush(heap, (ref.finish(k, now, nbf[k] * t0), k))
+            check(f"(b) {name}: arrival = dispatch + E epochs at the drifting speeds, k earliest aggregated", ok and mono)
+        elif m == "parallelsfl":
+            ctx2 = Context(cfg, small, eng(), quiet)                       # replays the same rng stream
+            algo = _ParallelSFLCompute(lam=cfg.psfl_lambda, tau_max=cfg.E * batches(float(np.mean(ctx2.sizes)), cfg.B),
+                                       max_cluster_size=cfg.psfl_max_cluster)
+            macs = layer_macs(spec)
+            r_top = sum(macs[cfg.cut:]) / sum(macs[:cfg.cut])
+            t, ok = 0.0, True
+            for r in rows[1:]:
+                s_now = np.exp(ref.sp._log(int(np.floor(t / dt))))
+                infos = [WorkerInfo(client_id=k, label_dist=ctx2.label_dists[k], num_samples=int(ctx2.sizes[k]),
+                                    mu_b=t0 / s_now[k], mu_p=r_top * t0 / s_now[k], beta_smashed=0.0, beta_full=0.0,
+                                    ingress_bw_hz=algo.b * cfg.psfl_max_cluster) for k in range(K)]
+                cl = algo.cluster_workers(infos, ctx2.rng)
+                algo.assign_frequencies(cl)
+                tc = []
+                for c in cl:
+                    x = t
+                    for _ in range(c.tau):
+                        x = ref.finish(c.top.client_id, max(ref.finish(w.client_id, x, t0) for w in c.bottoms), r_top * t0)
+                    tc.append(x - t)
+                t += max(tc)
+                ok &= rel(r["round_latency_s"], max(tc), 1e-7) and rel(r["sim_time_s"], t, 1e-7) \
+                    and r["tau_max"] == max(c.tau for c in cl) and r["num_clusters"] == len(cl)
+            check(f"(b) {name}: Algorithm 1 on the current speeds, Eq. 15 integrated over the drift", ok and mono)
+        else:
+            tr = ctx.trace
+            deadline, floor = cfg.local_work in ("deadline", "slot"), cfg.local_work == "slot"
+            L = float(np.quantile(ctx.tk, cfg.deadline_q)) if deadline else 0.0
+            halts = [(e["now"], e["halt"]) for e in tr if e["halt"] > 0]
+            h_ok = all(rel(h, max(ref.finish(k, tn, t0) - tn for k in range(K)), 1e-7) for tn, h in halts)
+            if cfg.clustering == "gradient":                         # initial probe on w^0, then the first rounds
+                h_ok &= rel(rows[0]["sim_time_s"], max(ref.finish(k, 0.0, t0) for k in range(K)), 1e-7)
+            starts = {0.0, rows[0]["sim_time_s"]} | {e["now"] for e in tr} | {tn + h for tn, h in halts}
+            caps_ok = fin_ok = done_ok = start_ok = paused = True
+            n_paused = 0
+            for e in tr:
+                for bb in e["batch"]:
+                    s0 = bb["started"]
+                    start_ok &= any(rel(s0, x, 1e-12) for x in starts)
+                    inflight = [(tn, h) for tn, h in halts if s0 <= tn < bb["done"]]
+                    n_paused += bool(inflight)
+                    fins = []
+                    for k in bb["members"]:
+                        n = int(nbf[k])
+                        if deadline:
+                            n = min(n, max(1, int(math.floor(ref.work(k, s0, s0 + L) / t0 + 1e-9))))
+                        caps_ok &= bb["caps"][k] == n and 0 < bb["samp"][k] <= n * cfg.B
+                        tt_, rem, A = s0, n * t0, None                   # its own work, paused by every halt
+                        for tn, h in inflight:
+                            w = ref.work(k, tt_, tn)
+                            if rem <= w:
+                                A = ref.finish(k, tt_, rem)
+                                break
+                            rem, tt_ = rem - w, tn + h
+                        A = ref.finish(k, tt_, rem) if A is None else A
+                        fin = A + sum(h for tn, h in inflight if tn >= A)  # a finished member waits through later halts
+                        fin_ok &= rel(bb["fin"][k], fin, 1e-7)
+                        fins.append(fin)
+                    done = max(fins + ([s0 + L + sum(h for _, h in inflight)] if floor else []))
+                    done_ok &= rel(bb["done"], done, 1e-7) and rel(e["now"], bb["done"], 1e-12)
+            check(f"(b) {name}: halts = max_k (one batch at the current speeds), rounds start at events / after halts",
+                  h_ok and start_ok and mono, f"{len(halts)} halts")
+            check(f"(b) {name}: per-member steps (E epochs{' or what fits in L' if deadline else ''}) and finish times, "
+                  f"round end = max(finishes{', start + L' if floor else ''}), paused by halts",
+                  caps_ok and fin_ok and done_ok, f"{sum(len(e['batch']) for e in tr)} rounds, {n_paused} paused by a halt")
 
 
 if __name__ == "__main__":

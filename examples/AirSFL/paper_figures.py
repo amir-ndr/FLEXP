@@ -93,6 +93,33 @@ FORMAT = dict(
     },
     inside_legend_frame=False,   # False = transparent legend (no box); True = white box
     inside_legend_font=10.5,     # font size of the legends inside the axes
+    # figures drawn at their PRINT size (one IEEE column, include with width=\columnwidth): same physical size and
+    # font as fig_payload_precision, so the text matches 1:1 in the paper. figsize / font / ylabel / legend
+    # (legend replaces the figure's inside_legend spec) override the defaults above for that figure only
+    # Same canvas (figsize above) for every figure except fig5; only the text, lines and markers are enlarged so that
+    # they stay readable after LaTeX shrinks the figure to its \includegraphics width (IEEEtran: \columnwidth 3.5 in,
+    # \textwidth 7.16 in). font: axis labels / ticks; legend: inside-legend spec; lw: line-width factor; ms: marker
+    # size; xlabel / ylabel: shorter axis labels where the long ones do not fit at that font; xk: ticks as 5k, 10k
+    compact={
+        # \includegraphics[width=\columnwidth]: drawn at 3.45 x 2.45 in, like fig_payload_precision
+        "fig5_noniid_uplink_time_to_target_vs_N": dict(
+            figsize=(3.45, 2.45), font=9, ylabel="Uplink time to target (s)", ybottom=100.0,   # log bars start at 100 s
+            legend=dict(loc="upper center", ncol=3, headroom=12.0, font=8.5, cs=0.8, hl=1.2)),
+        # width=0.48\columnwidth (1.68 in; the 6.4-in canvas prints at ~0.29x): 22 pt -> ~6.5 pt in print
+        "fig2_noniid_accuracy_vs_uplink_time_20dB": dict(
+            font=22, lw=1.6, ms=9, xk=True, xlabel="Accumulated uplink time (s)", inset_font=16),
+        "fig6_iid_accuracy_vs_uplink_time_20dB": dict(
+            font=22, lw=1.6, ms=9, xk=True, xlabel="Accumulated uplink time (s)", inset_font=16),
+        # width=0.32\textwidth (2.29 in; prints at ~0.41x): 19 pt -> ~7.5-8 pt in print
+        "fig1_noniid_final_accuracy_vs_snr": dict(
+            font=19, lw=1.4, ms=9, legend=dict(loc="lower right", font=16)),
+        "fig3_noniid_uplink_time_to_target_vs_snr": dict(
+            font=19, lw=1.4, ms=9, ylabel="Uplink time to target (s)",
+            legend=dict(loc="upper center", ncol=3, headroom=20.0, font=15, cs=0.8, hl=1.6)),
+        "fig4_noniid_accuracy_within_uplink_budget_2000": dict(
+            font=19, lw=1.4, ms=9, ylabel="Test accuracy in budget (%)",
+            legend=dict(loc="upper center", ncol=3, headroom=1.42, font=15, cs=0.8, hl=1.6, max_tick=80)),
+    },
     no_title_figs=("fig1_noniid_final_accuracy_vs_snr", "fig2_noniid_accuracy_vs_uplink_time_20dB",
                    "fig3_noniid_uplink_time_to_target_vs_snr", "fig4_noniid_accuracy_within_uplink_budget",
                    "fig4_noniid_accuracy_within_uplink_budget_2000", "fig5_noniid_uplink_time_to_target_vs_N", "fig6_iid_accuracy_vs_uplink_time_20dB",
@@ -199,6 +226,17 @@ PAYLOAD_FIGS = {   # extra figures of finalz_payload (same specs as FIGS)
     "fig8_noniid_payload_uplink_time_to_target_vs_snr": ("dirichlet", "uplink_time_to_target_vs_snr",
                                                          {"methods": PAYLOAD["fig8_methods"]}),
 }
+# compact one-column payload figure (finalz_payload/fig_payload_precision): uplink time to fig3's target of each
+# ZF baseline / AirSFL's, vs SNR -- color = payload, line style + marker = scheme; AirSFL's own points sit at 1
+PRECISION = dict(
+    figsize=(3.45, 2.45), font=9, legend_font=8.5, marker_size=4.5, lw=1.4,
+    payloads={"FP16": "#0f7c8c", "INT8": "#c06a00", "INT4": "#8350a8"},          # payload -> color
+    schemes={"SFL-Z": dict(ls="-", marker="o"), "Hybrid-Z": dict(ls="--", marker="s")},
+    airsfl=dict(label="AirSFL", color="#d62728", marker="o", ms=5.5, ls="-", lw=1.8),
+    ylabel="Uplink time (× AirSFL)",  # = uplink time to target / AirSFL's at the same SNR
+    shade="Digital faster",          # label of the region below 1 ("" = no shading)
+    airsfl_seconds=False,            # True: AirSFL's own time to target (s) written next to each of its points
+)
 DRAWN = TRAINED + list(VARIANTS)                         # drawing order (variants exist only in finalz_payload)
 COLUMN.update({m: st["label"] for m, st in VARIANTS.items()})
 
@@ -232,13 +270,21 @@ def _seeds_txt(ns):
     return "" if not ns else (str(min(ns)) if min(ns) == max(ns) else f"{min(ns)}-{max(ns)}")
 
 
-def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_results=None, payload_bits=PAYLOAD["bits"]):
+def _only_seeds(sets, seeds):
+    """Every run set restricted to these seeds (None = all): a paired comparison when one set has fewer seeds."""
+    if not seeds:
+        return sets
+    return {e: df if df.empty else df[df.seed.astype(int).isin(seeds)].reset_index(drop=True) for e, df in sets.items()}
+
+
+def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_results=None, payload_bits=PAYLOAD["bits"],
+               seeds=None):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import plots as P
     from flsim.airsfl.timing import breakeven_bits, payload_name
     P.MAIN_SEEDS["seeds"] = set(main_seeds) if main_seeds else None
     d, _ = P.load_results(results)
-    x = P._select_payload(d, 16)                       # FP16 digital payload
+    x = _only_seeds(P._select_payload(d, 16), seeds)   # FP16 digital payload
     P.ENV0["q_bits"] = 16
     P.TARGET_SRC["df"] = x["main"]                     # 95% target: every seed of FP16 digital SFL-V1
     main, snr, nsweep = x["main"], x["snr"], x["nsweep"]
@@ -247,7 +293,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_result
     if payload_results:
         dq, _ = P.load_results(payload_results)
         for q in payload_bits:
-            xq[q] = P._select_payload(dq, q)
+            xq[q] = _only_seeds(P._select_payload(dq, q), seeds)
             n = {e: int(df[df.method.isin(P.FP16_PARENTS)].run_id.nunique()) for e, df in xq[q].items()
                  if not df.empty and e in ("main", "snr", "nsweep")}
             print(f"[data] {payload_name(q)} runs in {payload_results}: {n or 'none'}")
@@ -477,6 +523,7 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_result
         t = pd.DataFrame(rows)
         t.to_csv(os.path.join(out, "table_payload.csv"), index=False, float_format="%.6g")
         _payload_tex(t, out)
+        _precision_csv(t, out)
         print(f"[data] table_payload.csv ({len(t)} rows), table_payload.tex / .md")
 
     figs = {**FIGS, **(PAYLOAD_FIGS if payload_results else {})}
@@ -506,6 +553,82 @@ def build_data(results, main_seeds, out, fig3_target=FIG3_TARGET, payload_result
     pay = prov[prov["digital payload"].str.match(r"(FP|INT)\d")]["digital payload"].unique()
     print(f"[data] provenance.csv: digital payloads used {sorted(pay)}; seeds per point "
           f"{prov.groupby('seeds').size().to_dict()}")
+
+
+def _precision_csv(t, out):
+    """fig_payload_precision.csv: per SNR, AirSFL's uplink time to fig3's target (s) and, per ZF scheme and payload,
+    the ratio of its mean time to AirSFL's (+ seeds reached)."""
+    snr = t[t.section == "snr"]
+    rows = []
+    for rho, g in snr.groupby("SNR (dB)"):
+        air = g[g.method == COLUMN["airsfl"]]
+        row = {"SNR (dB)": rho, "target val acc (%)": float(g["target val acc (%)"].iloc[0]),
+               "AirSFL (s)": float(air["UL time to target (s)"].iloc[0]) if not air.empty else np.nan,
+               "AirSFL [reached]": air["reached"].iloc[0] if not air.empty else ""}
+        for sc in PRECISION["schemes"]:
+            for pl in PRECISION["payloads"]:
+                w = g[(g.method == sc) & (g.payload == pl)]
+                if not w.empty:
+                    row[f"{sc} {pl}"] = float(w["UL time to target / AirSFL"].iloc[0])
+                    row[f"{sc} {pl} [reached]"] = w["reached"].iloc[0]
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(os.path.join(out, "fig_payload_precision.csv"), index=False, float_format="%.6g")
+
+
+def plot_payload_precision(df, out, name="fig_payload_precision"):
+    """Compact one-column figure: time to target of each ZF baseline at each payload / AirSFL's vs SNR; AirSFL's
+    own (measured) points at 1, the region below 1 (digital faster) shaded."""
+    from matplotlib.ticker import FixedLocator, NullLocator, StrMethodFormatter
+    fp = PRECISION
+    with plt.rc_context({"font.size": fp["font"]}):
+        fig, ax = plt.subplots(figsize=fp["figsize"])
+        x = df["SNR (dB)"]
+        entries = {}
+        for sc, ss in fp["schemes"].items():
+            for pl, col in fp["payloads"].items():
+                c = f"{sc} {pl}"
+                if c not in df:
+                    continue
+                ok = df[c].notna()
+                ax.plot(x[ok], df[c][ok], color=col, ls=ss["ls"], marker=ss["marker"], ms=fp["marker_size"], mfc="white",
+                        lw=fp["lw"])
+        a = fp["airsfl"]
+        ax.plot(x, np.ones(len(df)), color=a["color"], marker=a["marker"], ms=a["ms"], ls=a["ls"], lw=a["lw"], zorder=1.9)
+        if fp["airsfl_seconds"] and "AirSFL (s)" in df:
+            for xi, s in zip(x, df["AirSFL (s)"]):
+                ax.annotate(f"{s:,.0f}", (xi, 1.0), textcoords="offset points", xytext=(0, 5), ha="center",
+                            fontsize=fp["font"] - 2.5, color=a["color"])
+        ax.set_yscale("log")
+        vals = df[[c for c in df if c.split(" ")[-1] in fp["payloads"]]].to_numpy(dtype=float)
+        lo, hi = 0.85 * min(1.0, np.nanmin(vals)), 1.15 * np.nanmax(vals)
+        ax.set_ylim(lo, hi)
+        if fp["shade"]:
+            ax.axhspan(lo, 1.0, color="#8350a8", alpha=0.08, lw=0)
+            ax.text(0.03, (np.log(1.0) - np.log(lo)) / (np.log(hi) - np.log(lo)) / 2, fp["shade"], transform=ax.transAxes,
+                    va="center", fontsize=fp["font"] - 0.5, color="0.35")
+        ticks = [v for v in (0.5, 1, 2, 5, 10, 20, 50, 100, 200) if lo <= v <= hi]
+        ax.yaxis.set_major_locator(FixedLocator(ticks))
+        ax.yaxis.set_minor_locator(NullLocator())
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+        ax.set_xticks([v for v in (-20, -10, 0, 10, 20) if x.min() <= v <= x.max()])
+        ax.set_xlabel(FORMAT["snr_label"])
+        ax.set_ylabel(fp["ylabel"])
+        ax.grid(True, alpha=FORMAT["grid_alpha"])
+        # legend above the axes: payload colors (row 1), scheme styles and AirSFL (row 2)
+        for pl, col in fp["payloads"].items():
+            entries[pl] = (plt.Line2D([], [], color=col, lw=fp["lw"] + 0.6), pl)
+        for sc, ss in fp["schemes"].items():
+            entries[sc] = (plt.Line2D([], [], color="0.25", ls=ss["ls"], marker=ss["marker"], mfc="white",
+                                      ms=fp["marker_size"], lw=fp["lw"]), sc)
+        entries["AirSFL"] = (plt.Line2D([], [], color=a["color"], marker=a["marker"], ms=a["ms"] - 0.5, ls=a["ls"],
+                                        lw=a["lw"]), a["label"])
+        h, lab = _grid(entries, (tuple(fp["payloads"]), tuple(fp["schemes"]) + ("AirSFL",)))
+        ax.legend(h, lab, loc="lower center", bbox_to_anchor=(0.5, 1.01), ncol=3, frameon=False,
+                  fontsize=fp["legend_font"], handlelength=2.4, columnspacing=1.2)
+        for ext in FORMAT["file_types"]:
+            fig.savefig(os.path.join(out, f"{name}.{ext}"), bbox_inches="tight", dpi=FORMAT["dpi"])
+        plt.close(fig)
+    print(f"[fig] {name}")
 
 
 def _payload_tex(t, out):
@@ -572,6 +695,33 @@ def _style(m):
     return METHODS[m] if m in METHODS else VARIANTS[m]
 
 
+def _figsize(name):
+    return FORMAT["compact"].get(name, {}).get("figsize", FORMAT["figsize"])
+
+
+def _subplots(name):
+    return plt.subplots(figsize=_figsize(name))
+
+
+def _ylabel(name, default):
+    return FORMAT["compact"].get(name, {}).get("ylabel", default)
+
+
+def _xlabel(name, default):
+    return FORMAT["compact"].get(name, {}).get("xlabel", default)
+
+
+def _lw(name, lw):
+    """Line width of a method, scaled for a print-size figure."""
+    return lw * FORMAT["compact"].get(name, {}).get("lw", 1.0)
+
+
+def _ms(name, delta=0.0):
+    """Marker size (FORMAT["marker_size"] + delta), or the print-size figure's."""
+    c = FORMAT["compact"].get(name, {})
+    return c["ms"] + delta * c["ms"] / FORMAT["marker_size"] if "ms" in c else FORMAT["marker_size"] + delta
+
+
 def _legend(ax, fig):
     if FORMAT["legend"] == "none":
         return
@@ -591,7 +741,9 @@ def _finish(fig, ax, out, name, title):
     if FORMAT["title"] and title and name not in FORMAT["no_title_figs"]:
         ax.set_title(title, fontsize=FORMAT["font"])
     ax.grid(True, alpha=FORMAT["grid_alpha"])
-    if name in FORMAT["inside_legend"]:                 # own legend inside the axes
+    if "legend" in FORMAT["compact"].get(name, {}):     # print-size figure: its own legend spec
+        _inside_legend(ax, FORMAT["compact"][name]["legend"])
+    elif name in FORMAT["inside_legend"]:               # own legend inside the axes
         _inside_legend(ax, FORMAT["inside_legend"][name])
     elif name not in FORMAT["shared_legend_figs"]:      # shared ones: no legend, legend.png goes with them
         _legend(ax, fig)
@@ -606,6 +758,10 @@ def _inside_legend(ax, spec):
     if spec.get("headroom"):                           # make room above the data
         lo, hi = ax.get_ylim()
         ax.set_ylim(lo, hi * spec["headroom"] if ax.get_yscale() == "log" else lo + (hi - lo) * spec["headroom"])
+    if spec.get("max_tick") is not None:               # no ticks in the legend's headroom (e.g. accuracy above 80%)
+        lo, hi = ax.get_ylim()
+        ax.set_yticks([t for t in ax.get_yticks() if lo <= t <= spec["max_tick"]])
+        ax.set_ylim(lo, hi)
     if spec.get("footroom"):                           # make room below the data (linear axes)
         lo, hi = ax.get_ylim()
         ax.set_ylim(lo - (hi - lo) * spec["footroom"], hi)
@@ -625,7 +781,7 @@ def _inside_legend(ax, spec):
     ax.legend(h, lab, loc=spec.get("loc", "best"), ncol=ncol, bbox_to_anchor=spec.get("bbox"),
               fontsize=spec.get("font", FORMAT["inside_legend_font"]), frameon=FORMAT["inside_legend_frame"],
               framealpha=0.9, **({"columnspacing": spec.get("cs", 1.0), "handlelength": spec.get("hl", 2.2)}
-                                 if spec.get("rows") else {}))
+                                 if spec.get("rows") or "cs" in spec or "hl" in spec else {}))
 
 
 def _grid(entries, rows):
@@ -646,23 +802,23 @@ def _part(name):
 
 
 def plot_final_acc_vs_snr(df, out, name):
-    fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    fig, ax = _subplots(name)
     overlay = FORMAT["fig1_twins"] == "overlay"
     order = [m for m in DRAWN if m not in TWINS] + ([m for m in DRAWN if m in TWINS] if overlay else [])
     for m in order:                                    # OFDMA first, ZF twins (identical values) on top
         if COLUMN[m] not in df:
             continue
         st = _style(m)
-        ax.plot(df["SNR (dB)"], df[COLUMN[m]], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"] - (1 if m in TWINS else 0), mfc=st.get("mfc"),
+        ax.plot(df["SNR (dB)"], df[COLUMN[m]], color=st["color"], marker=st["marker"], ls=st["ls"], lw=_lw(name, st["lw"]),
+                ms=_ms(name, -1 if m in TWINS else 0), mfc=st.get("mfc"),
                 label=st["label"] if overlay else JOINT.get(m, st["label"]))
     ax.set_xlabel(FORMAT["snr_label"])
-    ax.set_ylabel("Final test accuracy (%)")
+    ax.set_ylabel(_ylabel(name, "Final test accuracy (%)"))
     _finish(fig, ax, out, name, f"{_part(name)}: final accuracy vs SNR")
 
 
 def plot_time_to_target_vs_snr(df, out, name, axis="Training", methods=None):
-    fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    fig, ax = _subplots(name)
     unreached = False
     for m in methods or DRAWN:
         c = COLUMN[m]
@@ -670,8 +826,8 @@ def plot_time_to_target_vs_snr(df, out, name, axis="Training", methods=None):
             continue
         st = _style(m)
         ok = df[df[c].notna()]
-        ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"], mfc=st.get("mfc"), label=st["label"])
+        ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=_lw(name, st["lw"]),
+                ms=_ms(name), mfc=st.get("mfc"), label=st["label"])
         for _, r in df.iterrows():
             if not isinstance(r.get(f"{c} [reached]"), str):
                 continue                               # no run of this method at this SNR
@@ -687,13 +843,14 @@ def plot_time_to_target_vs_snr(df, out, name, axis="Training", methods=None):
         lo, hi = ax.get_ylim()
         ax.set_ylim(lo, hi * 10)
     ax.set_xlabel(FORMAT["snr_label"])
-    ax.set_ylabel("Uplink communication time to target (s)" if axis == "Uplink" else f"{axis} time to target (s)")
+    ax.set_ylabel(_ylabel(name, "Uplink communication time to target (s)" if axis == "Uplink" else
+                          f"{axis} time to target (s)"))
     _finish(fig, ax, out, name, f"{_part(name)}: {axis.lower()} time to {df['target val acc (%)'].iloc[0]:.0f}% "
                                 f"val. acc." + (" (x = not reached)" if unreached else ""))
 
 
 def plot_budget_vs_snr(df, out, name):
-    fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    fig, ax = _subplots(name)
     for m in DRAWN:
         c = COLUMN[m]
         if c not in df:
@@ -701,20 +858,20 @@ def plot_budget_vs_snr(df, out, name):
         st = _style(m)
         hollow = df["no evaluated checkpoint in budget"].fillna("").str.split("; ").apply(lambda v: c in v)
         ok = df[~hollow]
-        ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=st["lw"],
-                ms=FORMAT["marker_size"], mfc=st.get("mfc"), label=st["label"])
+        ax.plot(ok["SNR (dB)"], ok[c], color=st["color"], marker=st["marker"], ls=st["ls"], lw=_lw(name, st["lw"]),
+                ms=_ms(name), mfc=st.get("mfc"), label=st["label"])
         if hollow.any():                               # initial model only (nothing evaluated inside the budget)
             ax.plot(df["SNR (dB)"][hollow], df[c][hollow], marker=st["marker"], mfc="white", mec=st["color"],
-                    ms=FORMAT["marker_size"] + 2, ls="")
+                    ms=_ms(name, 2), ls="")
     ax.set_xlabel(FORMAT["snr_label"])
-    ax.set_ylabel("Test accuracy within the budget (%)")
+    ax.set_ylabel(_ylabel(name, "Test accuracy within the budget (%)"))
     own = "budget" in df and str(df["budget"].iloc[0]) == "AirSFL's full run"
     _finish(fig, ax, out, name, f"{_part(name)}: accuracy after {df['budget (uplink s)'].iloc[0]:.0f} s of uplink "
                                 f"time" + (" (AirSFL's run)" if own else ""))
 
 
 def plot_time_to_target_vs_N(df, out, name):
-    fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    fig, ax = _subplots(name)
     ms = [m for m in DRAWN if COLUMN[m] in df]
     x = np.arange(len(df))
     w = 0.84 / len(ms)
@@ -728,16 +885,18 @@ def plot_time_to_target_vs_N(df, out, name):
                 ax.text(xi, 0.02, "×", ha="center", color=st["color"], fontsize=10, transform=ax.get_xaxis_transform())
                 unreached = True
     ax.set_yscale("log")
+    if FORMAT["compact"].get(name, {}).get("ybottom"):
+        ax.set_ylim(bottom=FORMAT["compact"][name]["ybottom"])
     ax.set_xticks(x)
     ax.set_xticklabels([str(int(n)) for n in df["N"]])
     ax.set_xlabel("Number of clients $N$")
-    ax.set_ylabel("Uplink communication time to target (s)")
+    ax.set_ylabel(_ylabel(name, "Uplink communication time to target (s)"))
     _finish(fig, ax, out, name, f"{_part(name)}: uplink time to {df['target val acc (%)'].iloc[0]:.0f}% val. acc."
                                 + (" (× = not reached)" if unreached else ""))
 
 
 def plot_curves(df, out, name):
-    fig, ax = plt.subplots(figsize=FORMAT["figsize"])
+    fig, ax = _subplots(name)
     ends = df[df.method.isin([COLUMN["aircomp_fl"], COLUMN["airsfl"]])].groupby("method")["uplink time (s)"].max()
     xmax = 1.05 * float(ends.max()) if len(ends) else None    # AirComp-FL's full run (the fastest baseline)
     for m in DRAWN:
@@ -745,40 +904,47 @@ def plot_curves(df, out, name):
         if c.empty:
             continue
         st = _style(m)
-        ax.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=st["lw"], marker=st["marker"],
-                markevery=max(1, len(c) // FORMAT["curve_markers"]), ms=FORMAT["marker_size"] - 1, mfc=st.get("mfc"),
+        ax.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=_lw(name, st["lw"]), marker=st["marker"],
+                markevery=max(1, len(c) // FORMAT["curve_markers"]), ms=_ms(name, -1), mfc=st.get("mfc"),
                 label=st["label"])
         if FORMAT["extend_curves"] and xmax and float(c["uplink time (s)"].iloc[-1]) < xmax:
             ax.plot([float(c["uplink time (s)"].iloc[-1]), xmax], [float(c["test acc (%)"].iloc[-1])] * 2,
-                    color=st["color"], ls=":", lw=1.0, alpha=0.7)
+                    color=st["color"], ls=":", lw=_lw(name, 1.0), alpha=0.7)
     if xmax:
         ax.set_xlim(0, xmax)
-    ax.set_xlabel("Accumulated uplink communication time (s)")
+    if FORMAT["compact"].get(name, {}).get("xk"):     # narrow panel: 0, 5k, 10k
+        from matplotlib.ticker import FuncFormatter, MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(3))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: "0" if v == 0 else f"{v / 1000:g}k"))
+    ax.set_xlabel(_xlabel(name, "Accumulated uplink communication time (s)"))
     ax.set_ylabel("Test accuracy (%)")
     if FORMAT["inset_methods"] and name in FORMAT["inset_bounds"]:
-        _inset_full_runs(ax, df, FORMAT["inset_bounds"][name])
+        c = FORMAT["compact"].get(name, {})
+        _inset_full_runs(ax, df, c.get("inset_bounds", FORMAT["inset_bounds"][name]),
+                         c.get("inset_font", FORMAT["inset_font"]), c.get("lw", 1.0))
     _finish(fig, ax, out, name, f"{_part(name)}, $\\rho$ = 20 dB")
 
 
-def _inset_full_runs(ax, df, bounds):
+def _inset_full_runs(ax, df, bounds, font=None, lw_scale=1.0):
     """Small box inside the axes with the whole run of the slow baselines (same colors and line styles
     as the main plot; uplink time in thousands of seconds: 0, 50k, 100k, 150k)."""
     from matplotlib.ticker import FuncFormatter, MaxNLocator
+    font = font or FORMAT["inset_font"]
     ins = ax.inset_axes(bounds)
     for m in FORMAT["inset_methods"]:
         c = df[df.method == COLUMN[m]].sort_values("round")
         if c.empty:
             continue
         st = _style(m)
-        ins.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=max(1.0, 0.7 * st["lw"]))
+        ins.plot(c["uplink time (s)"], c["test acc (%)"], color=st["color"], ls=st["ls"], lw=lw_scale * max(1.0, 0.7 * st["lw"]))
     ins.set_xlim(0, None)
     ins.xaxis.set_major_locator(MaxNLocator(4))
     ins.xaxis.set_major_formatter(FuncFormatter(lambda v, _: "0" if v == 0 else f"{v / 1000:g}k"))
     ins.yaxis.set_major_locator(MaxNLocator(4))
-    ins.tick_params(labelsize=FORMAT["inset_font"])
+    ins.tick_params(labelsize=font, length=2, pad=1)
     ins.grid(True, alpha=FORMAT["grid_alpha"])
     if FORMAT["inset_title"]:
-        ins.set_title(FORMAT["inset_title"], fontsize=FORMAT["inset_font"], pad=2)
+        ins.set_title(FORMAT["inset_title"], fontsize=font, pad=2)
 
 
 def plot_all(out, payload=False):
@@ -800,7 +966,10 @@ def plot_all(out, payload=False):
             print(f"[fig] {name}: {path} missing (run without --plot-only first)")
             continue
         extra = {"methods": spec[2]["methods"]} if len(spec) > 2 and "methods" in spec[2] else {}
-        draw[kind](pd.read_csv(path), out, name, **extra)
+        with plt.rc_context({"font.size": FORMAT["compact"].get(name, {}).get("font", FORMAT["font"])}):
+            draw[kind](pd.read_csv(path), out, name, **extra)
+    if payload and os.path.exists(os.path.join(out, "fig_payload_precision.csv")):
+        plot_payload_precision(pd.read_csv(os.path.join(out, "fig_payload_precision.csv")), out)
     if FORMAT["shared_legend_figs"]:
         plot_legend(out)
 
@@ -841,11 +1010,14 @@ def main():
                         "the figures with the INT-q baselines (VARIANTS), fig8 and table_payload -> <results>/finalz_payload/")
     p.add_argument("--payload-bits", nargs="+", type=int, default=list(PAYLOAD["bits"]),
                    help="INT-q payloads read from --payload-results (default 8 4)")
+    p.add_argument("--seeds", nargs="+", type=int, default=None,
+                   help="use only these seeds everywhere, for every method (paired comparison, e.g. 11 22 33 while the "
+                        "INT-q runs have three seeds); targets are recomputed from them unless given (--fig3-target)")
     p.add_argument("--out", default=None, help="output folder (default <results>/finalz or <results>/finalz_payload)")
     a = p.parse_args()
     out = a.out or os.path.join(os.path.abspath(a.results), "finalz_payload" if a.payload_results else "finalz")
     if not a.plot_only:
-        build_data(a.results, a.main_seeds, out, a.fig3_target, a.payload_results, a.payload_bits)
+        build_data(a.results, a.main_seeds, out, a.fig3_target, a.payload_results, a.payload_bits, a.seeds)
     plot_all(out, payload=bool(a.payload_results))
 
 
