@@ -72,6 +72,10 @@
 #   D="--speed-drift-rho 0.9 --speed-drift-dt 20"
 #   J=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$R,EXP="hsweep ablation",TIME_BUDGET=5000,SEEDS="1 2 3 4",EXTRA="--csa-variant sys --ablation-parts full uniform random $D" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
+#   WIDE H SWEEP (same folder): H in {10, 20, 50, 100, 200, 500}, seeds 1-3 (~1,700 rounds per run: H = 500 still
+#   re-clusters ~3 times). H = 10, 20, 50 exist; 9 new runs (H = 100, 200, 500); the figures show only this grid / seeds:
+#   J=$(sbatch --parsable --array=0-2 --export=ALL,RESULTS=$R,EXP=hsweep,TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant sys --hs 100 200 500 $D" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys --hs 10 20 50 100 200 500 --seeds 1 2 3 --out $R/figures_wideH --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # IMPROVED CSA-SFL (winner of the screens: slot q=0.25 + batched arrivals + lazy re-clustering). Set RESULTS to
 # the ONE folder that holds all finished runs (finished runs are reused, the figures compare against them):
 #   A) main comparison, seeds 3-5 (seeds 1-2 exist), both deltas, 10,000 s -- 6 runs:

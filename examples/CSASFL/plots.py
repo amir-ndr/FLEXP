@@ -276,6 +276,62 @@ def staleness_figure(groups: dict, path: str, title: str):
     print(f"[plots] {path}.png")
 
 
+def effect_of_h_figure(groups: dict, args, path: str, title: str):
+    """One row over H (groups: H -> runs cut at the common budget), each point mean +- std over seeds:
+      (a) staleness: mean tau of all buffered clusters over the run, and the mean of its per-event maximum
+      (b) final accuracy: mean test accuracy over the last 10% of the budget (not one evaluation)
+      (c) time to the highest target that every run reaches (--targets)
+      (d) instability: share of the time after --stable-from s with accuracy below --stable-acc
+    Writes <path>.png/.pdf and <path>.csv (per H and seed)."""
+    recs = []
+    for H, runs in sorted(groups.items()):
+        for r in runs:
+            ev = r.iloc[1:]
+            p = persistent(r)
+            t, a = p["sim_time_s"].to_numpy(float), p["test_acc"].to_numpy(float)
+            end = t[-1]
+            grid = np.linspace(0.0, end, 5001)
+            held = hold(t, a, grid)
+            late = grid >= args.stable_from
+            rec = {"H": H, "seed": int(r["seed"].iloc[0]), "tau_mean": ev["staleness_mean"].mean(),
+                   "tau_max": ev["staleness_max"].mean(), "acc_final": 100 * np.nanmean(held[grid >= 0.9 * end]),
+                   "below_share": 100 * float(np.mean(held[late] < args.stable_acc)) if late.any() else np.nan}
+            for A in args.targets:
+                rec[f"t{int(round(100 * A))}"] = first_hit(p, "sim_time_s", A)
+            recs.append(rec)
+    if len({r["H"] for r in recs}) < 2:
+        return
+    df = pd.DataFrame(recs)
+    reached = [A for A in args.targets if df[f"t{int(round(100 * A))}"].notna().all()]
+    tcol = f"t{int(round(100 * max(reached)))}" if reached else None
+    g = df.groupby("H")
+    Hs = np.array(sorted(df["H"].unique()))
+    fig, axes = plt.subplots(1, 4, figsize=(17, 3.6))
+    panels = [(axes[0], [("tau_mean", "mean over clusters"), ("tau_max", "max over clusters")], "staleness tau (global rounds)"),
+              (axes[1], [("acc_final", None)], "final accuracy (%, last 10% of budget)"),
+              (axes[2], [(tcol, None)] if tcol else [], f"time to {tcol[1:]}% accuracy (s)" if tcol else "no common target"),
+              (axes[3], [("below_share", None)], f"time below {100 * args.stable_acc:g}% after {args.stable_from:g} s (%)")]
+    for ax, cols, ylab in panels:
+        for col, lab in cols:
+            ax.errorbar(Hs, g[col].mean().reindex(Hs), yerr=g[col].std(ddof=0).reindex(Hs), marker="o", capsize=4,
+                        label=lab, color=None if lab else COLOR["csasfl"])
+        if any(lab for _, lab in cols):
+            ax.legend(fontsize=8)
+        ax.set_xticks(Hs)
+        ax.set_xlabel("Re-clustering interval H (global rounds)", fontsize=9)
+        ax.set_ylabel(ylab, fontsize=9)
+        ax.grid(True, alpha=0.3)
+    for ax, tag in zip(axes, "abcd"):
+        ax.set_title(f"({tag})", fontsize=9, loc="left")
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{path}.{ext}", dpi=200)
+    plt.close(fig)
+    df.sort_values(["H", "seed"]).to_csv(f"{path}.csv", index=False)
+    print(f"[plots] {path}.png")
+
+
 def first_hit(r, col, target):
     hit = r.index[r["test_acc"] >= target]
     return float(r.loc[hit[0], col]) if len(hit) else np.nan
@@ -337,11 +393,18 @@ def main():
                         "has N- or H-sweep runs in the folder (the paper's algorithm if none)")
     p.add_argument("--N", type=int, default=7, help="default N (fixed in the H sweep)")
     p.add_argument("--H", type=int, default=20, help="default H (fixed in the N sweep)")
+    p.add_argument("--hs", nargs="+", type=int, default=None, help="H values shown in the H-sweep figures (default: all present)")
+    p.add_argument("--seeds", nargs="+", type=int, default=None, help="only these seeds (default: all present)")
+    p.add_argument("--stable-acc", type=float, default=0.96,
+                   help="effect-of-H figure: instability = share of the time below this accuracy ...")
+    p.add_argument("--stable-from", type=float, default=1000.0, help="... after this simulated time (s)")
     p.add_argument("--speed-drift", nargs=2, type=float, default=None, metavar=("RHO", "DT"),
                    help="only the runs with these time-varying speeds (rho 1 = fixed speeds); required when the folder "
                         "holds several speed models, which are never averaged together")
     args = p.parse_args()
     df = load(args.results)
+    if args.seeds:
+        df = df[df["seed"].isin(args.seeds)]
     models = sorted({(float(r), float(d)) for r, d in zip(df["speed_drift_rho"], df["speed_drift_dt"])})
     if args.speed_drift is not None:
         rho, dt = args.speed_drift
@@ -407,7 +470,7 @@ def main():
             report += fmt_table(t, f"N sweep [{shown}] (delta {args.noniid:g}, H {args.H})", args.targets)
 
         # ---- H sweep ----
-        hs = sorted(sw[np.isclose(sw["N"], args.N)]["H"].dropna().unique())
+        hs = sorted(h for h in sw[np.isclose(sw["N"], args.N)]["H"].dropna().unique() if not args.hs or int(h) in args.hs)
         if len(hs) > 1:
             groups = {f"H={int(h)}": runs_of(sw, N=args.N, H=h) for h in hs}
             plot_curves({k: mean_curve(v, "sim_time_s") for k, v in groups.items()}, "sim_time_s",
@@ -434,6 +497,9 @@ def main():
             t[["config", "n_seeds", "final_acc_mean", "final_acc_std", "last10_acc_mean"]].to_csv(
                 os.path.join(out, f"{pre}hsweep_final.csv"), index=False)
             print(f"[plots] {out}/{pre}hsweep_final.png")
+            effect_of_h_figure({int(h): groups[f"H={int(h)}"] for h in hs}, args,
+                               os.path.join(out, f"{pre}hsweep_effect"),
+                               f"Effect of H [{shown}] (delta = {args.noniid:g}, N = {args.N}, mean +- std over seeds)")
 
         # ---- ablation ----
         ab = df[(df["method"] == "csasfl") & np.isclose(df["delta"], args.noniid)]
