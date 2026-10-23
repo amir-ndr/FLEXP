@@ -83,8 +83,10 @@ ABLATION = [("gradient", "weighted"), ("gradient", "uniform"), ("random", "weigh
 #                        label-homogeneous clusters, twice as frequent mixing
 #   sys_warm             (1) with warm-started re-clustering (Lloyd from the current partition, not a fresh
 #                        k-means++ seeding): only clusters whose members really moved restart
+#   sys_sw               (1) with staleness counted in sweeps, tau = (t - t_n)/N, in Eq. phi (gentler discount)
+#   sys_a                (1) with phi = |D_n| / (1+tau_n)^a, a = --staleness-exp (gentler discount for a < 1)
 VARIANT_NAMES = ["paper", "sys", "slot", "deadline", "delta", "lazy", "all", "all_nosys",
-                 "sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25", "sys_warm"]
+                 "sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25", "sys_warm", "sys_sw", "sys_a"]
 SCREEN2 = ["sys_lazy", "slot_batch", "slot_batch_lazy", "slot_batch_lazy_q25"]
 DEFAULT_VARIANTS = ["paper", "sys", "slot", "delta", "lazy", "all", "all_nosys"]
 
@@ -101,6 +103,10 @@ def variant_overrides(name: str, args) -> dict:
         return {**one["sys"], **one["lazy"]}
     if name == "sys_warm":
         return {**one["sys"], "recluster_init": "warm"}
+    if name == "sys_sw":
+        return {**one["sys"], "staleness": "sweeps"}
+    if name == "sys_a":
+        return {**one["sys"], "staleness_exp": args.staleness_exp}
     if name.startswith("slot_batch"):
         o = {**one["slot"], "batch_arrivals": True}
         if "lazy" in name:
@@ -378,6 +384,7 @@ def main():
                         "aggregation), random (w/o gradient clustering), speed (speed-only clusters), removals (the "
                         "variant with each improvement removed); default all")
     p.add_argument("--sys-lambda", type=float, default=1.0, help="(1) weight of the system term in the clustering")
+    p.add_argument("--staleness-exp", type=float, default=0.5, help="variant sys_a: phi = |D_n| / (1+tau_n)^a, a = this")
     p.add_argument("--deadline-q", type=float, default=0.5, help="(2) time slot L = this quantile of the devices' t_k")
     p.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS, help="methods of --exp main")
     p.add_argument("--deltas", nargs="+", type=float, default=DELTAS, help="Dirichlet deltas of --exp main")

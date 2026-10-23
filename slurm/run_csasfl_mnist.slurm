@@ -76,6 +76,10 @@
 #   re-clusters ~3 times). H = 10, 20, 50 exist; 9 new runs (H = 100, 200, 500); the figures show only this grid / seeds:
 #   J=$(sbatch --parsable --array=0-2 --export=ALL,RESULTS=$R,EXP=hsweep,TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant sys --hs 100 200 500 $D" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys --hs 10 20 50 100 200 500 --seeds 1 2 3 --out $R/figures_wideH --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
+#   GENTLER STALENESS DISCOUNT in Eq. phi, same wide H sweep (36 runs): sys_sw (tau = (t - t_n)/N) and sys_a
+#   (phi = |D_n| / (1+tau_n)^a, a = 0.5); sys itself (a = 1, tau in rounds) is reused:
+#   J=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$R,EXP=hsweep,TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant sys_sw sys_a --hs 10 20 50 100 200 500 $D" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys sys_sw sys_a --hs 10 20 50 100 200 500 --seeds 1 2 3 --out $R/figures_phi --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # IMPROVED CSA-SFL (winner of the screens: slot q=0.25 + batched arrivals + lazy re-clustering). Set RESULTS to
 # the ONE folder that holds all finished runs (finished runs are reused, the figures compare against them):
 #   A) main comparison, seeds 3-5 (seeds 1-2 exist), both deltas, 10,000 s -- 6 runs:

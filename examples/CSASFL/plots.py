@@ -115,6 +115,8 @@ def variant_label(v: str) -> str:
             names.append("batched arrivals")
         elif tg == "warm":
             names.append("warm re-clust.")
+        elif tg.startswith("a") and tg[1:].replace(".", "").isdigit():
+            names.append(f"staleness exp. a={tg[1:]}")
     return "+ " + ", ".join(names)
 
 
@@ -192,7 +194,7 @@ def sweep_definitions(name: str):
     import types
     from run_mnist_exp import ablation_configs, variant_overrides
     from flsim.csasfl.methods import RunConfig
-    a = types.SimpleNamespace(sys_lambda=1.0, deadline_q=0.5)
+    a = types.SimpleNamespace(sys_lambda=1.0, deadline_q=0.5, staleness_exp=0.5)
     vs = lambda ov: RunConfig(method="csasfl", **ov).variant()
     return vs(variant_overrides(name, a)), [(lab, vs(ov)) for lab, ov in ablation_configs(name, a)]
 

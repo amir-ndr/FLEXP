@@ -108,6 +108,7 @@ class RunConfig:
     recluster: str = "halt"          # (4) halt (paper: halt, re-probe, restart affected) | lazy
     batch_arrivals: bool = False     # (2b) clusters finishing at the same instant -> one aggregation (slot mode)
     recluster_init: str = "seed"     # (4b) seed (fresh k-means++ every re-clustering) | warm (Lloyd from the current partition)
+    staleness_exp: float = 1.0       # (3b) a in phi = |D_n| / (1+tau_n)^a (paper: 1; < 1 = gentler staleness discount)
     # SAFSL
     safsl_buffer_frac: float = 0.8   # aggregate the 0.8K earliest arrivals
     safsl_gamma: float = 1.0
@@ -121,7 +122,8 @@ class RunConfig:
     SYSTEM_DEFAULTS = {"speed_drift_rho": 1.0, "speed_drift_dt": 100.0}
     IMPROVEMENT_DEFAULTS = {"sys_lambda": 0.0, "local_work": "epochs", "deadline_q": 0.5,
                             "agg_mode": "buffer", "staleness": "rounds", "recluster": "halt",
-                            "batch_arrivals": False, "recluster_init": "seed"}
+                            "batch_arrivals": False, "recluster_init": "seed",
+                            "staleness_exp": 1.0}
 
     def improvements(self) -> dict:
         """The CSA-SFL improvement options that differ from the paper's algorithm."""
@@ -146,6 +148,8 @@ class RunConfig:
             tags.append("delta")
         if self.staleness == "sweeps":
             tags.append("sw")
+        if self.staleness_exp != 1.0:
+            tags.append(f"a{self.staleness_exp:g}")
         if self.recluster == "lazy":
             tags.append("lazy")
         if self.batch_arrivals:
@@ -479,6 +483,7 @@ def run_csasfl(ctx: Context):
                            w^{t+1} = w^t + psi_n (w_bar_n - w^{t_n}),  psi_n = |D_n|/|D| * 1/(1+tau_n)
                            (uniform ablation: psi_n = 1/N); no buffer of old models
           staleness = sweeps   tau_n = (t - t_n) / N (in buffer or delta mode)
+          staleness_exp = a    staleness discount (1+tau_n)^a instead of (1+tau_n) in phi / psi (a < 1: gentler)
       time-varying speeds (RunConfig.speed_drift_rho < 1, flsim.csasfl.system.SpeedProcess): every round's
                            member finish times are integrated over the drifting speeds from its start; a halt
                            pauses in-flight rounds (remaining work resumes at the speeds after the halt); the
@@ -495,7 +500,7 @@ def run_csasfl(ctx: Context):
                            clusters, less discarded in-flight work); the first clustering is seeded as usual."""
     cfg, K, E, B, t0 = ctx.cfg, ctx.cfg.K, ctx.cfg.E, ctx.cfg.B, ctx.cfg.t0
     algo = CSASFL(num_clusters=cfg.N, recluster_every=cfg.H, local_iters=E, global_rounds=cfg.T,
-                  clustering=cfg.clustering, aggregation=cfg.aggregation)
+                  clustering=cfg.clustering, aggregation=cfg.aggregation, staleness_exp=cfg.staleness_exp)
     dims, s, sizes = ctx.dims, ctx.speeds, ctx.sizes
     for opt, ok in (("local_work", ("epochs", "deadline", "slot")), ("agg_mode", ("buffer", "delta")),
                     ("staleness", ("rounds", "sweeps")), ("recluster", ("halt", "lazy")),
@@ -661,7 +666,8 @@ def run_csasfl(ctx: Context):
             g = (ctx.wavg([x.buf[0] for x in order], phi), ctx.wavg([x.buf[1] for x in order], phi))  # Eq. global_update
             ws = [float(phi[i]) for i in idx]
         else:                                                    # (3) each update applied once
-            ws = [(1.0 / len(order) if algo.aggregation == "uniform" else x.D / D_tot / (1.0 + stale[i]))
+            disc = ((lambda tau: 1.0 + tau) if cfg.staleness_exp == 1.0 else (lambda tau: (1.0 + tau) ** cfg.staleness_exp))
+            ws = [(1.0 / len(order) if algo.aggregation == "uniform" else x.D / D_tot / disc(stale[i]))
                   for x, i in zip(arr, idx)]
             g0, g1 = g
             for x, r, w in zip(arr, res, ws):

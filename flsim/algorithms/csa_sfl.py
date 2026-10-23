@@ -45,6 +45,7 @@ class CSASFL:
         kmeans_iters: int = 50,
         clustering: str = "gradient",
         aggregation: str = "weighted",
+        staleness_exp: float = 1.0,
     ):
         self.N = int(num_clusters)          # N — number of clusters
         self.H = int(recluster_every)       # H — re-cluster every H global rounds
@@ -59,6 +60,7 @@ class CSASFL:
         #                 "uniform"  (phi = 1/N — drops data-size AND staleness)
         self.clustering = clustering
         self.aggregation = aggregation
+        self.staleness_exp = float(staleness_exp)   # a in phi = |D_n| / (1+tau_n)^a  (paper: a = 1)
         if self.N < 1:
             raise ValueError(f"num_clusters must be >= 1, got {self.N}")
         if self.H < 1:
@@ -243,6 +245,7 @@ class CSASFL:
     def agg_weights(self, data_sizes, stalenesses) -> np.ndarray:
         """
         phi_{n,t} = |D_n| * 1/(1+tau_n) / sum_n' |D_n'| * 1/(1+tau_n')  (paper Eq. phi).
+        With staleness_exp a != 1: |D_n| / (1+tau_n)^a (a < 1: a gentler staleness discount).
         Returns a length-N array summing to 1. The "uniform" ablation returns 1/N
         (drops both the data-size and the staleness weighting).
         """
@@ -251,6 +254,6 @@ class CSASFL:
             return np.full(n, 1.0 / max(1, n))
         d = np.asarray(data_sizes, dtype=float)
         tau = np.asarray(stalenesses, dtype=float)
-        raw = d / (1.0 + tau)
+        raw = d / (1.0 + tau) if self.staleness_exp == 1.0 else d / (1.0 + tau) ** self.staleness_exp
         s = raw.sum()
         return raw / s if s > 0 else np.full(n, 1.0 / max(1, n))
