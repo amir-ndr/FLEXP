@@ -66,6 +66,12 @@
 #   J=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$R,EXP="hsweep ablation",TIME_BUDGET=5000,SEEDS="1 2",EXTRA="--csa-variant sys sys_lazy --ablation-parts full uniform random $D" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys sys_lazy --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 #   (more seeds later: the same lines with SEEDS="3" -- finished runs are skipped)
+# FASTER SPEED FLUCTUATION for the H sweep (rho = 0.9 per 20 s, correlation time 200 s: at H = 50 the clustering lives
+# ~one correlation time, at H = 10 the recollection halts dominate), sys only, seeds 1-4, NEW folder -- 28 runs:
+#   R=examples/CSASFL/results_drift_tc200
+#   D="--speed-drift-rho 0.9 --speed-drift-dt 20"
+#   J=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$R,EXP="hsweep ablation",TIME_BUDGET=5000,SEEDS="1 2 3 4",EXTRA="--csa-variant sys --ablation-parts full uniform random $D" slurm/run_csasfl_mnist.slurm)
+#   sbatch --dependency=afterany:$J --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # IMPROVED CSA-SFL (winner of the screens: slot q=0.25 + batched arrivals + lazy re-clustering). Set RESULTS to
 # the ONE folder that holds all finished runs (finished runs are reused, the figures compare against them):
 #   A) main comparison, seeds 3-5 (seeds 1-2 exist), both deltas, 10,000 s -- 6 runs:
