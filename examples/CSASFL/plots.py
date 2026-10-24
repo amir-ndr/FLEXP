@@ -319,7 +319,11 @@ def effect_of_h_figure(groups: dict, args, path: str, title: str):
                         label=lab, color=None if lab else COLOR["csasfl"])
         if any(lab for _, lab in cols):
             ax.legend(fontsize=8)
+        if Hs.max() > 10 * Hs.min():                     # wide grid: log axis, plain tick labels
+            ax.set_xscale("log")
+            ax.minorticks_off()
         ax.set_xticks(Hs)
+        ax.set_xticklabels([str(h) for h in Hs])
         ax.set_xlabel("Re-clustering interval H (global rounds)", fontsize=9)
         ax.set_ylabel(ylab, fontsize=9)
         ax.grid(True, alpha=0.3)
@@ -486,6 +490,11 @@ def main():
             fig, ax = plt.subplots(figsize=(5.2, 3.8))
             ax.errorbar([int(h) for h in hs], 100 * t["final_acc_mean"], yerr=100 * t["final_acc_std"],
                         marker="o", capsize=4, color=COLOR["csasfl"])
+            if max(hs) > 10 * min(hs):
+                ax.set_xscale("log")
+                ax.minorticks_off()
+            ax.set_xticks([int(h) for h in hs])
+            ax.set_xticklabels([str(int(h)) for h in hs])
             ax.set_xlabel("Re-clustering interval H (global rounds)")
             ax.set_ylabel("Final test accuracy (%)")
             tb = float(sw["time_budget"].max()) if "time_budget" in sw else 0.0
