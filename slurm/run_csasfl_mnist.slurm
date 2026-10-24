@@ -7,7 +7,7 @@
 # until its simulated clock reaches the same TIME_BUDGET (default 50,000 s ~ 2000 CSA-SFL rounds,
 # ~1000 SAFSL / ~2000 ParallelSFL / ~30 FL-SFLv2 rounds, median over seeds); ROUNDS caps own rounds.
 # Experiments (EXP, any subset):
-#   main      5 methods x delta {0.1, 10}                       (comparison)
+#   main      FL / CFL / SFLv2 / SAFSL / ParallelSFL / CSA-SFL x delta {0.1, 10}   (comparison)
 #   nsweep    CSA-SFL x N {3,5,7,9,11}, delta 0.1, H 20         (paper Fig. a/b)
 #   hsweep    CSA-SFL x H {10,20,30,40,50}, delta 0.1, N 7      (paper Fig. c)
 #   ablation  CSA-SFL full / uniform phi / random clustering, delta 0.1
@@ -18,7 +18,7 @@
 # Environment variables (all optional):
 #   EXP          default "main"  (sweeps/ablation: EXP="nsweep hsweep ablation")
 #   SEEDS        paired seeds, default "1 2 3 4 5" (the paper averages 20 runs: SEEDS="$(seq -s ' ' 1 20)")
-#   METHODS      subset of "fl sflv2 safsl parallelsfl csasfl" for EXP=main
+#   METHODS      subset of "fl cfl sflv2 safsl parallelsfl csasfl" for EXP=main (cfl = clustered FL, Sattler et al. 2021)
 #   DELTAS       default "0.1 10"
 #   TIME_BUDGET  simulated seconds every method trains for, default 50000 (0 = exactly ROUNDS rounds)
 #   ROUNDS       safety cap on each method's own global rounds, default 50000 (time-stopped runs are reused)
@@ -84,10 +84,10 @@
 #   JA=$(sbatch --parsable --array=0-2 --export=ALL,RESULTS=$R,EXP=hsweep,TIME_BUDGET=5000,SEEDS="4 5",EXTRA="--csa-variant sys --hs 10 20 50 100 200 500 $D" slurm/run_csasfl_mnist.slurm)
 #   JB=$(sbatch --parsable --array=0-3 --export=ALL,RESULTS=$R,EXP=nsweep,TIME_BUDGET=5000,SEEDS="1 2 3",EXTRA="--csa-variant sys $D" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$JA:$JB --export=ALL,RESULTS=$R,EXP=plots,PLOT_EXTRA="--csa-variant sys --hs 10 20 50 100 200 500 --seeds 1 2 3 4 5 --out $R/figures_final --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
-#   (C) main comparison in the same environment, NEW folder, both deltas, seeds 1-3, 10,000 s: FL / SFLv2 / SAFSL /
-#   ParallelSFL + CSA-SFL (sys) -- 30 runs:
+#   (C) main comparison in the same environment, NEW folder, both deltas, seeds 1-3, 10,000 s: FL / CFL / SFLv2 /
+#   SAFSL / ParallelSFL + CSA-SFL (sys) -- 36 runs:
 #   RM=examples/CSASFL/results_drift_tc200_main
-#   JC=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$RM,EXP="main variants",METHODS="fl sflv2 safsl parallelsfl",TIME_BUDGET=10000,SEEDS="1 2 3",EXTRA="--variants sys --variant-deltas 0.1 10 $D" slurm/run_csasfl_mnist.slurm)
+#   JC=$(sbatch --parsable --array=0-5 --export=ALL,RESULTS=$RM,EXP="main variants",METHODS="fl cfl sflv2 safsl parallelsfl",TIME_BUDGET=10000,SEEDS="1 2 3",EXTRA="--variants sys --variant-deltas 0.1 10 $D" slurm/run_csasfl_mnist.slurm)
 #   sbatch --dependency=afterany:$JC --export=ALL,RESULTS=$RM,EXP=plots,PLOT_EXTRA="--csa-variant sys --targets 0.9 0.95 0.97 0.98" --time=00:30:00 slurm/run_csasfl_mnist.slurm
 # IMPROVED CSA-SFL (winner of the screens: slot q=0.25 + batched arrivals + lazy re-clustering). Set RESULTS to
 # the ONE folder that holds all finished runs (finished runs are reused, the figures compare against them):

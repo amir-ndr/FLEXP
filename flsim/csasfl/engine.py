@@ -221,6 +221,19 @@ class Engine:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    def evaluate_per_class(self, dev, srv, X, Y, n_classes: int = 10, bs: int = 2500):
+        """(n_classes,) test accuracy of (dev, srv) on each true class (NaN for an absent class)."""
+        pd, ps = self.dev_views(dev, two_d=False), self.srv_views(srv, two_d=False)
+        hit = torch.zeros(n_classes, device=X.device)
+        tot = torch.zeros(n_classes, device=X.device)
+        with torch.no_grad():
+            for s in range(0, X.shape[0], bs):
+                logits = forward_layers(self.spec, ps, forward_layers(self.spec, pd, X[s:s + bs], 0, self.cut), self.cut)
+                y = Y[s:s + bs]
+                hit += torch.bincount(y[logits.argmax(1) == y], minlength=n_classes).float()
+                tot += torch.bincount(y, minlength=n_classes).float()
+        return (hit / tot).cpu().numpy()
+
     def evaluate(self, dev, srv, X, Y, bs: int = 2500):
         pd, ps = self.dev_views(dev, two_d=False), self.srv_views(srv, two_d=False)
         correct, loss = 0, 0.0

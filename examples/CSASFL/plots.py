@@ -28,9 +28,9 @@ import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-METHOD_ORDER = ["fl", "sflv2", "safsl", "parallelsfl", "csasfl"]
-LABEL = {"fl": "FL", "sflv2": "SFLv2", "safsl": "SAFSL", "parallelsfl": "ParallelSFL", "csasfl": "CSA-SFL"}
-COLOR = {"fl": "#1f77b4", "sflv2": "#ff7f0e", "safsl": "#2ca02c", "parallelsfl": "#9467bd", "csasfl": "#d62728"}
+METHOD_ORDER = ["fl", "cfl", "sflv2", "safsl", "parallelsfl", "csasfl"]
+LABEL = {"fl": "FL", "cfl": "CFL", "sflv2": "SFLv2", "safsl": "SAFSL", "parallelsfl": "ParallelSFL", "csasfl": "CSA-SFL"}
+COLOR = {"fl": "#1f77b4", "cfl": "#8c564b", "sflv2": "#ff7f0e", "safsl": "#2ca02c", "parallelsfl": "#9467bd", "csasfl": "#d62728"}
 VARIANT_LABEL = {"full": "CSA-SFL (full)", "uniform_agg": "w/o weighted aggregation",
                  "random_cluster": "w/o gradient clustering"}
 XLAB = {"sim_time_s": "Training time (s)", "comm_mb": "Communication overhead (MB)", "round": "Global round"}

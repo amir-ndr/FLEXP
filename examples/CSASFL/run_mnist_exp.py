@@ -62,7 +62,7 @@ from flsim.csasfl.model import CUT_LAYER, FC_WIDTHS, layer_spec
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "results_mnist_exp")
 SCHEMA = 1
-METHODS = ["fl", "sflv2", "safsl", "parallelsfl", "csasfl"]
+METHODS = ["fl", "cfl", "sflv2", "safsl", "parallelsfl", "csasfl"]
 DELTAS = [0.1, 10.0]
 NONIID = 0.1
 N_SWEEP = [3, 5, 7, 9, 11]
@@ -124,7 +124,7 @@ def variant_overrides(name: str, args) -> dict:
 # (each one batched GPU step) / MNIST-epochs of local training per run -- ParallelSFL 346k / 4160,
 # CSA-SFL 347k / 1400 (only ~4 devices per step: launch-overhead bound), SAFSL 215k / 3650,
 # FL & SFLv2 19k / 400 (SFLv2: + a 50-device sequential server loop per step).
-COST = {"parallelsfl": 4.0, "safsl": 3.5, "csasfl": 3.0, "sflv2": 0.8, "fl": 0.4}
+COST = {"parallelsfl": 4.0, "safsl": 3.5, "csasfl": 3.0, "sflv2": 0.8, "fl": 0.4, "cfl": 0.5}
 
 
 def run_cost(cfg: RunConfig) -> float:
@@ -247,6 +247,8 @@ def manifest(cfg: RunConfig) -> dict:
         d.pop("safsl_buffer_frac"); d.pop("safsl_gamma")
     if cfg.method != "parallelsfl":
         d.pop("psfl_lambda"); d.pop("psfl_max_cluster")
+    if cfg.method != "cfl":
+        d.pop("cfl_eps1_frac"); d.pop("cfl_eps2_mult"); d.pop("cfl_gamma_max")
     return {"schema": SCHEMA, "model": f"lenet12-fc{'-'.join(map(str, FC_WIDTHS))}-he", "dataset": "mnist60k", **d}
 
 

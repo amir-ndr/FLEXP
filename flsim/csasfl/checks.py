@@ -22,6 +22,10 @@ flsim/csasfl/checks.py: correctness checks for the CSA-SFL paper setup (run befo
                 method; with drifting speeds every method's timing (FL / SFLv2 rounds, SAFSL arrivals,
                 ParallelSFL Eq. 15, CSA-SFL rounds, caps, halts, paused rounds) matches an independent
                 re-simulation
+ 11 cfl         (python -m flsim.csasfl.checks --cfl, ~3 min) the CFL baseline (Sattler et al. 2021): Algorithm 1 gives
+                the exact optimum of Eq. 33 (brute force); without splits CFL is bitwise FL (fixed and drifting speeds);
+                with forced splits every decision (eps1 / eps2 rule, Eq. 36), child model (Eq. 2), the reported
+                accuracies, the clock and the traffic are recomputed independently
 """
 
 import math
@@ -217,6 +221,8 @@ def main():
         check_variants(small, spec, cpu)
     if "--drift" in sys.argv:
         check_drift(small, spec, cpu)
+    if "--cfl" in sys.argv:
+        check_cfl(small, spec, cpu)
     print(f"\n{'ALL CHECKS PASSED' if not _fails else f'{len(_fails)} FAILED: {_fails}'}")
     return 1 if _fails else 0
 
@@ -329,6 +335,98 @@ def check_variants(small, spec, cpu):
         check(f"(4) [{tag}] no halts and no probe traffic after the start; every device trained or is training",
               all(x >= -1e-6 and abs(x / dm - round(x / dm)) < 1e-9 for x in extra)
               and sum(r["recluster"] for r in rows[1:]) > 0 and done | busy_end == set(range(12)))
+
+
+def check_cfl(small, spec, cpu):
+    """11 CFL baseline."""
+    import itertools
+    from flsim.csasfl.methods import RUNNERS, Context, cfl_bipartition
+    print("11 CFL (--cfl)")
+    r0 = np.random.RandomState(0)
+    ok = True
+    for _ in range(200):                                   # Algorithm 1 == brute-force argmin of Eq. 33
+        n = int(r0.randint(2, 10))
+        A = r0.randn(n, 6) + (r0.randint(0, 3, n)[:, None] * r0.randn(1, 6))
+        U = A / np.linalg.norm(A, axis=1, keepdims=True)
+        S = U @ U.T
+        c1, c2 = cfl_bipartition(S)
+        best = min(S[np.ix_([i for i in range(n) if m >> i & 1], [i for i in range(n) if not m >> i & 1])].max()
+                   for m in range(1, 2 ** n - 1) if m & 1)
+        ok &= sorted(c1 + c2) == list(range(n)) and len(c1) > 0 and len(c2) > 0 and abs(S[np.ix_(c1, c2)].max() - best) < 1e-12
+    check("Algorithm 1 bipartition = exact argmin_{c1,c2} max_{i in c1, j in c2} alpha_ij (Eq. 33), 200 random cases", ok)
+
+    quiet = lambda *_: None
+    eng = lambda: Engine(spec, 8, 0.01, cpu, "vmap" if _HAS_FUNC else "loop")
+    base = dict(delta=0.1, seed=2, K=10, E=1, B=32, lr=0.01, time_budget=0.0, T=8)
+    eq = lambda u, v: u == v or (isinstance(u, float) and isinstance(v, float) and math.isnan(u) and math.isnan(v))
+
+    def go(method, **kw):
+        ctx = Context(RunConfig(method=method, **{**base, **kw}), small, eng(), quiet)
+        ctx.trace = []
+        return ctx, RUNNERS[method](ctx)
+    for kw, tag in (({}, "fixed speeds"), ({"speed_drift_rho": 0.6, "speed_drift_dt": 5.0}, "drifting speeds")):
+        _, rf = go("fl", **kw)
+        _, rc = go("cfl", cfl_eps1_frac=0.0, **kw)            # eps1 = 0: never splits
+        same = len(rf) == len(rc) and all(eq(a[k], b[k]) for a, b in zip(rf, rc) for k in a if k != "wall_s")
+        check(f"CFL without a split == FL bitwise ({tag}, {len(rc)} rows)", same and all(r["num_clusters"] == 1 for r in rc))
+
+    # forced splits: eps1 = running max (split as soon as the mean update shrinks), eps2 = 0, gamma_max = 0
+    ctx, rows = go("cfl", cfl_eps1_frac=1.0, cfl_eps2_mult=0.0, T=10)
+    _, rf = go("fl", T=10)
+    sizes, D = ctx.sizes, float(ctx.sizes.sum())
+    pk = ctx.label_dists / ctx.label_dists.sum(1, keepdims=True)
+    models = {k: (ctx.dev0, ctx.srv0) for k in range(ctx.cfg.K)}     # each device's cluster model
+    peaks = {k: 0.0 for k in range(ctx.cfg.K)}
+    dec_ok = mod_ok = part_ok = acc_ok = True
+    n_splits = 0
+    for e, row in zip(ctx.trace, rows[1:]):
+        mem = e["mem"]
+        start = torch.stack([torch.cat(models[k]) for k in mem])
+        trained = torch.cat([e["dev"], e["srv"]], 1)
+        dW = trained - start
+        for d in e["decisions"]:
+            ks = d["members"]
+            rows_ = [mem.index(k) for k in ks]
+            p = torch.tensor(sizes[ks] / sizes[ks].sum(), dtype=torch.float32)
+            mn = float((p @ dW[rows_]).norm())
+            mx = float(dW[rows_].norm(dim=1).max())
+            pkc = max(peaks[ks[0]], mn)
+            want = len(ks) >= 2 and mn < 1.0 * pkc and mx > 0.0
+            dec_ok &= (abs(d["mean_norm"] - mn) <= 1e-5 * max(1, mn) and abs(d["eps1"] - pkc) <= 1e-5 * max(1, pkc)
+                       and d["split"] == want and d["peak_before"] == peaks[ks[0]])
+            if d["split"]:
+                n_splits += 1
+                U = dW[rows_] / dW[rows_].norm(dim=1, keepdim=True)
+                S = (U @ U.T).double().numpy()
+                c1, c2 = cfl_bipartition(S)
+                dec_ok &= np.allclose(S, d["S"], atol=1e-6) and sorted(d["c1"]) == sorted(ks[i] for i in c1) \
+                    and sorted(d["c2"]) == sorted(ks[i] for i in c2)
+        after = e["clusters_after"]
+        part_ok &= sorted(k for C in after for k in C) == list(range(ctx.cfg.K))
+        new = {}
+        for C, (md, ms), pkk in zip(after, e["models_after"], e["peak_after"]):
+            w = torch.tensor(sizes[C] / sizes[C].sum(), dtype=torch.float32)
+            idx = [mem.index(k) for k in C]
+            mod_ok &= bool(torch.allclose(md, w @ e["dev"][idx], atol=1e-6) and torch.allclose(ms, w @ e["srv"][idx], atol=1e-6))
+            for k in C:
+                new[k] = (md, ms)
+                peaks[k] = pkk
+        models = new
+        accs, pers = 0.0, 0.0
+        for C, (md, ms) in zip(after, e["models_after"]):
+            a, _ = ctx.eng.evaluate(md, ms, ctx.Xte, ctx.yte)
+            pc = ctx.eng.evaluate_per_class(md, ms, ctx.Xte, ctx.yte)
+            accs += sizes[C].sum() / D * a
+            pers += sum(sizes[k] * (pk[k] @ pc) for k in C) / D
+        acc_ok &= abs(row["test_acc"] - accs) < 1e-9 and abs(row["acc_personal"] - pers) < 1e-9 and row["num_clusters"] == len(after)
+    check("forced splits: split iff ||Delta_c|| < eps1 and max_k ||Delta_k|| > eps2 (eps1 = frac * running max), "
+          "cosine matrix and Algorithm 1 recomputed", dec_ok and n_splits > 0, f"{n_splits} splits, final clusters {rows[-1]['cluster_sizes']}")
+    check("forced splits: clusters partition the devices; every cluster model = |D_k|-weighted mean of its members (Eq. 2)",
+          part_ok and mod_ok)
+    check("forced splits: test_acc = sum_c |D_c|/|D| acc(w_c) on the full test set; acc_personal on each device's labels", acc_ok)
+    check("CFL clock and traffic = FL's (slowest device per round, full model down + up per device)",
+          all(math.isclose(a["sim_time_s"], b["sim_time_s"], rel_tol=1e-12) and math.isclose(a["comm_mb"], b["comm_mb"], rel_tol=1e-12)
+              for a, b in zip(rows, rf)))
 
 
 class _RefClock:

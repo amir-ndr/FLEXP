@@ -74,7 +74,7 @@ from flsim.csasfl.model import activation_numel, layer_macs
 from flsim.csasfl.system import Dims, SpeedProcess, batches, device_speeds, train_time
 from flsim.interfaces.parallel_sfl_algorithm import WorkerInfo
 
-METHOD_LABELS = {"fl": "FL", "sflv2": "SFLv2", "safsl": "SAFSL", "parallelsfl": "ParallelSFL",
+METHOD_LABELS = {"fl": "FL", "cfl": "CFL", "sflv2": "SFLv2", "safsl": "SAFSL", "parallelsfl": "ParallelSFL",
                  "csasfl": "CSA-SFL"}
 
 
@@ -115,6 +115,12 @@ class RunConfig:
     # ParallelSFL
     psfl_lambda: float = 0.5
     psfl_max_cluster: int = 8
+    # CFL (Sattler et al., TNNLS 2021): split a cluster when ||mean update|| < eps1 and max_k ||update_k|| > eps2,
+    # eps1 = cfl_eps1_frac * (largest ||mean update|| of the cluster so far), eps2 = cfl_eps2_mult * eps1,
+    # and the bipartition passes sqrt((1 - alpha_cross_max) / 2) > cfl_gamma_max (Eq. 36)
+    cfl_eps1_frac: float = 0.1
+    cfl_eps2_mult: float = 4.0
+    cfl_gamma_max: float = 0.0
     # time-varying device speeds (flsim.csasfl.system.SpeedProcess; rho = 1: the paper's fixed speeds)
     speed_drift_rho: float = 1.0     # AR(1) coefficient of log s_k per interval
     speed_drift_dt: float = 100.0    # interval length (s); correlation time = dt / (1 - rho)
@@ -254,9 +260,10 @@ class Context:
     # bookkeeping
     # ------------------------------------------------------------------
 
-    def record(self, r, sim_time, comm_bytes, round_bytes, dev, srv, train_loss, **extra) -> bool:
-        """Evaluate (w^c, w^s) on the test set and append a row. Returns False if diverged."""
-        acc, loss = self.eng.evaluate(dev, srv, self.Xte, self.yte)
+    def record(self, r, sim_time, comm_bytes, round_bytes, dev, srv, train_loss, acc_loss=None, **extra) -> bool:
+        """Evaluate (w^c, w^s) on the test set and append a row (acc_loss: the method's own (acc, loss), e.g. a
+        mean over several models; dev / srv are then only checked for divergence). Returns False if diverged."""
+        acc, loss = self.eng.evaluate(dev, srv, self.Xte, self.yte) if acc_loss is None else acc_loss
         ok = bool(torch.isfinite(dev).all() and torch.isfinite(srv).all()) and math.isfinite(loss)
         self.rows.append({"round": int(r), "sim_time_s": float(sim_time), "comm_mb": comm_bytes / 1e6,
                           "round_comm_mb": round_bytes / 1e6, "test_acc": acc, "test_loss": loss,
@@ -314,6 +321,145 @@ def run_fl(ctx: Context):
         comm += rb
         if not ctx.record(r + 1, now, comm, rb, g_dev, g_srv, loss, round_latency_s=lat,
                           avg_wait_s=float(np.mean(lat - dts))) or ctx.over(now):
+            break
+    return ctx.rows
+
+
+# ======================================================================
+# CFL (clustered FL, Sattler et al., IEEE TNNLS 2021)
+# ======================================================================
+
+def cfl_bipartition(S: np.ndarray):
+    """Paper Algorithm 1: the bipartition c1, c2 minimizing max_{i in c1, j in c2} S_ij (Eq. 33). Pairs are merged in
+    order of decreasing similarity until two groups remain (single linkage). Returns (c1, c2) as sorted index lists."""
+    n = len(S)
+    parent = list(range(n))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    groups = n
+    for idx in np.argsort(-S, axis=None, kind="stable"):
+        if groups == 2:
+            break
+        a, b = root(int(idx) // n), root(int(idx) % n)
+        if a != b:
+            parent[b] = a
+            groups -= 1
+    r0 = root(0)
+    c1 = [i for i in range(n) if root(i) == r0]
+    return c1, [i for i in range(n) if root(i) != r0]
+
+
+def run_cfl(ctx: Context):
+    """CFL (Sattler, Mueller, Samek, IEEE TNNLS 2021; Algorithm 5 with weight-updates, no permutation P) on the
+    paper's system model. Every round all K devices train the FULL model of their cluster for E local epochs from
+    the cluster model (as FL), Delta_k = w_k - w_c; each cluster aggregates |D_k|-weighted (Eq. 2), so CFL is FL
+    until its first split. Split test per cluster c (Algorithm 5 l.14-19):
+        ||Delta_c|| < eps1  and  max_{k in c} ||Delta_k|| > eps2,   Delta_c = sum_k |D_k|/|D_c| Delta_k,
+        eps1 = cfl_eps1_frac * max_{rounds so far} ||Delta_c||  (paper: "a tenth of the maximum average update norm",
+               the running maximum of the cluster, inherited from its parent),  eps2 = cfl_eps2_mult * eps1,
+    then the cosine similarities alpha_ij of the members' updates (Eq. 40), the bipartition of Algorithm 1 (Eq. 33),
+    and the split is kept if sqrt((1 - alpha_cross_max) / 2) > cfl_gamma_max (Eq. 36). A split takes effect in
+    the same round: each child aggregates only its own members' updates (no work discarded) and keeps the parent's
+    running maximum. Round time = the slowest device (all clusters train together, as FL); traffic = FL's (full
+    model down + up per device). Reported test_acc / test_loss: |D_k|-weighted mean over devices of their cluster
+    model's accuracy on the full test set; acc_personal: the same with each device's model scored on its own label
+    distribution (per-class test accuracy weighted by the device's training-label shares)."""
+    cfg, K = ctx.cfg, ctx.cfg.K
+    sizes = ctx.sizes
+    D_tot = float(sizes.sum())
+    pk = ctx.label_dists / ctx.label_dists.sum(1, keepdims=True)              # (K, 10) training-label shares
+    clusters = [list(range(K))]                                               # C
+    models = [(ctx.dev0, ctx.srv0)]                                           # w_c
+    peak = [0.0]                                                              # running max ||Delta_c||
+
+    def evaluate():
+        """(acc, loss) over devices, acc_personal, per-cluster accuracies."""
+        accs, losses, pers = [], [], 0.0
+        for C, (d, s_) in zip(clusters, models):
+            a, l = ctx.eng.evaluate(d, s_, ctx.Xte, ctx.yte)
+            pc = ctx.eng.evaluate_per_class(d, s_, ctx.Xte, ctx.yte)
+            accs.append(a); losses.append(l)
+            pers += float(sum(sizes[k] * (pk[k] @ np.nan_to_num(pc)) for k in C))
+        w = np.array([sizes[C].sum() for C in clusters]) / D_tot
+        return float(w @ accs), float(w @ losses), pers / D_tot, accs
+
+    def info():
+        return {"num_clusters": len(clusters), "cluster_sizes": "-".join(str(len(C)) for C in sorted(clusters, key=len, reverse=True))}
+
+    trace = getattr(ctx, "trace", None)                                       # verification hook (checks.py)
+    now = comm = 0.0
+    acc, loss_t, pers, _ = evaluate()
+    ctx.record(0, now, comm, 0.0, ctx.dev0, ctx.srv0, float("nan"), acc_personal=pers, **info())
+    members = list(range(K))
+    for r in range(cfg.T):
+        sched = ctx.schedule(members)
+        mem = [members[i] for i in sched[0]]
+        row = {k: i for i, k in enumerate(mem)}
+        cid = {k: c for c, C in enumerate(clusters) for k in C}
+        if len(clusters) == 1:                                                # (= FL's g.repeat)
+            dev, srv = models[0][0].repeat(K, 1), models[0][1].repeat(K, 1)
+        else:
+            dev = torch.stack([models[cid[k]][0] for k in mem])
+            srv = torch.stack([models[cid[k]][1] for k in mem])
+        dev_s, srv_s = dev.clone(), srv.clone()
+        loss = ctx.run_group(dev, srv, "per_device", sched)
+        dW = torch.cat([dev - dev_s, srv - srv_s], 1)                         # (K, d) weight updates (Eq. 1)
+        dnorm = dW.norm(dim=1)
+        del dev_s, srv_s
+        new_clusters, new_models, new_peak, n_split = [], [], [], 0
+        norms_mean, eps1_all, decisions = [], [], []
+        for c, C in enumerate(clusters):
+            rows = sorted(row[k] for k in C)                                  # schedule order (as FL's wavg)
+            ks = [mem[i] for i in rows]
+            p = torch.as_tensor(sizes[ks] / float(sizes[ks].sum()), dtype=torch.float32, device=ctx.device)
+            mean_norm = float((p @ dW[rows]).norm())                          # ||Delta_c||
+            max_norm = float(dnorm[rows].max())                               # max_k ||Delta_k||
+            pk_c = max(peak[c], mean_norm)
+            eps1 = cfg.cfl_eps1_frac * pk_c
+            eps2 = cfg.cfl_eps2_mult * eps1
+            norms_mean.append(mean_norm); eps1_all.append(eps1)
+            parts, dec = [list(range(len(rows)))], {}
+            if len(rows) >= 2 and mean_norm < eps1 and max_norm > eps2:
+                U = dW[rows] / dnorm[rows].clamp_min(1e-30)[:, None]
+                S = (U @ U.T).double().cpu().numpy()                          # alpha_ij (Eq. 40)
+                c1, c2 = cfl_bipartition(S)
+                a_cross = float(S[np.ix_(c1, c2)].max())
+                if math.sqrt(max(0.0, 1.0 - a_cross) / 2.0) > cfg.cfl_gamma_max:
+                    parts, n_split = [c1, c2], n_split + 1
+                dec = {"S": S, "c1": [ks[i] for i in c1], "c2": [ks[i] for i in c2], "a_cross": a_cross}
+            for part in parts:
+                prow = [rows[i] for i in part]
+                pks = [mem[i] for i in prow]
+                new_clusters.append(sorted(pks))
+                new_models.append((ctx.wavg(dev[prow], sizes[pks]), ctx.wavg(srv[prow], sizes[pks])))   # Eq. 2
+                new_peak.append(pk_c)
+            decisions.append({"members": ks, "mean_norm": mean_norm, "max_norm": max_norm, "peak_before": peak[c],
+                              "eps1": eps1, "eps2": eps2, "split": len(parts) == 2, **dec})
+        if trace is not None:
+            trace.append({"r": r + 1, "mem": list(mem), "dev": dev.detach().cpu().clone(), "srv": srv.detach().cpu().clone(),
+                          "decisions": decisions, "clusters_after": [list(C) for C in new_clusters],
+                          "models_after": [(m[0].detach().cpu().clone(), m[1].detach().cpu().clone()) for m in new_models],
+                          "peak_after": list(new_peak)})
+        clusters, models, peak = new_clusters, new_models, new_peak
+        del dev, srv, dW
+        dts = ctx.device_times(now)
+        lat = float(dts.max())
+        now += lat
+        rb = K * ctx.dims.full_round()
+        comm += rb
+        acc, loss_t, pers, _ = evaluate()
+        if len(models) == 1:                                                  # one model: recorded exactly as FL
+            dchk, schk, al = models[0][0], models[0][1], None
+        else:                                                                 # several: mean over devices, all checked
+            dchk, schk, al = torch.stack([m[0] for m in models]), torch.stack([m[1] for m in models]), (acc, loss_t)
+        ok = ctx.record(r + 1, now, comm, rb, dchk, schk, loss, acc_loss=al,
+                        round_latency_s=lat, avg_wait_s=float(np.mean(lat - dts)), acc_personal=pers, n_split=n_split,
+                        cfl_mean_norm=max(norms_mean), cfl_max_norm=float(dnorm.max()), cfl_eps1=min(eps1_all), **info())
+        if not ok or ctx.over(now):
             break
     return ctx.rows
 
@@ -792,7 +938,7 @@ def run_csasfl(ctx: Context):
     return ctx.rows
 
 
-RUNNERS = {"fl": run_fl, "sflv2": run_sflv2, "safsl": run_safsl, "parallelsfl": run_parallelsfl,
+RUNNERS = {"fl": run_fl, "cfl": run_cfl, "sflv2": run_sflv2, "safsl": run_safsl, "parallelsfl": run_parallelsfl,
            "csasfl": run_csasfl}
 
 
